@@ -38,7 +38,11 @@ func getRequestContext() *RequestContext {
 	return rc
 }
 
+// Note: Response will be released as well if not nil.
 func releaseRequestContext(rc *RequestContext) {
+	if rc.Response.Msg != nil {
+		dnsmsg.ReleaseMsg(rc.Response.Msg)
+	}
 	*rc = RequestContext{}
 	requestContextPool.Put(rc)
 }

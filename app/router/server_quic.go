@@ -138,18 +138,16 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 			)
 		}
 	}
+	defer dnsmsg.ReleaseMsg(m)
 
 	rc := getRequestContext()
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
+	defer releaseRequestContext(rc)
 
 	r.handleServerReq(m, rc)
-	resp := rc.Response.Msg
-	dnsmsg.ReleaseMsg(m)
-	releaseRequestContext(rc)
 
-	respBuf, err := packRespTCP(resp, true)
-	dnsmsg.ReleaseMsg(resp)
+	respBuf, err := packRespTCP(rc.Response.Msg, true)
 	if err != nil {
 		s.logger.Error(logPackRespErr, zap.Error(err))
 		return

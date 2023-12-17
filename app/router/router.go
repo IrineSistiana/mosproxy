@@ -212,8 +212,7 @@ var (
 )
 
 // rc will always have a non-nil response msg.
-// Does not take the ownership of m.
-// Caller has the responsibility to release the m and the resp.
+// Does not take the ownership of the m and rc.
 func (r *router) handleServerReq(m *dnsmsg.Msg, rc *RequestContext) {
 	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second*6, errRequestTimeout)
 	defer func() {

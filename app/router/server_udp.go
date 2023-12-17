@@ -174,11 +174,9 @@ func (s *udpServer) handleReq(remoteC netip.AddrPort, oob []byte, m *dnsmsg.Msg,
 	rc := getRequestContext()
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
+	defer releaseRequestContext(rc)
 
 	r.handleServerReq(m, rc)
-	resp := rc.Response.Msg
-	dnsmsg.ReleaseMsg(m)
-	releaseRequestContext(rc)
 
 	// Determine the client udp size. Try to find edns0.
 	clientUdpSize := 512
@@ -191,8 +189,7 @@ func (s *udpServer) handleReq(remoteC netip.AddrPort, oob []byte, m *dnsmsg.Msg,
 		}
 	}
 
-	b, err := packResp(resp, true, clientUdpSize)
-	dnsmsg.ReleaseMsg(resp)
+	b, err := packResp(rc.Response.Msg, true, clientUdpSize)
 	if err != nil {
 		s.logger.Error(logPackRespErr, zap.Error(err))
 		return

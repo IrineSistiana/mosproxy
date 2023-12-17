@@ -250,13 +250,11 @@ func (s *tcpServer) handleReq(connCtx context.Context, c net.Conn, wc chan *pool
 	rc := getRequestContext()
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
+	defer releaseRequestContext(rc)
 
 	r.handleServerReq(m, rc)
-	resp := rc.Response.Msg
-	releaseRequestContext(rc)
 
-	buf, err := packRespTCP(resp, true)
-	dnsmsg.ReleaseMsg(resp)
+	buf, err := packRespTCP(rc.Response.Msg, true)
 	if err != nil {
 		s.logger.Error(logPackRespErr, zap.Error(err))
 		return

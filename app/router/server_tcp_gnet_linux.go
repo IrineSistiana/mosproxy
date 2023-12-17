@@ -194,13 +194,12 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 			rc := getRequestContext()
 			rc.RemoteAddr = cc.remoteAddr
 			rc.LocalAddr = cc.localAddr
-			e.r.handleServerReq(m, rc)
-			resp := rc.Response.Msg
-			dnsmsg.ReleaseMsg(m)
-			releaseRequestContext(rc)
+			defer releaseRequestContext(rc)
 
-			buf, err := packRespTCP(resp, true)
-			dnsmsg.ReleaseMsg(resp)
+			e.r.handleServerReq(m, rc)
+			dnsmsg.ReleaseMsg(m)
+
+			buf, err := packRespTCP(rc.Response.Msg, true)
 			if err != nil {
 				e.logger.Error(logPackRespErr, zap.Error(err))
 				return
