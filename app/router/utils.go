@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"unsafe"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
@@ -57,4 +58,13 @@ func copyBuf(b []byte) *pool.Buffer {
 	c := pool.GetBuf(len(b))
 	copy(c.B(), b)
 	return c
+}
+
+func ctxDone(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
 }

@@ -186,9 +186,9 @@ func (c *cache) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg.Ms
 	}
 }
 
-func (c *cache) AsyncSingleFlightPrefetch(reqCtx *reqContext, u *upstreamWrapper) {
-	mark := c.ipMark(reqCtx.req.remote.Addr())
-	prefetchKey := hashReq(reqCtx.req.q, mark)
+func (c *cache) AsyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr, localAddr netip.AddrPort, u *upstreamWrapper) {
+	mark := c.ipMark(remoteAddr.Addr())
+	prefetchKey := hashReq(q, mark)
 	c.prefetchMu.Lock()
 	_, dup := c.prefetching[prefetchKey]
 	if !dup {
@@ -196,10 +196,10 @@ func (c *cache) AsyncSingleFlightPrefetch(reqCtx *reqContext, u *upstreamWrapper
 	}
 	c.prefetchMu.Unlock()
 	if !dup {
-		q := reqCtx.req.q.Copy() // q is not concurrent save. Copy it.
+		q := q.Copy() // q is not concurrent save. Copy it.
 		pool.Go(func() {
 			defer dnsmsg.ReleaseQuestion(q)
-			c.doPreFetch(prefetchKey, q, reqCtx.req.remote, reqCtx.req.local, u)
+			c.doPreFetch(prefetchKey, q, remoteAddr, localAddr, u)
 		})
 	}
 }

@@ -173,8 +173,15 @@ func (s *udpServer) run() {
 func (s *udpServer) handleReq(remoteC netip.AddrPort, oob []byte, ctx context.Context, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
 	r := s.r
 	c := s.c
-	resp := r.handleServerReq(ctx, m, remoteAddr, localAddr)
-	defer dnsmsg.ReleaseMsg(resp)
+
+	rc := getRequestContext()
+	rc.RemoteAddr = remoteAddr
+	rc.LocalAddr = localAddr
+
+	r.handleServerReq(ctx, m, rc)
+	resp := rc.Response.Msg
+	dnsmsg.ReleaseMsg(m)
+	releaseRequestContext(rc)
 
 	// Determine the client udp size. Try to find edns0.
 	clientUdpSize := 512
@@ -186,15 +193,14 @@ func (s *udpServer) handleReq(remoteC netip.AddrPort, oob []byte, ctx context.Co
 			}
 		}
 	}
-	buf := pool.GetBuf(clientUdpSize)
-	defer pool.ReleaseBuf(buf)
-	bs := buf.B()
-	n, err := resp.Pack(bs, true, clientUdpSize)
+
+	b, err := packResp(resp, true, clientUdpSize)
+	dnsmsg.ReleaseMsg(resp)
 	if err != nil {
 		s.logger.Error(logPackRespErr, zap.Error(err))
 		return
 	}
-	if _, _, err := c.WriteMsgUDPAddrPort(bs[:n], oob, remoteC); err != nil {
+	if _, _, err := c.WriteMsgUDPAddrPort(b.B(), oob, remoteC); err != nil {
 		s.logger.Check(zap.WarnLevel, "failed to write udp response").Write(
 			zap.Stringer("local", c.LocalAddr()),
 			zap.Stringer("remote", c.RemoteAddr()),

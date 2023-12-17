@@ -246,9 +246,17 @@ func tcpWriteLoop(ctx context.Context, c net.Conn, ch chan *pool.Buffer) error {
 
 func (s *tcpServer) handleReq(ctx context.Context, c net.Conn, wc chan *pool.Buffer, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
 	r := s.r
-	resp := r.handleServerReq(ctx, m, remoteAddr, localAddr)
-	defer dnsmsg.ReleaseMsg(resp)
+
+	rc := getRequestContext()
+	rc.RemoteAddr = remoteAddr
+	rc.LocalAddr = localAddr
+
+	r.handleServerReq(ctx, m, rc)
+	resp := rc.Response.Msg
+	releaseRequestContext(rc)
+
 	buf, err := packRespTCP(resp, true)
+	dnsmsg.ReleaseMsg(resp)
 	if err != nil {
 		s.logger.Error(logPackRespErr, zap.Error(err))
 		return

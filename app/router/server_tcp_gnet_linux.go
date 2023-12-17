@@ -191,11 +191,16 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		}
 
 		pool.Go(func() {
-			defer dnsmsg.ReleaseMsg(m)
-			resp := e.r.handleServerReq(cc.ctx, m, cc.remoteAddr, cc.localAddr)
-			defer dnsmsg.ReleaseMsg(resp)
+			rc := getRequestContext()
+			rc.RemoteAddr = cc.remoteAddr
+			rc.LocalAddr = cc.localAddr
+			e.r.handleServerReq(cc.ctx, m, rc)
+			resp := rc.Response.Msg
+			dnsmsg.ReleaseMsg(m)
+			releaseRequestContext(rc)
 
 			buf, err := packRespTCP(resp, true)
+			dnsmsg.ReleaseMsg(resp)
 			if err != nil {
 				e.logger.Error(logPackRespErr, zap.Error(err))
 				return

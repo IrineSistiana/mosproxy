@@ -130,12 +130,18 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if m == nil {
 		return
 	}
-	defer dnsmsg.ReleaseMsg(m)
 
-	resp := h.r.handleServerReq(req.Context(), m, remoteAddr, h.localAddr)
-	defer dnsmsg.ReleaseMsg(resp)
+	rc := getRequestContext()
+	rc.RemoteAddr = remoteAddr
+	rc.LocalAddr = h.localAddr
+
+	h.r.handleServerReq(req.Context(), m, rc)
+	resp := rc.Response.Msg
+	dnsmsg.ReleaseMsg(m)
+	releaseRequestContext(rc)
 
 	buf, err := packResp(resp, true, 65535)
+	dnsmsg.ReleaseMsg(resp)
 	if err != nil {
 		h.logger.Error(logPackRespErr, reqField(req), zap.Error(err))
 		w.WriteHeader(http.StatusInternalServerError)

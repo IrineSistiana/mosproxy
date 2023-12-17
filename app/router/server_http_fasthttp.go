@@ -116,12 +116,18 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 	if m == nil {
 		return
 	}
-	defer dnsmsg.ReleaseMsg(m)
 
-	resp := h.r.handleServerReq(ctx, m, remoteAddr, localAddr)
-	defer dnsmsg.ReleaseMsg(resp)
+	rc := getRequestContext()
+	rc.RemoteAddr = remoteAddr
+	rc.LocalAddr = localAddr
+
+	h.r.handleServerReq(ctx, m, rc)
+	resp := rc.Response.Msg
+	dnsmsg.ReleaseMsg(m)
+	releaseRequestContext(rc)
 
 	buf, err := packResp(resp, true, 65535)
+	dnsmsg.ReleaseMsg(resp)
 	if err != nil {
 		h.logger.Warn(logPackRespErr, fasthttpCtxField(ctx), zap.Error(err))
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)

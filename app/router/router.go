@@ -211,77 +211,107 @@ var (
 	errRequestTimeout = errors.New("request timeout")
 )
 
-// Always returns a non-nil resp.
-// Does not take the ownership of req.m.
-// Caller has the responsibility to release the req.m and resp.
-func (r *router) handleServerReq(ctx context.Context, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) *dnsmsg.Msg {
+// rc will always have a non-nil response msg.
+// Does not take the ownership of m.
+// Caller has the responsibility to release the m and the resp.
+func (r *router) handleServerReq(ctx context.Context, m *dnsmsg.Msg, rc *RequestContext) {
+	defer func() { // Make sure always returns a resp
+		if rc.Response.Msg == nil {
+			rc.Response.Msg = makeEmptyRespM(m, dnsmsg.RCodeServerFailure)
+		}
+	}()
+
+	for _, f := range MiddlewarePreProcessors {
+		f(ctx, m, rc)
+		if ctxDone(ctx) {
+			return
+		}
+		if rc.Response.Msg != nil {
+			goto postMiddlewares // skip router's rules
+		}
+	}
+
+	r.handleReqMsg(ctx, m, rc)
+	if ctxDone(ctx) {
+		return
+	}
+
+postMiddlewares:
+	for i, f := range MiddlewarePostProcessors {
+		f(ctx, m, rc)
+		if ctxDone(ctx) {
+			return
+		}
+		if rc.Response.Msg == nil {
+			r.logger.Error("misbehaved post middleware, nil response", zap.Int("middleware_idx", i))
+			break
+		}
+	}
+}
+
+func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
+	resp := dnsmsg.NewMsg()
+	resp.Header.RCode = rcode
+	for n := m.Questions.Head(); n != nil; n = n.Next() {
+		resp.Questions.Add(n.Value().Copy())
+	}
+	return resp
+}
+
+func (r *router) handleReqMsg(ctx context.Context, m *dnsmsg.Msg, rc *RequestContext) {
 	hdr := m.Header
 	notImpl := hdr.Response ||
 		!hdr.RecursionDesired ||
 		hdr.OpCode != dnsmsg.OpCode(0) ||
 		m.Questions.Len() != 1
 
-	var resp *dnsmsg.Msg
 	if notImpl {
-		resp := dnsmsg.NewMsg()
-		resp.Header.RCode = dnsmsg.RCodeNotImplemented
-		for n := m.Questions.Head(); n != nil; n = n.Next() {
-			resp.Questions.Add(n.Value())
-		}
 		if r.opt.logInvalid {
 			r.logger.Check(zap.WarnLevel, "suspicious query msg").Write(
-				zap.String("local", localAddr.String()),
-				zap.String("remote", remoteAddr.String()),
+				zap.Stringer("remote", rc.RemoteAddr),
+				zap.Stringer("local", rc.LocalAddr),
 			)
 		}
+		rc.Response.Msg = makeEmptyRespM(m, dnsmsg.RCodeNotImplemented)
 	} else {
 		q := m.Questions.Head().Value().Copy()
 		asciiToLower(q.Name.B())
-		qc := &reqContext{
-			start: time.Now(),
-			req: request{
-				q:      q,
-				remote: remoteAddr,
-				local:  localAddr,
-			},
-		}
 		defer dnsmsg.ReleaseQuestion(q)
 
 		ctx, cancel := context.WithTimeoutCause(ctx, time.Second*5, errRequestTimeout)
-		r.handleReq(ctx, qc)
+		r.handleReq(ctx, q, rc)
 		cancel()
-		if r.opt.logQueries {
-			r.logger.Info("query summary", zap.Inline(qc))
-		}
-		resp = qc.resp.m
 
-		hasEdns0 := false
+		clientSupportEDNS0 := false
 		for n := m.Additionals.Head(); n != nil; n = n.Next() {
 			if n.Value().Type == dnsmsg.TypeOPT {
-				hasEdns0 = true
+				clientSupportEDNS0 = true
 				break
 			}
 		}
 
-		if hasEdns0 { // client does not support edns0
-			// remove opt from resp
-			removeOpt(resp)
+		if clientSupportEDNS0 {
+			addOrReplaceOpt(rc.Response.Msg, udpSize)
 		} else {
-			addOrReplaceOpt(resp, udpSize)
+			// remove opt from resp
+			removeOpt(rc.Response.Msg)
+		}
+
+		if r.opt.logQueries {
+			r.logger.Check(zap.InfoLevel, "query summary").Write(inlineQ(q), zap.Inline(rc)) // TODO: Better struct. Do not use inline.
 		}
 	}
 
-	resp.Header.ID = m.Header.ID
-	resp.Header.Response = true
-	resp.Header.OpCode = m.Header.OpCode
-	resp.Header.RecursionAvailable = true
-	resp.Header.RecursionDesired = m.Header.RecursionDesired
-	return resp
+	rc.Response.Msg.Header.ID = m.Header.ID
+	rc.Response.Msg.Header.Response = true
+	rc.Response.Msg.Header.OpCode = m.Header.OpCode
+	rc.Response.Msg.Header.RecursionAvailable = true
+	rc.Response.Msg.Header.RecursionDesired = m.Header.RecursionDesired
 }
 
-func (r *router) handleReq(ctx context.Context, reqCtx *reqContext) {
+// always returns a resp
+func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestContext) {
 	// Match rules
-	q := reqCtx.req.q
 	var matchedRule *rule
 	for i, rule := range r.rules {
 		if rule.matcher != nil {
@@ -293,53 +323,52 @@ func (r *router) handleReq(ctx context.Context, reqCtx *reqContext) {
 				continue
 			}
 		}
-		reqCtx.resp.ruleIdx = i
+		rc.Response.RuleIdx = i
 		matchedRule = rule
 		break
 	}
 
 	if matchedRule == nil {
-		makeEmptyResp(reqCtx, uint16(dnsmsg.RCodeRefused))
+		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeRefused))
 		return
 	}
 	if rejectRCode := matchedRule.reject; rejectRCode > 0 {
-		makeEmptyResp(reqCtx, rejectRCode)
+		makeEmptyResp(q, rc, rejectRCode)
 		return
 	}
 	if matchedRule.upstream == nil {
-		makeEmptyResp(reqCtx, uint16(dnsmsg.RCodeRefused))
+		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeRefused))
 		return
 	}
 
 	upstream := matchedRule.upstream
 
 	// lookup cache
-	resp, storedTime, expireTime, err := r.cache.Get(ctx, reqCtx.req.q, reqCtx.req.remote.Addr())
+	resp, storedTime, expireTime, err := r.cache.Get(ctx, q, rc.RemoteAddr.Addr())
 	if err != nil {
 		r.logger.Error("cache error", zap.Error(err)) // TODO: Better message.
-		makeEmptyResp(reqCtx, uint16(dnsmsg.RCodeServerFailure))
+		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))
 		return
 	}
 	if r.cache.NeedPrefetch(storedTime, expireTime) {
-		r.cache.AsyncSingleFlightPrefetch(reqCtx, upstream)
+		r.cache.AsyncSingleFlightPrefetch(q, rc.RemoteAddr, rc.LocalAddr, upstream)
 	}
 	if resp != nil { // cache hit
-		reqCtx.resp.m = resp
-		reqCtx.resp.cached = true
+		rc.Response.Msg = resp
+		rc.Response.Cached = true
 		return
 	}
 
-	resp, err = r.forward(ctx, upstream, reqCtx.req.q, reqCtx.req.remote, reqCtx.req.local)
+	resp, err = r.forward(ctx, upstream, q, rc.RemoteAddr, rc.LocalAddr)
 	if err != nil {
-		r.logger.Error("failed to forward req", inlineQ(reqCtx.req.q), zap.String("upstream", upstream.tag), zap.Error(err))
-		makeEmptyResp(reqCtx, uint16(dnsmsg.RCodeServerFailure))
+		r.logger.Error("failed to forward req", inlineQ(q), zap.String("upstream", upstream.tag), zap.Error(err))
+		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))
 		return
 	}
-	reqCtx.resp.m = resp
-	reqCtx.resp.upstream = upstream.tag
+	rc.Response.Msg = resp
 
 	// save upstream resp to cache
-	r.cache.Store(reqCtx.req.q, reqCtx.req.remote.Addr(), resp)
+	r.cache.Store(q, rc.RemoteAddr.Addr(), resp)
 }
 
 func (r *router) forward(
@@ -361,11 +390,11 @@ func (r *router) forward(
 	return resp, nil
 }
 
-func makeEmptyResp(req *reqContext, rcode uint16) {
+func makeEmptyResp(q *dnsmsg.Question, rc *RequestContext, rcode uint16) {
 	resp := dnsmsg.NewMsg()
 	resp.Header.RCode = dnsmsg.RCode(rcode)
-	resp.Questions.Add(req.req.q.Copy())
-	req.resp.m = resp
+	resp.Questions.Add(q.Copy())
+	rc.Response.Msg = resp
 }
 
 func (r *router) packReq(q *dnsmsg.Question, remoteAddr netip.AddrPort) (*pool.Buffer, error) {
