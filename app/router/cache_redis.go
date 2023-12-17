@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
@@ -19,6 +20,8 @@ import (
 type redisCache struct {
 	client rueidis.Client
 	logger *zap.Logger
+
+	disabled atomic.Bool
 
 	setOpChan chan redisSetOp
 
@@ -55,7 +58,7 @@ func newRedisCache(u string, logger *zap.Logger) (*redisCache, error) {
 		info, err := client.Do(ctx, client.B().Info().Build()).ToString()
 		cancel()
 		if err != nil {
-			logger.Warn("redis server ping check failed", zap.Error(err))
+			logger.Error("redis server ping check failed", zap.Error(err))
 		} else {
 			fs := []zap.Field{
 				zap.Duration("latency", time.Since(start)),
@@ -102,6 +105,7 @@ func newRedisCache(u string, logger *zap.Logger) (*redisCache, error) {
 	})
 
 	go c.setLoop()
+	go c.pingLoop()
 	return c, nil
 }
 
@@ -140,6 +144,10 @@ func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) *poo
 // Returned error is redis connection error.
 // The error of broking/invalid stored data will be logged.
 func (c *redisCache) Get(ctx context.Context, q *dnsmsg.Question, mark uint32) (storedTime, expireTime time.Time, resp *dnsmsg.Msg, v []byte, err error) {
+	if c.disabled.Load() {
+		return
+	}
+
 	key := c.buildKey(q, mark)
 	defer pool.ReleaseBuf(key)
 	start := time.Now()
@@ -178,6 +186,10 @@ func (c *redisCache) Get(ctx context.Context, q *dnsmsg.Question, mark uint32) (
 }
 
 func (c *redisCache) AsyncStore(q *dnsmsg.Question, marker uint32, storedTime, expireTime time.Time, v []byte) {
+	if c.disabled.Load() {
+		return
+	}
+
 	ttlMs := time.Until(expireTime).Milliseconds()
 	if ttlMs <= 10 {
 		return
@@ -191,6 +203,34 @@ func (c *redisCache) AsyncStore(q *dnsmsg.Question, marker uint32, storedTime, e
 		pool.ReleaseBuf(key)
 		pool.ReleaseBuf(value)
 		c.setDroppedTotal.Inc()
+	}
+}
+
+func (c *redisCache) pingLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.closeNotify:
+			return
+		case <-ticker.C:
+			start := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			err := c.client.Do(ctx, c.client.B().Ping().Build()).Error()
+			cancel()
+			if err != nil {
+				c.disabled.Store(true)
+				c.logger.Check(zap.ErrorLevel, "redis server ping failed").Write(
+					zap.Duration("elapsed", time.Since(start)),
+					zap.Error(err),
+				)
+			} else {
+				c.disabled.Store(false)
+				c.logger.Check(zap.DebugLevel, "redis server ping check successful").Write(
+					zap.Duration("latency", time.Since(start)),
+				)
+			}
+		}
 	}
 }
 
