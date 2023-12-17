@@ -194,7 +194,7 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 			rc := getRequestContext()
 			rc.RemoteAddr = cc.remoteAddr
 			rc.LocalAddr = cc.localAddr
-			e.r.handleServerReq(cc.ctx, m, rc)
+			e.r.handleServerReq(m, rc)
 			resp := rc.Response.Msg
 			dnsmsg.ReleaseMsg(m)
 			releaseRequestContext(rc)

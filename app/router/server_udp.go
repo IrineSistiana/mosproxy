@@ -2,7 +2,6 @@ package router
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -62,8 +61,6 @@ func (s *udpServer) run() {
 	r := s.r
 	c := s.c
 	listenerAddr := c.LocalAddr().(*net.UDPAddr).AddrPort()
-	connCtx, cancel := context.WithCancelCause(r.ctx)
-	defer cancel(errListenerClosed)
 
 	rbp := pool.GetBuf(65535)
 	defer pool.ReleaseBuf(rbp)
@@ -165,12 +162,12 @@ func (s *udpServer) run() {
 
 		pool.Go(func() {
 			defer dnsmsg.ReleaseMsg(m)
-			s.handleReq(remoteAddrC, sessionOob, connCtx, m, remoteAddr, localAddr)
+			s.handleReq(remoteAddrC, sessionOob, m, remoteAddr, localAddr)
 		})
 	}
 }
 
-func (s *udpServer) handleReq(remoteC netip.AddrPort, oob []byte, ctx context.Context, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
+func (s *udpServer) handleReq(remoteC netip.AddrPort, oob []byte, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
 	r := s.r
 	c := s.c
 
@@ -178,7 +175,7 @@ func (s *udpServer) handleReq(remoteC netip.AddrPort, oob []byte, ctx context.Co
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
 
-	r.handleServerReq(ctx, m, rc)
+	r.handleServerReq(m, rc)
 	resp := rc.Response.Msg
 	dnsmsg.ReleaseMsg(m)
 	releaseRequestContext(rc)

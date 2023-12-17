@@ -121,28 +121,22 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
 
-	h.r.handleServerReq(ctx, m, rc)
+	h.r.handleServerReq(m, rc)
 	resp := rc.Response.Msg
 	dnsmsg.ReleaseMsg(m)
 	releaseRequestContext(rc)
 
-	buf, err := packResp(resp, true, 65535)
+	msgBody, err := packResp(resp, true, 65535)
 	dnsmsg.ReleaseMsg(resp)
 	if err != nil {
 		h.logger.Warn(logPackRespErr, fasthttpCtxField(ctx), zap.Error(err))
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 		return
 	}
-	defer pool.ReleaseBuf(buf)
+	defer pool.ReleaseBuf(msgBody)
 
 	ctx.Response.Header.Add("Content-Type", "application/dns-message")
-	if _, err := ctx.Write(buf.B()); err != nil {
-		h.logger.Check(zap.DebugLevel, "failed to write http response").Write(
-			fasthttpCtxField(ctx),
-			zap.Error(err),
-		)
-		return
-	}
+	ctx.SetBody(msgBody.B())
 }
 
 func readClientAddrFromXFFBytes(b []byte) (netip.Addr, error) {

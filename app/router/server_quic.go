@@ -143,7 +143,7 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
 
-	r.handleServerReq(stream.Context(), m, rc)
+	r.handleServerReq(m, rc)
 	resp := rc.Response.Msg
 	dnsmsg.ReleaseMsg(m)
 	releaseRequestContext(rc)
@@ -156,10 +156,12 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 	}
 	defer pool.ReleaseBuf(respBuf)
 	if _, err := stream.Write(respBuf.B()); err != nil {
-		s.logger.Check(zap.DebugLevel, "failed to write quic response").Write(
-			zap.Stringer("local", c.LocalAddr()),
-			zap.Stringer("remote", c.RemoteAddr()),
-			zap.Error(err),
-		)
+		if r.opt.logInvalid {
+			s.logger.Check(zap.WarnLevel, "failed to write quic response").Write(
+				zap.Stringer("local", c.LocalAddr()),
+				zap.Stringer("remote", c.RemoteAddr()),
+				zap.Error(err),
+			)
+		}
 	}
 }

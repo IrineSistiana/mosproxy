@@ -244,14 +244,14 @@ func tcpWriteLoop(ctx context.Context, c net.Conn, ch chan *pool.Buffer) error {
 	}
 }
 
-func (s *tcpServer) handleReq(ctx context.Context, c net.Conn, wc chan *pool.Buffer, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
+func (s *tcpServer) handleReq(connCtx context.Context, c net.Conn, wc chan *pool.Buffer, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
 	r := s.r
 
 	rc := getRequestContext()
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
 
-	r.handleServerReq(ctx, m, rc)
+	r.handleServerReq(m, rc)
 	resp := rc.Response.Msg
 	releaseRequestContext(rc)
 
@@ -262,9 +262,9 @@ func (s *tcpServer) handleReq(ctx context.Context, c net.Conn, wc chan *pool.Buf
 		return
 	}
 
-	err = asyncWriteMsg(ctx, wc, buf)
+	err = asyncWriteMsg(connCtx, wc, buf)
 	if err != nil && s.r.opt.logInvalid {
-		s.logger.Check(zap.DebugLevel, "failed to write tcp response").Write(
+		s.logger.Check(zap.WarnLevel, "failed to write tcp response").Write(
 			zap.Stringer("local", c.LocalAddr()),
 			zap.Stringer("remote", c.RemoteAddr()),
 			zap.Error(err),

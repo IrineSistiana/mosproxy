@@ -135,7 +135,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = h.localAddr
 
-	h.r.handleServerReq(req.Context(), m, rc)
+	h.r.handleServerReq(m, rc)
 	resp := rc.Response.Msg
 	dnsmsg.ReleaseMsg(m)
 	releaseRequestContext(rc)
@@ -151,10 +151,12 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "application/dns-message")
 	if _, err := w.Write(buf.B()); err != nil {
-		h.logger.Check(zap.DebugLevel, "failed to write http response").Write(
-			reqField(req),
-			zap.Error(err),
-		)
+		if h.r.opt.logInvalid {
+			h.logger.Check(zap.WarnLevel, "failed to write http response").Write(
+				reqField(req),
+				zap.Error(err),
+			)
+		}
 		return
 	}
 }

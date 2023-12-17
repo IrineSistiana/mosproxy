@@ -214,9 +214,11 @@ var (
 // rc will always have a non-nil response msg.
 // Does not take the ownership of m.
 // Caller has the responsibility to release the m and the resp.
-func (r *router) handleServerReq(ctx context.Context, m *dnsmsg.Msg, rc *RequestContext) {
-	defer func() { // Make sure always returns a resp
-		if rc.Response.Msg == nil {
+func (r *router) handleServerReq(m *dnsmsg.Msg, rc *RequestContext) {
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second*6, errRequestTimeout)
+	defer func() {
+		cancel()
+		if rc.Response.Msg == nil { // Make sure always returns a resp
 			rc.Response.Msg = makeEmptyRespM(m, dnsmsg.RCodeServerFailure)
 		}
 	}()
@@ -278,9 +280,7 @@ func (r *router) handleReqMsg(ctx context.Context, m *dnsmsg.Msg, rc *RequestCon
 		asciiToLower(q.Name.B())
 		defer dnsmsg.ReleaseQuestion(q)
 
-		ctx, cancel := context.WithTimeoutCause(ctx, time.Second*5, errRequestTimeout)
 		r.handleReq(ctx, q, rc)
-		cancel()
 
 		clientSupportEDNS0 := false
 		for n := m.Additionals.Head(); n != nil; n = n.Next() {
