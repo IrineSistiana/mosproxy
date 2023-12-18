@@ -15,6 +15,7 @@ type Response struct {
 	Msg     *dnsmsg.Msg
 	RuleIdx int
 	Cached  bool
+	IpMark  string
 }
 
 type RequestContext struct {
@@ -61,13 +62,18 @@ func (rc *RequestContext) MarshalLogObject(e zapcore.ObjectEncoder) error {
 		printAddr(e, rc.LocalAddr, "local")
 	}
 
+	e.AddInt("rule", rc.Response.RuleIdx)
+
 	resp := rc.Response.Msg
 	if rc.Response.Msg != nil {
-		e.AddInt("rule", rc.Response.RuleIdx)
 		e.AddUint16("rcode", uint16(resp.Header.RCode))
-		if rc.Response.Cached {
-			e.AddBool("cached", true)
-		}
+	}
+	if rc.Response.Cached {
+		e.AddBool("cached", true)
+	}
+	
+	if len(rc.Response.IpMark) > 0 {
+		e.AddString("ip_mark", rc.Response.IpMark)
 	}
 
 	if !rc.start.IsZero() {

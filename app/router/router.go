@@ -342,7 +342,7 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 	upstream := matchedRule.upstream
 
 	// lookup cache
-	resp, storedTime, expireTime, err := r.cache.Get(ctx, q, rc.RemoteAddr.Addr())
+	resp, storedTime, expireTime, err := r.cache.Get(ctx, q, rc)
 	if err != nil {
 		r.logger.Error("cache error", zap.Error(err)) // TODO: Better message.
 		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))

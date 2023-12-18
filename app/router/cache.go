@@ -238,12 +238,9 @@ func (c *cache) doPreFetch(prefetchKey uint64, q *dnsmsg.Question, remoteAddr, l
 // ip can be invalid, then mark 0 will be used.
 // The ctx is for redis cache, and the error, if not nil, will be a redis io error.
 // Invalid msg/data error will be logged instead of returning an error.
-func (c *cache) Get(ctx context.Context, q *dnsmsg.Question, clientAddr netip.Addr) (resp *dnsmsg.Msg, storedTime, expireTime time.Time, err error) {
-	if c.memory == nil && c.redis == nil {
-		return
-	}
-
-	ipMark := c.ipMark(clientAddr)
+func (c *cache) Get(ctx context.Context, q *dnsmsg.Question, rc *RequestContext) (resp *dnsmsg.Msg, storedTime, expireTime time.Time, err error) {
+	ipMark := c.ipMark(rc.RemoteAddr.Addr())
+	rc.Response.IpMark = ipMark
 
 	// memory cache
 	if c.memory != nil {
