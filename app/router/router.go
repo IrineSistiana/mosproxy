@@ -250,7 +250,11 @@ postMiddlewares:
 
 func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
 	resp := dnsmsg.NewMsg()
-	resp.Header.RCode = rcode
+	resp.ID = m.ID
+	resp.OpCode = m.OpCode
+	resp.Response = true
+	resp.RecursionDesired = m.RecursionDesired
+	resp.RCode = rcode
 	for n := m.Questions.Head(); n != nil; n = n.Next() {
 		resp.Questions.Add(n.Value().Copy())
 	}
