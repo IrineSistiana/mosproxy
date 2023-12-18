@@ -122,15 +122,18 @@ func (c *redisCache) Close() error {
 	return nil
 }
 
-func (c *redisCache) buildKey(q *dnsmsg.Question, marker uint32) *pool.Buffer {
-	b := pool.GetBuf(q.Name.Len() + 8)
-	off := copy(b.B(), q.Name.B())
-	binary.BigEndian.PutUint16(b.B()[off:], uint16(q.Class))
+func (c *redisCache) buildKey(q *dnsmsg.Question, marker string) *pool.Buffer {
+	bp := pool.GetBuf(1 + q.Name.Len() + 4 + len(marker))
+	b := bp.B()
+	b[0] = byte(q.Name.Len())
+	off := 1
+	off += copy(b[off:], q.Name.B())
+	binary.BigEndian.PutUint16(b[off:], uint16(q.Class))
 	off += 2
-	binary.BigEndian.PutUint16(b.B()[off:], uint16(q.Type))
+	binary.BigEndian.PutUint16(b[off:], uint16(q.Type))
 	off += 2
-	binary.BigEndian.PutUint32(b.B()[off:], marker)
-	return b
+	copy(b[off:], []byte(marker))
+	return bp
 }
 
 func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) *pool.Buffer {
@@ -143,7 +146,7 @@ func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) *poo
 
 // Returned error is redis connection error.
 // The error of broking/invalid stored data will be logged.
-func (c *redisCache) Get(ctx context.Context, q *dnsmsg.Question, mark uint32) (storedTime, expireTime time.Time, resp *dnsmsg.Msg, v []byte, err error) {
+func (c *redisCache) Get(ctx context.Context, q *dnsmsg.Question, mark string) (storedTime, expireTime time.Time, resp *dnsmsg.Msg, v []byte, err error) {
 	if c.disabled.Load() {
 		return
 	}
@@ -185,7 +188,7 @@ func (c *redisCache) Get(ctx context.Context, q *dnsmsg.Question, mark uint32) (
 	return
 }
 
-func (c *redisCache) AsyncStore(q *dnsmsg.Question, marker uint32, storedTime, expireTime time.Time, v []byte) {
+func (c *redisCache) AsyncStore(q *dnsmsg.Question, mark string, storedTime, expireTime time.Time, v []byte) {
 	if c.disabled.Load() {
 		return
 	}
@@ -195,7 +198,7 @@ func (c *redisCache) AsyncStore(q *dnsmsg.Question, marker uint32, storedTime, e
 		return
 	}
 
-	key := c.buildKey(q, marker)
+	key := c.buildKey(q, mark)
 	value := c.buildValue(storedTime, expireTime, v)
 	select {
 	case c.setOpChan <- redisSetOp{k: key, v: value, ttlMs: ttlMs}:

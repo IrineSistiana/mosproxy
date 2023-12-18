@@ -15,10 +15,10 @@ func Test_loadMarker(t *testing.T) {
 	r := require.New(t)
 	data := "224.0.0.0,255.255.255.255,1\n" +
 		"::,::1,2"
-	l, marks, err := loadIpMarkerFromReader(strings.NewReader(data))
-	r.Equal(2, marks)
+	marker, err := loadIpMarkerFromReader(strings.NewReader(data))
 	r.NoError(err)
-	r.Equal(2, l.Len())
+	r.Equal(2, marker.IpLen())
+	r.Equal(2, marker.MarkLen())
 }
 
 func Benchmark_Compress(b *testing.B) {

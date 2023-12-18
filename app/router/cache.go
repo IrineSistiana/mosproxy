@@ -3,11 +3,9 @@ package router
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/netip"
 	"os"
 	"strings"
@@ -63,15 +61,15 @@ func (r *router) initCache(cfg *CacheConfig) (*cache, error) {
 	}
 
 	if len(cfg.IpMarker) > 0 {
-		marker, markerNum, err := loadIpMarkerFromFile(cfg.IpMarker)
+		marker, err := loadIpMarkerFromFile(cfg.IpMarker)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load ip marker, %w", err)
 		}
 		c.logger.Info(
 			"ip marker file loaded",
 			zap.String("file", cfg.IpMarker),
-			zap.Int("length", marker.Len()),
-			zap.Int("marks", markerNum),
+			zap.Int("length", marker.IpLen()),
+			zap.Int("marks", marker.MarkLen()),
 		)
 		c.ipMarker = marker
 	}
@@ -96,10 +94,10 @@ func (r *router) initCache(cfg *CacheConfig) (*cache, error) {
 type cache struct {
 	r          *router
 	logger     *zap.Logger
-	maximumTtl time.Duration         // Always valid. Has default value.
-	ipMarker   *netlist.List[uint32] // Maybe nil.
-	memory     *memoryCache          // Maybe nil
-	redis      *redisCache           // Maybe nil
+	maximumTtl time.Duration // Always valid. Has default value.
+	ipMarker   *ipMarker     // Maybe nil.
+	memory     *memoryCache  // Maybe nil
+	redis      *redisCache   // Maybe nil
 
 	prefetch    bool
 	prefetchMu  sync.Mutex
@@ -275,13 +273,12 @@ func (c *cache) Get(ctx context.Context, q *dnsmsg.Question, clientAddr netip.Ad
 }
 
 // Lookup the mark of the addr.
-// For convenience, if c.ipMarker==nil || addr is not valid, returns 0.
-func (c *cache) ipMark(addr netip.Addr) uint32 {
+// For convenience, if c.ipMarker==nil || addr is not valid, returns "".
+func (c *cache) ipMark(addr netip.Addr) string {
 	if c.ipMarker == nil || !addr.IsValid() {
-		return 0
+		return ""
 	}
-	n, _ := c.ipMarker.LookupAddr(addr)
-	return n
+	return c.ipMarker.Mark(addr)
 }
 
 // Always returns nil.
@@ -296,13 +293,11 @@ func (c *cache) Close() error {
 }
 
 // Hash the request key.
-func hashReq(q *dnsmsg.Question, ipMark uint32) (hash uint64) {
+func hashReq(q *dnsmsg.Question, ipMark string) (hash uint64) {
 	h1 := z.MemHash(q.Name.B())
-	var b [8]byte
-	binary.BigEndian.PutUint16(b[:], uint16(q.Class))
-	binary.BigEndian.PutUint16(b[2:], uint16(q.Type))
-	binary.BigEndian.PutUint32(b[4:], ipMark)
-	h2 := z.MemHash(b[:])
+	h1 += uint64(q.Class) << 16
+	h1 += uint64(q.Type)
+	h2 := z.MemHashString(ipMark)
 	return h1 ^ h2
 }
 
@@ -344,7 +339,31 @@ func unpackCacheMsg(m []byte) (*dnsmsg.Msg, error) {
 	return dnsmsg.UnpackMsg(decoded)
 }
 
-func loadIpMarkerFromReader(r io.Reader) (*netlist.List[uint32], int, error) {
+type ipMarker struct {
+	l *netlist.List[int]
+	s []string
+}
+
+func (m *ipMarker) Mark(addr netip.Addr) string {
+	if !addr.IsValid() {
+		return ""
+	}
+	idx, ok := m.l.LookupAddr(addr)
+	if !ok {
+		return ""
+	}
+	return m.s[idx]
+}
+
+func (m *ipMarker) IpLen() int {
+	return m.l.Len()
+}
+
+func (m *ipMarker) MarkLen() int {
+	return len(m.s)
+}
+
+func loadIpMarkerFromReader(r io.Reader) (*ipMarker, error) {
 	parseLine := func(s string) (_ netip.Addr, _ netip.Addr, _ string, err error) {
 		t, s, ok := strings.Cut(s, ",")
 		if !ok {
@@ -369,21 +388,18 @@ func loadIpMarkerFromReader(r io.Reader) (*netlist.List[uint32], int, error) {
 		return start, end, s, nil
 	}
 
-	listBuilder := netlist.NewBuilder[uint32](0)
-	assignedMarks := make(map[string]uint32)
-	nextMark := uint32(1) // 0 mark means not set. So, we start from 1.
-	assignMark := func(s string) (mark uint32, overflowed bool) {
-		mark, ok := assignedMarks[s]
+	listBuilder := netlist.NewBuilder[int](0)
+	labelIndexes := make(map[string]int)
+	labels := make([]string, 0)
+	assignIdx := func(s string) (idx int) {
+		idx, ok := labelIndexes[s]
 		if ok {
-			return mark, false
+			return idx
 		}
-		if nextMark == math.MaxUint32 {
-			return 0, true
-		}
-		mark = nextMark
-		assignedMarks[s] = nextMark
-		nextMark++
-		return mark, false
+		labels = append(labels, s)
+		idx = len(labels) - 1
+		labelIndexes[s] = idx
+		return idx
 	}
 
 	scanner := bufio.NewScanner(r)
@@ -398,30 +414,30 @@ func loadIpMarkerFromReader(r io.Reader) (*netlist.List[uint32], int, error) {
 		}
 		start, end, markStr, err := parseLine(t)
 		if err != nil {
-			return nil, 0, fmt.Errorf("invalid line #%d, %w", line, err)
+			return nil, fmt.Errorf("invalid line #%d, %w", line, err)
 		}
-		mark, overflowed := assignMark(markStr)
-		if overflowed {
-			return nil, 0, errors.New("too many marks")
-		}
-		if ok := listBuilder.Add(start, end, mark); !ok {
-			return nil, 0, fmt.Errorf("invalid range at line #%d", line)
+		idx := assignIdx(markStr)
+		if ok := listBuilder.Add(start, end, idx); !ok {
+			return nil, fmt.Errorf("invalid range at line #%d", line)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	l, err := listBuilder.Build()
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to build ip list, %w", err)
+		return nil, fmt.Errorf("failed to build ip list, %w", err)
 	}
-	return l, int(nextMark) - 1, nil
+	return &ipMarker{
+		l: l,
+		s: labels,
+	}, nil
 }
 
-func loadIpMarkerFromFile(fp string) (*netlist.List[uint32], int, error) {
+func loadIpMarkerFromFile(fp string) (*ipMarker, error) {
 	f, err := os.Open(fp)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	defer f.Close()
 	return loadIpMarkerFromReader(f)

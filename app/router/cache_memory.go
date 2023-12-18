@@ -48,7 +48,7 @@ func (c *memoryCache) RegisterMetricsTo(r prometheus.Registerer) error {
 	return regMetrics(r, c.getTotal, c.hitTotal)
 }
 
-func (c *memoryCache) Store(q *dnsmsg.Question, mark uint32, storedTime, expireTime time.Time, v []byte) {
+func (c *memoryCache) Store(q *dnsmsg.Question, mark string, storedTime, expireTime time.Time, v []byte) {
 	cost := q.Name.Len() + 4 + len(v) // TODO: Better cost calculation.
 	key := hashReq(q, mark)
 
@@ -65,7 +65,7 @@ func (c *memoryCache) Store(q *dnsmsg.Question, mark uint32, storedTime, expireT
 	c.backend.SetWithTTL(key, e, int64(cost), time.Until(expireTime))
 }
 
-func (c *memoryCache) Get(q *dnsmsg.Question, mark uint32) (resp *dnsmsg.Msg, storedTime, expireTime time.Time) {
+func (c *memoryCache) Get(q *dnsmsg.Question, mark string) (resp *dnsmsg.Msg, storedTime, expireTime time.Time) {
 	sameQuestion := func(n1, n2 *dnsmsg.Question) bool {
 		return n1.Class == n2.Class && n1.Type == n2.Type && bytes.Equal(n1.Name.B(), n2.Name.B())
 	}
@@ -106,7 +106,7 @@ type cacheEntry struct {
 	l          sync.RWMutex
 	storedTime time.Time
 	expireTime time.Time
-	ipMark     uint32
+	ipMark     string
 	q          *dnsmsg.Question // nil if released
 	v          *pool.Buffer     // nil if released
 }
@@ -125,7 +125,7 @@ func releaseEntry(e *cacheEntry) {
 	pool.ReleaseBuf(e.v)
 	e.storedTime = time.Time{}
 	e.expireTime = time.Time{}
-	e.ipMark = 0
+	e.ipMark = ""
 	e.q = nil
 	e.v = nil
 	e.l.Unlock()
