@@ -43,8 +43,8 @@ type UdpConfig struct {
 }
 
 type TcpConfig struct {
-	MaxConcurrentRequests int `yaml:"max_concurrent_requests"`
-	EngineNum             int `yaml:"engine_num"`
+	MaxConcurrentRequests int32 `yaml:"max_concurrent_requests"`
+	EngineNum             int   `yaml:"engine_num"`
 }
 
 type TlsConfig struct {

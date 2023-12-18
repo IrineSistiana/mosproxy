@@ -70,7 +70,7 @@ type engine struct {
 	r      *router
 
 	idleTimeout   time.Duration
-	maxConcurrent int
+	maxConcurrent int32
 }
 
 type connCtx struct {
@@ -165,7 +165,7 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 
 		// full body
 
-		if int(cc.concurrentRequests.Load()) > e.maxConcurrent {
+		if cc.concurrentRequests.Load() > e.maxConcurrent {
 			// Too many concurrent requests.
 			// TODO: Return a REFUSE instead of closing the connection?
 			e.logger.Check(zap.WarnLevel, "too many concurrent requests").Write(

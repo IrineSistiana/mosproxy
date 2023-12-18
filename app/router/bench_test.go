@@ -193,10 +193,10 @@ var initBenchServerOnce = sync.OnceFunc(func() {
 		Servers: []ServerConfig{
 			{Protocol: "udp", Listen: udpAddr, Socket: SocketConfig{SO_RCVBUF: 1024 * 1024, SO_SNDBUF: 1024 * 1024}},
 
-			{Protocol: "tcp", Listen: tcpAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt}},
-			{Protocol: "tcp", Listen: tcpUnixAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt}},
+			{Protocol: "tcp", Listen: tcpAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt32}},
+			{Protocol: "tcp", Listen: tcpUnixAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt32}},
 
-			{Protocol: "tls", Listen: tlsAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt}, Tls: tlsOpts},
+			{Protocol: "tls", Listen: tlsAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt32}, Tls: tlsOpts},
 
 			{Protocol: "http", Listen: httpAddr},
 			{Protocol: "http", Listen: httpUnixAddr},

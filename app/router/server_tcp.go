@@ -3,10 +3,10 @@ package router
 import (
 	"context"
 	"crypto/tls"
-	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
@@ -67,7 +67,7 @@ type tcpServer struct {
 	l             net.Listener
 	tlsConfig     *tls.Config // maybe nil
 	idleTimeout   time.Duration
-	maxConcurrent int
+	maxConcurrent int32
 	ppv2          bool
 	logger        *zap.Logger
 }
@@ -121,8 +121,8 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		cancel()
 		if err != nil {
 			s.logger.Check(zap.WarnLevel, "failed to tls handshake").Write(
-				zap.Stringer("local", c.LocalAddr()),
-				zap.Stringer("remote", c.RemoteAddr()),
+				zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
+				zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
 				zap.Error(err),
 			)
 			return
@@ -149,14 +149,14 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		err := tcpWriteLoop(connCtx, c, writeChan)
 		if err != nil {
 			s.logger.Check(zap.WarnLevel, "failed to write tcp response").Write(
-				zap.Stringer("local", c.LocalAddr()),
-				zap.Stringer("remote", c.RemoteAddr()),
+				zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
+				zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
 				zap.Error(err),
 			)
 		}
 	})
 
-	concurrentLimiter := make(chan struct{}, s.maxConcurrent)
+	concurrent := new(atomic.Int32)
 	emptyConn := true
 	for {
 		c.SetReadDeadline(time.Now().Add(s.idleTimeout))
@@ -181,23 +181,30 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		}
 		emptyConn = false
 
-		concurrentLimiter <- struct{}{}
+		if concurrent.Add(1) > s.maxConcurrent {
+			s.logger.Check(zap.WarnLevel, "too many concurrent requests").Write(
+				zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
+				zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
+				zap.Error(err),
+			)
+			return
+		}
+
 		pool.Go(func() {
-			s.handleReq(connCtx, c, writeChan, m, remoteAddr, localAddr)
+			s.handleReq(connCtx, writeChan, m, remoteAddr, localAddr)
 			dnsmsg.ReleaseMsg(m)
-			<-concurrentLimiter
+			concurrent.Add(-1)
 		})
 	}
 }
 
 // Note: asyncWriteMsg takes the ownership of the payload.
-func asyncWriteMsg(ctx context.Context, ch chan *pool.Buffer, payload *pool.Buffer) error {
+func asyncWriteMsg(ctx context.Context, ch chan *pool.Buffer, payload *pool.Buffer) {
 	select {
 	case <-ctx.Done():
 		defer pool.ReleaseBuf(payload)
-		return fmt.Errorf("failed to send payload to write queue, %w", context.Cause(ctx))
 	case ch <- payload:
-		return nil
+		return
 	}
 }
 
@@ -237,28 +244,18 @@ func tcpWriteLoop(ctx context.Context, c net.Conn, ch chan *pool.Buffer) error {
 	}
 }
 
-func (s *tcpServer) handleReq(connCtx context.Context, c net.Conn, wc chan *pool.Buffer, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
-	r := s.r
-
+func (s *tcpServer) handleReq(connCtx context.Context, wc chan *pool.Buffer, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
 	rc := getRequestContext()
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
 	defer releaseRequestContext(rc)
 
-	r.handleServerReq(m, rc)
+	s.r.handleServerReq(m, rc)
 
 	buf, err := packRespTCP(rc.Response.Msg, true)
 	if err != nil {
 		s.logger.Error(logPackRespErr, zap.Error(err))
 		return
 	}
-
-	err = asyncWriteMsg(connCtx, wc, buf)
-	if err != nil {
-		s.logger.Check(zap.WarnLevel, "failed to write tcp response").Write(
-			zap.Stringer("local", c.LocalAddr()),
-			zap.Stringer("remote", c.RemoteAddr()),
-			zap.Error(err),
-		)
-	}
+	asyncWriteMsg(connCtx, wc, buf)
 }
