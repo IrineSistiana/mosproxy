@@ -85,7 +85,6 @@ func newRouterCmd() *cobra.Command {
 
 type opt struct {
 	logQueries bool
-	logInvalid bool
 	ecsEnabled bool
 }
 
@@ -124,7 +123,6 @@ func run(ctx context.Context, cfg *Config) {
 		fatalErr:   make(chan fatalErr, 1),
 	}
 	r.opt.logQueries = cfg.Log.Queries
-	r.opt.logInvalid = cfg.Log.Invalid
 	r.opt.ecsEnabled = cfg.ECS.Enabled
 
 	// start metrics endpoint
@@ -267,12 +265,10 @@ func (r *router) handleReqMsg(ctx context.Context, m *dnsmsg.Msg, rc *RequestCon
 		m.Questions.Len() != 1
 
 	if notImpl {
-		if r.opt.logInvalid {
-			r.logger.Check(zap.WarnLevel, "suspicious query msg").Write(
-				zap.Stringer("remote", rc.RemoteAddr),
-				zap.Stringer("local", rc.LocalAddr),
-			)
-		}
+		r.logger.Check(zap.WarnLevel, "suspicious query msg").Write(
+			zap.Stringer("remote", rc.RemoteAddr),
+			zap.Stringer("local", rc.LocalAddr),
+		)
 		rc.Response.Msg = makeEmptyRespM(m, dnsmsg.RCodeNotImplemented)
 	} else {
 		q := m.Questions.Head().Value().Copy()

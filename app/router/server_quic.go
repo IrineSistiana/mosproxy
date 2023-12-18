@@ -130,13 +130,11 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 	stream.SetReadDeadline(time.Now().Add(quicStreamReadTimeout))
 	m, _, err := dnsutils.ReadMsgFromTCP(stream)
 	if err != nil {
-		if r.opt.logInvalid {
-			s.logger.Check(zap.WarnLevel, "invalid quic msg").Write(
-				zap.Stringer("local", c.LocalAddr()),
-				zap.Stringer("remote", c.RemoteAddr()),
-				zap.Error(err),
-			)
-		}
+		s.logger.Check(zap.WarnLevel, "invalid quic msg").Write(
+			zap.Stringer("local", c.LocalAddr()),
+			zap.Stringer("remote", c.RemoteAddr()),
+			zap.Error(err),
+		)
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
@@ -154,12 +152,10 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 	}
 	defer pool.ReleaseBuf(respBuf)
 	if _, err := stream.Write(respBuf.B()); err != nil {
-		if r.opt.logInvalid {
-			s.logger.Check(zap.WarnLevel, "failed to write quic response").Write(
-				zap.Stringer("local", c.LocalAddr()),
-				zap.Stringer("remote", c.RemoteAddr()),
-				zap.Error(err),
-			)
-		}
+		s.logger.Check(zap.WarnLevel, "failed to write quic response").Write(
+			zap.Stringer("local", c.LocalAddr()),
+			zap.Stringer("remote", c.RemoteAddr()),
+			zap.Error(err),
+		)
 	}
 }

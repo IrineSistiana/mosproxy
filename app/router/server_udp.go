@@ -150,13 +150,11 @@ func (s *udpServer) run() {
 
 		m, err := dnsmsg.UnpackMsg(rb[ppHdrL:n])
 		if err != nil {
-			if r.opt.logInvalid {
-				s.logger.Check(zap.WarnLevel, "invalid udp msg").Write(
-					zap.String("local", localAddr.String()),
-					zap.String("remote", remoteAddr.String()),
-					zap.Error(err),
-				)
-			}
+			s.logger.Check(zap.WarnLevel, "invalid udp msg").Write(
+				zap.String("local", localAddr.String()),
+				zap.String("remote", remoteAddr.String()),
+				zap.Error(err),
+			)
 			continue
 		}
 

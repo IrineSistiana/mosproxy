@@ -123,7 +123,7 @@ func (e *engine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 func (e *engine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	cc := c.Context().(*connCtx)
 	cc.cancel(err)
-	if e.r.opt.logInvalid && err != nil && !errors.Is(err, io.EOF) {
+	if err != nil && !errors.Is(err, io.EOF) {
 		// TODO: This log will be annoying. So the lvl is debug. Filter out the common errors?
 		e.logger.Check(zap.DebugLevel, "conn closed").Write(
 			zap.Stringer("remote", cc.remoteAddr),
@@ -180,13 +180,11 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		c.Discard(2 + int(l))
 		c.SetReadDeadline(time.Now().Add(e.idleTimeout))
 		if err != nil {
-			if e.r.opt.logInvalid {
-				e.logger.Check(zap.WarnLevel, "invalid msg").Write(
-					zap.Stringer("remote", cc.remoteAddr),
-					zap.Stringer("local", cc.localAddr),
-					zap.Error(err),
-				)
-			}
+			e.logger.Check(zap.WarnLevel, "invalid msg").Write(
+				zap.Stringer("remote", cc.remoteAddr),
+				zap.Stringer("local", cc.localAddr),
+				zap.Error(err),
+			)
 			return gnet.Close
 		}
 
@@ -211,7 +209,7 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 					err = c.Flush()
 				}
 				cc.concurrentRequests.Add(-1)
-				if err != nil && e.r.opt.logInvalid {
+				if err != nil {
 					e.logger.Check(zap.WarnLevel, "failed to write").Write(
 						zap.Stringer("remote", cc.remoteAddr),
 						zap.Stringer("local", cc.localAddr),
@@ -220,7 +218,7 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 				}
 				return nil
 			})
-			if err != nil && e.r.opt.logInvalid {
+			if err != nil {
 				e.logger.Check(zap.WarnLevel, "failed to async write").Write(
 					zap.Stringer("remote", cc.remoteAddr),
 					zap.Stringer("local", cc.localAddr),

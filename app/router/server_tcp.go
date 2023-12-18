@@ -88,7 +88,6 @@ func (s *tcpServer) run() {
 }
 
 func (s *tcpServer) handleConn(c net.Conn) {
-	r := s.r
 	// Read pp2 header
 	var ppHdr pp.HeaderV2 // maybe zero
 	if s.ppv2 {
@@ -121,13 +120,11 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		err := tlsConn.HandshakeContext(ctx)
 		cancel()
 		if err != nil {
-			if r.opt.logInvalid {
-				s.logger.Check(zap.WarnLevel, "failed to tls handshake").Write(
-					zap.Stringer("local", c.LocalAddr()),
-					zap.Stringer("remote", c.RemoteAddr()),
-					zap.Error(err),
-				)
-			}
+			s.logger.Check(zap.WarnLevel, "failed to tls handshake").Write(
+				zap.Stringer("local", c.LocalAddr()),
+				zap.Stringer("remote", c.RemoteAddr()),
+				zap.Error(err),
+			)
 			return
 		}
 		c = tlsConn
@@ -151,13 +148,11 @@ func (s *tcpServer) handleConn(c net.Conn) {
 	pool.Go(func() {
 		err := tcpWriteLoop(connCtx, c, writeChan)
 		if err != nil {
-			if s.r.opt.logInvalid {
-				s.logger.Check(zap.WarnLevel, "failed to write tcp response").Write(
-					zap.Stringer("local", c.LocalAddr()),
-					zap.Stringer("remote", c.RemoteAddr()),
-					zap.Error(err),
-				)
-			}
+			s.logger.Check(zap.WarnLevel, "failed to write tcp response").Write(
+				zap.Stringer("local", c.LocalAddr()),
+				zap.Stringer("remote", c.RemoteAddr()),
+				zap.Error(err),
+			)
 		}
 	})
 
@@ -167,22 +162,20 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		c.SetReadDeadline(time.Now().Add(s.idleTimeout))
 		m, n, err := dnsutils.ReadMsgFromTCP(connReader)
 		if err != nil {
-			if r.opt.logInvalid {
-				var errMsg string
-				if n > 0 {
-					errMsg = "invalid tcp msg"
-				} else if emptyConn {
-					errMsg = "empty tcp connection"
-				}
-				// Other cases: n == 0, has error, not empty conn.
-				// Most likely are normal close or idle timeout.
-				if len(errMsg) > 0 {
-					s.logger.Check(zap.WarnLevel, errMsg).Write(
-						zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
-						zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
-						zap.Error(err),
-					)
-				}
+			var errMsg string
+			if n > 0 {
+				errMsg = "invalid tcp msg"
+			} else if emptyConn {
+				errMsg = "empty tcp connection"
+			}
+			// Other cases: n == 0, has error, not empty conn.
+			// Most likely are normal close or idle timeout.
+			if len(errMsg) > 0 {
+				s.logger.Check(zap.WarnLevel, errMsg).Write(
+					zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
+					zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
+					zap.Error(err),
+				)
 			}
 			return
 		}
@@ -261,7 +254,7 @@ func (s *tcpServer) handleReq(connCtx context.Context, c net.Conn, wc chan *pool
 	}
 
 	err = asyncWriteMsg(connCtx, wc, buf)
-	if err != nil && s.r.opt.logInvalid {
+	if err != nil {
 		s.logger.Check(zap.WarnLevel, "failed to write tcp response").Write(
 			zap.Stringer("local", c.LocalAddr()),
 			zap.Stringer("remote", c.RemoteAddr()),

@@ -210,7 +210,6 @@ var initBenchServerOnce = sync.OnceFunc(func() {
 
 			{Protocol: "gnet", Listen: gnetAddr, Tcp: TcpConfig{EngineNum: 4}},
 		},
-		Log: LogConfig{Invalid: false},
 	}
 	go func() {
 		mlog.SetLevel(zap.WarnLevel) // disable log

@@ -149,12 +149,10 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "application/dns-message")
 	if _, err := w.Write(buf.B()); err != nil {
-		if h.r.opt.logInvalid {
-			h.logger.Check(zap.WarnLevel, "failed to write http response").Write(
-				reqField(req),
-				zap.Error(err),
-			)
-		}
+		h.logger.Check(zap.WarnLevel, "failed to write http response").Write(
+			reqField(req),
+			zap.Error(err),
+		)
 		return
 	}
 }

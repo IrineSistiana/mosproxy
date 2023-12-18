@@ -105,7 +105,6 @@ type AddonsConfig struct{}
 type LogConfig struct {
 	// TODO: More fine-grained log entry control. e.g can disable/enable each log field.
 	Queries bool `yaml:"queries"`
-	Invalid bool `yaml:"invalid"`
 }
 
 type CacheConfig struct {
