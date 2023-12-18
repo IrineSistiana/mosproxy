@@ -79,7 +79,6 @@ func newRouterCmd() *cobra.Command {
 		},
 	}
 	c.AddCommand(genConfigCmd)
-	c.AddCommand(newConvIpMarkerCmd())
 	return c
 }
 
