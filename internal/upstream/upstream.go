@@ -421,12 +421,10 @@ func (u *UDPWithPP2) ExchangeContextPP2(ctx context.Context, q []byte, remoteAdd
 		hdr.DestinationAddr = localAddr
 	}
 
-	ppHdrLen := hdr.Size()
-	b := pool.GetBuf(hdr.Size() + len(q))
-	defer pool.ReleaseBuf(b)
-	hdr.Put(b.B()[:ppHdrLen])
-	copy(b.B()[ppHdrLen:], q)
-	return u.t.ExchangeContextOff(ctx, b.B(), ppHdrLen)
+	hdrB := pool.GetBuf(hdr.Size())
+	defer pool.ReleaseBuf(hdrB)
+	hdr.Put(hdrB.B())
+	return u.t.ExchangeContextOff(ctx, hdrB.B(), q)
 }
 
 func (u *UDPWithPP2) Close() error {

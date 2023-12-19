@@ -32,7 +32,9 @@ type pipelineConn struct {
 	closeNotify chan struct{}
 	closeErr    error // closeErr is ready (not nil) when closeNotify is closed.
 
-	writeQueue  chan *pool.Buffer
+	// for tcp
+	tcpWriteQueue chan *pool.Buffer
+
 	readQueueMu sync.RWMutex
 	readQueue   map[uint32]chan *dnsmsg.Msg // uint32 has fast path
 
@@ -47,9 +49,29 @@ type pipelineConn struct {
 	eol        bool
 }
 
+func newPipelineConn(c net.Conn, t *PipelineTransport) *pipelineConn {
+	pc := &pipelineConn{
+		c: c,
+		t: t,
+
+		closeNotify: make(chan struct{}),
+		readQueue:   make(map[uint32]chan *dnsmsg.Msg),
+	}
+	if t.connIsTcp {
+		pc.tcpWriteQueue = make(chan *pool.Buffer, 8)
+	}
+	return pc
+}
+
+func (c *pipelineConn) startLoops() {
+	go c.readLoop()
+	if c.t.connIsTcp {
+		go c.writeLoopTCP()
+	}
+}
+
 // exchange writes payload to connection waits for its reply.
-// payload must have the same qid (and header if protocol required)
-func (c *pipelineConn) exchange(ctx context.Context, payload []byte, qid uint16) (*dnsmsg.Msg, error) {
+func (c *pipelineConn) exchange(ctx context.Context, ppHdr, m []byte, qid uint16) (*dnsmsg.Msg, error) {
 	select {
 	case <-c.closeNotify:
 		return nil, ErrPipelineConnClosed
@@ -59,7 +81,7 @@ func (c *pipelineConn) exchange(ctx context.Context, payload []byte, qid uint16)
 	respChan := c.addQueueC(qid)
 	defer c.deleteQueueC(qid)
 
-	err := c.write(ctx, payload)
+	err := c.write(ctx, ppHdr, m, qid)
 	if err != nil {
 		return nil, err
 	}
@@ -144,25 +166,49 @@ func (c *pipelineConn) readLoop() {
 	}
 }
 
-func (c *pipelineConn) write(ctx context.Context, payload []byte) (err error) {
-	b := copyMsg(payload)
-	select {
-	case c.writeQueue <- b:
-		return nil
-	case <-c.closeNotify:
-		pool.ReleaseBuf(b)
-		return ErrPipelineConnClosed
-	case <-ctx.Done():
-		return fmt.Errorf("failed to send payload to write queue, %w", context.Cause(ctx))
-	}
-}
-
-func (c *pipelineConn) writeLoop() {
+func (c *pipelineConn) write(ctx context.Context, ppHdr, m []byte, qid uint16) (err error) {
+	var b *pool.Buffer
 	if c.t.connIsTcp {
-		c.writeLoopTCP()
-	} else {
-		c.writeLoopUDP()
+		var err error
+		b, err = copyMsgWithLenHdr(m)
+		setQid(b.B(), 2, qid)
+		if err != nil {
+			return err
+		}
+
+		select {
+		case c.tcpWriteQueue <- b:
+			return nil
+		case <-c.closeNotify:
+			pool.ReleaseBuf(b)
+			return c.closeErr
+		case <-ctx.Done():
+			return fmt.Errorf("failed to send payload to write queue, %w", context.Cause(ctx))
+		}
 	}
+
+	b = pool.GetBuf(len(ppHdr) + len(m))
+	bb := b.B()
+	off := copy(bb, ppHdr)
+	copy(bb[off:], m)
+	setQid(bb, off, qid)
+
+	_, err = c.c.Write(bb)
+	pool.ReleaseBuf(b)
+	if err != nil {
+		if isUdpMsgSizeErr(err) {
+			c.t.logger.Warn(
+				"failed to write req due to udp size limit",
+				zap.Stringer("local", c.c.LocalAddr()),
+				zap.Stringer("remote", c.c.RemoteAddr()),
+				zap.Error(err),
+			)
+		} else {
+			c.closeWithErr(fmt.Errorf("write err, %w", err), false)
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *pipelineConn) writeLoopTCP() {
@@ -174,7 +220,7 @@ func (c *pipelineConn) writeLoopTCP() {
 		select {
 		case <-c.closeNotify:
 			return
-		case b := <-c.writeQueue:
+		case b := <-c.tcpWriteQueue:
 			var err error
 			_, err = bw.Write(b.B())
 			pool.ReleaseBuf(b)
@@ -184,7 +230,7 @@ func (c *pipelineConn) writeLoopTCP() {
 		readMore:
 			for {
 				select {
-				case b := <-c.writeQueue:
+				case b := <-c.tcpWriteQueue:
 					_, err = bw.Write(b.B())
 					pool.ReleaseBuf(b)
 					if err != nil {
@@ -203,31 +249,6 @@ func (c *pipelineConn) writeLoopTCP() {
 		writeErr:
 			c.closeWithErr(fmt.Errorf("write err, %w", err), false)
 			return
-		}
-	}
-}
-
-func (c *pipelineConn) writeLoopUDP() {
-	for {
-		select {
-		case <-c.closeNotify:
-			return
-		case b := <-c.writeQueue:
-			_, err := c.c.Write(b.B())
-			pool.ReleaseBuf(b)
-			if err != nil {
-				if isUdpMsgSizeErr(err) {
-					c.t.logger.Warn(
-						"failed to write req due to udp size limit",
-						zap.Stringer("local", c.c.LocalAddr()),
-						zap.Stringer("remote", c.c.RemoteAddr()),
-						zap.Error(err),
-					)
-					continue
-				}
-				c.closeWithErr(fmt.Errorf("write err, %w", err), false)
-				return
-			}
 		}
 	}
 }

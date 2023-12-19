@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
-	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"go.uber.org/zap"
 )
 
@@ -23,7 +22,7 @@ const (
 	defaultPipelineMaxConcurrent = 32
 )
 
-var ErrMsgOffsetIsNotAllowed = errors.New("msg offset is not allowed in tcp transport")
+var ErrPpHdrIsNotAllowed = errors.New("msg offset is not allowed in tcp transport")
 
 var _ Transport = (*PipelineTransport)(nil)
 
@@ -91,40 +90,29 @@ func NewPipelineTransport(opt PipelineOpts) *PipelineTransport {
 }
 
 // Spacial exchange call mainly for protocol proxy header.
-// t underlayer protocol must be udp. m contains pp header and msg. msg starts at msgOff.
-func (t *PipelineTransport) ExchangeContextOff(ctx context.Context, m []byte, msgOff int) (*dnsmsg.Msg, error) {
-	return t.exchangeContext(ctx, m, msgOff)
+// t underlayer protocol must be udp.
+// It's ok that ppHdr is nil.
+func (t *PipelineTransport) ExchangeContextOff(ctx context.Context, ppHdr, m []byte) (*dnsmsg.Msg, error) {
+	return t.exchangeContext(ctx, ppHdr, m)
 }
 
 func (t *PipelineTransport) ExchangeContext(ctx context.Context, m []byte) (*dnsmsg.Msg, error) {
-	return t.exchangeContext(ctx, m, 0)
+	return t.exchangeContext(ctx, nil, m)
 }
 
-func (t *PipelineTransport) exchangeContext(ctx context.Context, m []byte, msgOff int) (*dnsmsg.Msg, error) {
-	if len(m[msgOff:]) < dnsHeaderLen {
+func (t *PipelineTransport) exchangeContext(ctx context.Context, ppHdr, m []byte) (*dnsmsg.Msg, error) {
+	if len(m) < dnsHeaderLen {
 		return nil, ErrPayloadTooSmall
 	}
 
-	var payload *pool.Buffer
-	var err error
-	if t.connIsTcp {
-		if msgOff > 0 {
-			return nil, ErrMsgOffsetIsNotAllowed
-		}
-		payload, err = copyMsgWithLenHdr(m)
-		if err != nil {
-			return nil, err
-		}
-		msgOff = 2
-	} else {
-		payload = copyMsg(m)
+	if t.connIsTcp && len(ppHdr) > 0 {
+		return nil, ErrPpHdrIsNotAllowed
 	}
-	defer pool.ReleaseBuf(payload)
 
 	start := time.Now()
 	retry := 0
 	for {
-		b, err, shouldRetry := t.exchangeOnce(ctx, payload.B(), msgOff)
+		b, err, shouldRetry := t.exchangeOnce(ctx, ppHdr, m)
 		if err != nil && shouldRetry && retry < 3 && time.Since(start) < time.Second && !ctxIsDone(ctx) {
 			retry++
 			continue
@@ -137,21 +125,20 @@ func setQid(payload []byte, off int, qid uint16) {
 	binary.BigEndian.PutUint16(payload[off:], qid)
 }
 
-func (t *PipelineTransport) exchangeOnce(ctx context.Context, payload []byte, msgOff int) (_ *dnsmsg.Msg, _ error, shouldRetry bool) {
+func (t *PipelineTransport) exchangeOnce(ctx context.Context, ppHdr, m []byte) (_ *dnsmsg.Msg, _ error, shouldRetry bool) {
 	call, pc, qid, closed := t.reserveConn()
 	if closed {
 		return nil, ErrClosedTransport, false
 	}
 
 	if call != nil {
-		b, err := t.exchangeUsingDialingCall(ctx, payload, msgOff, call)
+		b, err := t.exchangeUsingDialingCall(ctx, ppHdr, m, call)
 		call.release()
 		shouldRetry = errors.Is(err, ErrTooManyPipeliningQueries)
 		return b, err, shouldRetry
 	}
 
-	setQid(payload, msgOff, qid)
-	b, err := pc.exchange(ctx, payload, qid)
+	b, err := pc.exchange(ctx, ppHdr, m, qid)
 	pc.releaseQid()
 	return b, err, true
 }
@@ -168,7 +155,7 @@ func (e *ErrNoAvailablePipelineConn) Unwrap() error {
 	return e.cause
 }
 
-func (t *PipelineTransport) exchangeUsingDialingCall(ctx context.Context, payload []byte, msgOff int, call *dialingCall) (*dnsmsg.Msg, error) {
+func (t *PipelineTransport) exchangeUsingDialingCall(ctx context.Context, ppHdr, m []byte, call *dialingCall) (*dnsmsg.Msg, error) {
 	select {
 	case <-ctx.Done():
 		return nil, &ErrNoAvailablePipelineConn{cause: context.Cause(ctx)}
@@ -182,8 +169,7 @@ func (t *PipelineTransport) exchangeUsingDialingCall(ctx context.Context, payloa
 			return nil, &ErrNoAvailablePipelineConn{cause: ErrTooManyPipeliningQueries}
 		}
 		defer c.releaseQid()
-		setQid(payload, msgOff, qid)
-		return c.exchange(ctx, payload, qid)
+		return c.exchange(ctx, ppHdr, m, qid)
 	}
 }
 
@@ -293,14 +279,7 @@ func (t *PipelineTransport) dial(call *dialingCall) {
 
 	var pc *pipelineConn
 	if c != nil {
-		pc = &pipelineConn{ // prepare pc outside lock. Run its io loops later.
-			c: c,
-			t: t,
-
-			closeNotify: make(chan struct{}),
-			writeQueue:  make(chan *pool.Buffer, 8),
-			readQueue:   make(map[uint32]chan *dnsmsg.Msg),
-		}
+		pc = newPipelineConn(c, t)
 	}
 
 	t.m.Lock()
@@ -323,8 +302,7 @@ func (t *PipelineTransport) dial(call *dialingCall) {
 	close(call.done)
 
 	if pc != nil { // pc is in the transport, run its io loops
-		go pc.readLoop()
-		go pc.writeLoop()
+		pc.startLoops()
 		debugLogTransportNewConn(pc.c, t.logger)
 	}
 	if err != nil {

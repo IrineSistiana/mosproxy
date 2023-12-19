@@ -200,7 +200,7 @@ func Test_pipelineConn_exchange(t *testing.T) {
 			payload, err := copyMsgWithLenHdr(qWire)
 			r.NoError(err)
 
-			respPayload, err := dc.exchange(ctx, payload.B(), qid)
+			respPayload, err := dc.exchange(ctx, nil, payload.B(), qid)
 			if tt.wantErr {
 				r.Error(err)
 			} else {
@@ -265,7 +265,7 @@ func Test_pipelineConn_exchange_race(t *testing.T) {
 				r.True(ok)
 			}
 
-			_, _ = pc.exchange(ctx, queryPayload, qid)
+			_, _ = pc.exchange(ctx, nil, queryPayload, qid)
 		}()
 	}
 
