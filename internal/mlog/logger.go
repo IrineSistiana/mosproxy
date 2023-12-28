@@ -1,30 +1,68 @@
 package mlog
 
 import (
+	"bufio"
 	"bytes"
 	"io"
 	"log"
 	"os"
+	"strconv"
+	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 var (
-	stderr = zapcore.Lock(os.Stderr)
-	lvl    = zap.NewAtomicLevelAt(zap.InfoLevel)
-	l      = initLogger()
-	s      = l.Sugar()
+	lvl = zap.NewAtomicLevelAt(zap.InfoLevel)
+	l   = initLogger()
+	s   = l.Sugar()
 
 	nop = zap.NewNop()
 )
 
+type lockBufWriteSyncer struct {
+	sync.Mutex
+	syncTimer *time.Timer
+	w         *bufio.Writer
+}
+
+func (w *lockBufWriteSyncer) Sync() error {
+	w.Lock()
+	defer w.Unlock()
+	return w.w.Flush()
+}
+
+func (w *lockBufWriteSyncer) Write(p []byte) (int, error) {
+	w.Lock()
+	defer w.Unlock()
+
+	defer w.syncTimer.Reset(time.Millisecond * 100)
+	return w.w.Write(p)
+}
+
+func lockBufWriter(w io.Writer) *lockBufWriteSyncer {
+	bw := bufio.NewWriterSize(os.Stderr, 4096)
+	return &lockBufWriteSyncer{
+		syncTimer: time.AfterFunc(0, func() { bw.Flush() }),
+		w:         bw,
+	}
+}
+
 func initLogger() *zap.Logger {
-	var logger *zap.Logger
-	if _, ok := os.LookupEnv("MOSPROXY_JSONLOGGER"); ok {
-		logger = zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), stderr, lvl))
+	var out zapcore.WriteSyncer
+	if ok, _ := strconv.ParseBool(os.Getenv("MOSPROXY_BUFFERLOGGER")); ok {
+		out = lockBufWriter(os.Stderr)
 	} else {
-		logger = zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), stderr, lvl))
+		out = zapcore.Lock(os.Stderr)
+	}
+
+	var logger *zap.Logger
+	if ok, _ := strconv.ParseBool(os.Getenv("MOSPROXY_JSONLOGGER")); ok {
+		logger = zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), out, lvl))
+	} else {
+		logger = zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), out, lvl))
 	}
 
 	// Redirect std log
