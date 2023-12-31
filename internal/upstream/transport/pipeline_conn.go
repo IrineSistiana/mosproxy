@@ -1,7 +1,6 @@
 package transport
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/IrineSistiana/mosproxy/internal/bufconn"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
@@ -32,9 +32,6 @@ type pipelineConn struct {
 	closeNotify chan struct{}
 	closeErr    error // closeErr is ready (not nil) when closeNotify is closed.
 
-	// for tcp
-	tcpWriteQueue chan *pool.Buffer
-
 	readQueueMu sync.RWMutex
 	readQueue   map[uint32]chan *dnsmsg.Msg // uint32 has fast path
 
@@ -50,6 +47,9 @@ type pipelineConn struct {
 }
 
 func newPipelineConn(c net.Conn, t *PipelineTransport) *pipelineConn {
+	if t.connIsTcp {
+		c = bufconn.New(c)
+	}
 	pc := &pipelineConn{
 		c: c,
 		t: t,
@@ -57,17 +57,11 @@ func newPipelineConn(c net.Conn, t *PipelineTransport) *pipelineConn {
 		closeNotify: make(chan struct{}),
 		readQueue:   make(map[uint32]chan *dnsmsg.Msg),
 	}
-	if t.connIsTcp {
-		pc.tcpWriteQueue = make(chan *pool.Buffer, 8)
-	}
 	return pc
 }
 
 func (c *pipelineConn) startLoops() {
 	go c.readLoop()
-	if c.t.connIsTcp {
-		go c.writeLoopTCP()
-	}
 }
 
 // exchange writes payload to connection waits for its reply.
@@ -106,13 +100,6 @@ func (c *pipelineConn) exchange(ctx context.Context, ppHdr, m []byte, qid uint16
 }
 
 func (c *pipelineConn) readLoop() {
-	var br *bufio.Reader // nil if c is not tcp
-	if c.t.connIsTcp {
-		br = pool.BufReaderPool1K.Get()
-		br.Reset(c.c)
-		defer pool.BufReaderPool1K.Release(br)
-	}
-
 	for {
 		c.c.SetReadDeadline(time.Now().Add(c.t.connIdleTimeout))
 		var (
@@ -120,7 +107,7 @@ func (c *pipelineConn) readLoop() {
 			err error
 		)
 		if c.t.connIsTcp {
-			r, _, err = dnsutils.ReadMsgFromTCP(br)
+			r, _, err = dnsutils.ReadMsgFromTCP(c.c)
 		} else {
 			var n int
 			r, n, err = dnsutils.ReadMsgFromUDP(c.c, 4096) // TODO: make udp read buf size configurable?
@@ -167,27 +154,18 @@ func (c *pipelineConn) readLoop() {
 }
 
 func (c *pipelineConn) write(ctx context.Context, ppHdr, m []byte, qid uint16) (err error) {
-	var b *pool.Buffer
 	if c.t.connIsTcp {
-		var err error
-		b, err = copyMsgWithLenHdr(m)
+		b, err := copyMsgWithLenHdr(m)
 		setQid(b.B(), 2, qid)
 		if err != nil {
 			return err
 		}
-
-		select {
-		case c.tcpWriteQueue <- b:
-			return nil
-		case <-c.closeNotify:
-			pool.ReleaseBuf(b)
-			return c.closeErr
-		case <-ctx.Done():
-			return fmt.Errorf("failed to send payload to write queue, %w", context.Cause(ctx))
-		}
+		_, err = c.c.Write(b.B())
+		pool.ReleaseBuf(b)
+		return err
 	}
 
-	b = pool.GetBuf(len(ppHdr) + len(m))
+	b := pool.GetBuf(len(ppHdr) + len(m))
 	bb := b.B()
 	off := copy(bb, ppHdr)
 	copy(bb[off:], m)
@@ -209,48 +187,6 @@ func (c *pipelineConn) write(ctx context.Context, ppHdr, m []byte, qid uint16) (
 		return err
 	}
 	return nil
-}
-
-func (c *pipelineConn) writeLoopTCP() {
-	bw := pool.BufWriterPool1K.Get()
-	bw.Reset(c.c)
-	defer pool.BufWriterPool1K.Release(bw)
-
-	for {
-		select {
-		case <-c.closeNotify:
-			return
-		case b := <-c.tcpWriteQueue:
-			var err error
-			_, err = bw.Write(b.B())
-			pool.ReleaseBuf(b)
-			if err != nil {
-				goto writeErr
-			}
-		readMore:
-			for {
-				select {
-				case b := <-c.tcpWriteQueue:
-					_, err = bw.Write(b.B())
-					pool.ReleaseBuf(b)
-					if err != nil {
-						goto writeErr
-					}
-				default:
-					break readMore
-				}
-			}
-			err = bw.Flush()
-			if err != nil {
-				goto writeErr
-			}
-			continue
-
-		writeErr:
-			c.closeWithErr(fmt.Errorf("write err, %w", err), false)
-			return
-		}
-	}
 }
 
 // closeWithErr closes this pipelineConn. The error will be sent

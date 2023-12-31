@@ -3,12 +3,12 @@ package router
 import (
 	"context"
 	"crypto/tls"
-	"io"
 	"net"
 	"net/netip"
 	"sync/atomic"
 	"time"
 
+	"github.com/IrineSistiana/mosproxy/internal/bufconn"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
@@ -106,10 +106,6 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		}
 	}
 
-	// tls conn or a bufio reader.
-	// Note: tls conn is already a, some kind of, buffered reader.
-	var connReader io.Reader
-
 	// If server is tls enabled, do tls handshake here instead of
 	// in the io calls. Because we can set deadline and handle error easily.
 	if s.tlsConfig != nil {
@@ -128,13 +124,9 @@ func (s *tcpServer) handleConn(c net.Conn) {
 			return
 		}
 		c = tlsConn
-		connReader = c
-	} else {
-		br := pool.BufReaderPool1K.Get()
-		br.Reset(c)
-		defer pool.BufReaderPool1K.Release(br)
-		connReader = br
 	}
+
+	c = bufconn.New(c)
 
 	// Maybe invalid. e.g. No pp2 header and c is unix socket.
 	localAddr := firstValidAddr(ppHdr.DestinationAddr, c.LocalAddr())
@@ -143,24 +135,11 @@ func (s *tcpServer) handleConn(c net.Conn) {
 	connCtx, cancelConn := context.WithCancelCause(context.Background())
 	defer cancelConn(errClientConnClosed)
 
-	// Start conn write loop.
-	writeChan := make(chan *pool.Buffer, 8)
-	pool.Go(func() {
-		err := tcpWriteLoop(connCtx, c, writeChan)
-		if err != nil {
-			s.logger.Check(zap.WarnLevel, "failed to write tcp response").Write(
-				zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
-				zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
-				zap.Error(err),
-			)
-		}
-	})
-
 	concurrent := new(atomic.Int32)
 	emptyConn := true
 	for {
 		c.SetReadDeadline(time.Now().Add(s.idleTimeout))
-		m, n, err := dnsutils.ReadMsgFromTCP(connReader)
+		m, n, err := dnsutils.ReadMsgFromTCP(c)
 		if err != nil {
 			var errMsg string
 			if n > 0 {
@@ -191,60 +170,14 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		}
 
 		pool.Go(func() {
-			s.handleReq(connCtx, writeChan, m, remoteAddr, localAddr)
+			s.handleReq(connCtx, c, m, remoteAddr, localAddr)
 			dnsmsg.ReleaseMsg(m)
 			concurrent.Add(-1)
 		})
 	}
 }
 
-// Note: asyncWriteMsg takes the ownership of the payload.
-func asyncWriteMsg(ctx context.Context, ch chan *pool.Buffer, payload *pool.Buffer) {
-	select {
-	case <-ctx.Done():
-		defer pool.ReleaseBuf(payload)
-	case ch <- payload:
-		return
-	}
-}
-
-func tcpWriteLoop(ctx context.Context, c net.Conn, ch chan *pool.Buffer) error {
-	bw := pool.BufWriterPool1K.Get()
-	bw.Reset(c)
-	defer pool.BufWriterPool1K.Release(bw)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case b := <-ch:
-			_, err := bw.Write(b.B())
-			pool.ReleaseBuf(b)
-			if err != nil {
-				return err
-			}
-		readMore:
-			for {
-				select {
-				case b := <-ch:
-					_, err := bw.Write(b.B())
-					pool.ReleaseBuf(b)
-					if err != nil {
-						return err
-					}
-				default:
-					break readMore
-				}
-			}
-			err = bw.Flush()
-			if err != nil {
-				return err
-			}
-		}
-	}
-}
-
-func (s *tcpServer) handleReq(connCtx context.Context, wc chan *pool.Buffer, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
+func (s *tcpServer) handleReq(connCtx context.Context, c net.Conn, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
 	rc := getRequestContext()
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
@@ -257,5 +190,14 @@ func (s *tcpServer) handleReq(connCtx context.Context, wc chan *pool.Buffer, m *
 		s.logger.Error(logPackRespErr, zap.Error(err))
 		return
 	}
-	asyncWriteMsg(connCtx, wc, buf)
+
+	_, err = c.Write(buf.B())
+	pool.ReleaseBuf(buf)
+	if err != nil {
+		s.logger.Check(zap.WarnLevel, "write error").Write(
+			zap.Stringer("local", localAddr),
+			zap.Stringer("remote", remoteAddr),
+			zap.Error(err),
+		)
+	}
 }
