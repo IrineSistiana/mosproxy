@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -65,17 +66,17 @@ func (c *pipelineConn) startLoops() {
 }
 
 // exchange writes payload to connection waits for its reply.
-func (c *pipelineConn) exchange(ctx context.Context, ppHdr, m []byte, qid uint16) (*dnsmsg.Msg, error) {
+func (c *pipelineConn) exchange(ctx context.Context, ppHdr, m []byte, assignedQid uint16) (*dnsmsg.Msg, error) {
 	select {
 	case <-c.closeNotify:
 		return nil, ErrPipelineConnClosed
 	default:
 	}
 
-	respChan := c.addQueueC(qid)
-	defer c.deleteQueueC(qid)
+	respChan := c.addQueueC(assignedQid)
+	defer c.deleteQueueC(assignedQid)
 
-	err := c.write(ctx, ppHdr, m, qid)
+	err := c.write(ctx, ppHdr, m, assignedQid)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +94,7 @@ func (c *pipelineConn) exchange(ctx context.Context, ppHdr, m []byte, qid uint16
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
 	case r := <-respChan:
+		r.Header.ID = binary.BigEndian.Uint16(m)
 		return r, nil
 	case <-c.closeNotify:
 		return nil, c.closeErr

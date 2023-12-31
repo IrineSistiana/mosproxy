@@ -59,7 +59,7 @@ func newDummyEchoNetConn(opt dummyEchoNetConnOpts) net.Conn {
 					}
 					latency := time.Millisecond * time.Duration(rand.Intn(20))
 					time.Sleep(latency)
-					buf := pool.GetBuf(m.Len())
+					buf := pool.GetBuf(m.Len() + 2)
 					defer pool.ReleaseBuf(buf)
 					bs := buf.B()
 					n, err := m.Pack(bs[2:], false, 0)
@@ -70,7 +70,7 @@ func newDummyEchoNetConn(opt dummyEchoNetConnOpts) net.Conn {
 						log.Printf("failed to pack msg, %v", err)
 					}
 					binary.BigEndian.PutUint16(bs, uint16(n))
-					_, err = c2.Write(bs)
+					_, err = c2.Write(bs[:2+n])
 					if err != nil {
 						log.Printf("failed to write msg, %v", err)
 					}
@@ -197,8 +197,7 @@ func Test_pipelineConn_exchange(t *testing.T) {
 			q.Id = qid
 			qWire, err := q.Pack()
 			r.NoError(err)
-			payload, err := copyMsgWithLenHdr(qWire)
-			r.NoError(err)
+			payload := copyMsg(qWire)
 
 			respPayload, err := dc.exchange(ctx, nil, payload.B(), qid)
 			if tt.wantErr {
