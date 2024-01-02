@@ -1,15 +1,14 @@
 package mlog
 
 import (
-	"bufio"
 	"bytes"
 	"io"
 	"log"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
+	"github.com/IrineSistiana/mosproxy/internal/delaywriter"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -22,38 +21,14 @@ var (
 	nop = zap.NewNop()
 )
 
-type lockBufWriteSyncer struct {
-	sync.Mutex
-	syncTimer *time.Timer
-	w         *bufio.Writer
-}
-
-func (w *lockBufWriteSyncer) Sync() error {
-	w.Lock()
-	defer w.Unlock()
-	return w.w.Flush()
-}
-
-func (w *lockBufWriteSyncer) Write(p []byte) (int, error) {
-	w.Lock()
-	defer w.Unlock()
-
-	defer w.syncTimer.Reset(time.Millisecond * 100)
-	return w.w.Write(p)
-}
-
-func lockBufWriter(w io.Writer) *lockBufWriteSyncer {
-	bw := bufio.NewWriterSize(os.Stderr, 4096)
-	return &lockBufWriteSyncer{
-		syncTimer: time.AfterFunc(0, func() { bw.Flush() }),
-		w:         bw,
-	}
-}
-
 func initLogger() *zap.Logger {
 	var out zapcore.WriteSyncer
 	if ok, _ := strconv.ParseBool(os.Getenv("MOSPROXY_BUFFERLOGGER")); ok {
-		out = lockBufWriter(os.Stderr)
+		opts := delaywriter.Opts{
+			BufSize: 4096,
+			Delay:   time.Millisecond * 10,
+		}
+		out = delaywriter.New(os.Stderr, opts)
 	} else {
 		out = zapcore.Lock(os.Stderr)
 	}

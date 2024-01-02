@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/bufconn"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
@@ -126,8 +125,6 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		c = tlsConn
 	}
 
-	c = bufconn.New(c)
-
 	// Maybe invalid. e.g. No pp2 header and c is unix socket.
 	localAddr := firstValidAddr(ppHdr.DestinationAddr, c.LocalAddr())
 	remoteAddr := firstValidAddr(ppHdr.SourceAddr, c.RemoteAddr())
@@ -137,9 +134,13 @@ func (s *tcpServer) handleConn(c net.Conn) {
 
 	concurrent := new(atomic.Int32)
 	emptyConn := true
+
+	br := pool.BufReaderPool1K.Get()
+	br.Reset(c)
+	defer pool.BufReaderPool1K.Release(br)
 	for {
 		c.SetReadDeadline(time.Now().Add(s.idleTimeout))
-		m, n, err := dnsutils.ReadMsgFromTCP(c)
+		m, n, err := dnsutils.ReadMsgFromTCP(br)
 		if err != nil {
 			var errMsg string
 			if n > 0 {

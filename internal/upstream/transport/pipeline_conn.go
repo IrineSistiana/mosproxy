@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -10,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/bufconn"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
@@ -48,9 +48,6 @@ type pipelineConn struct {
 }
 
 func newPipelineConn(c net.Conn, t *PipelineTransport) *pipelineConn {
-	if t.connIsTcp {
-		c = bufconn.New(c)
-	}
 	pc := &pipelineConn{
 		c: c,
 		t: t,
@@ -102,6 +99,13 @@ func (c *pipelineConn) exchange(ctx context.Context, ppHdr, m []byte, assignedQi
 }
 
 func (c *pipelineConn) readLoop() {
+	var br *bufio.Reader // nil if c is not tcp
+	if c.t.connIsTcp {
+		br = pool.BufReaderPool1K.Get()
+		br.Reset(c.c)
+		defer pool.BufReaderPool1K.Release(br)
+	}
+	
 	for {
 		c.c.SetReadDeadline(time.Now().Add(c.t.connIdleTimeout))
 		var (
@@ -109,7 +113,7 @@ func (c *pipelineConn) readLoop() {
 			err error
 		)
 		if c.t.connIsTcp {
-			r, _, err = dnsutils.ReadMsgFromTCP(c.c)
+			r, _, err = dnsutils.ReadMsgFromTCP(br)
 		} else {
 			var n int
 			r, n, err = dnsutils.ReadMsgFromUDP(c.c, 4096) // TODO: make udp read buf size configurable?
