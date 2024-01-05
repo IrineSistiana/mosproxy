@@ -2,7 +2,9 @@ package router
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/internal/pp"
 )
 
 const (
@@ -74,16 +77,21 @@ func (r *router) listen(cfg *ServerConfig) (net.Listener, error) {
 	return l, err
 }
 
-func firstValidAddr(ap netip.AddrPort, netAddr net.Addr) netip.AddrPort {
-	if ap.IsValid() {
-		return ap
-	}
-	return netAddr2NetipAddr(netAddr)
-}
+var (
+	errPP2UnexpectedLocalCmd = errors.New("unexpected pp2 LOCAL command")
+	errPP2UnexpectedUnspecTp = errors.New("unexpected pp2 UNSPEC transport protocol")
+)
 
-func firstValidAddrStringer(ap netip.AddrPort, netAddr net.Addr) fmt.Stringer {
-	if ap.IsValid() {
-		return ap
+func readIpFromPP2(r io.Reader) (pp.HeaderV2, int, error) {
+	h, n, err := pp.ReadV2(r)
+	if err != nil {
+		return pp.HeaderV2{}, n, err
 	}
-	return netAddr
+	if h.Command == pp.LOCAL {
+		return pp.HeaderV2{}, n, errPP2UnexpectedLocalCmd
+	}
+	if h.TransportProtocol == pp.UNSPEC {
+		return pp.HeaderV2{}, n, errPP2UnexpectedUnspecTp
+	}
+	return h, n, nil
 }

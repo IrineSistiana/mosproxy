@@ -31,7 +31,7 @@ func (r *router) startFastHttpServer(cfg *ServerConfig) error {
 	h := &fasthttpHandler{
 		r:                r,
 		clientAddrHeader: cfg.Http.ClientAddrHeader,
-		logger:           r.logger.Named("server_fasthttp").With(zap.Stringer("addr", l.Addr())),
+		logger:           r.logger.Named("server_fasthttp").With(zap.Stringer("server_addr", l.Addr())),
 	}
 	h.logger.Info("fasthttp server started")
 	s := &fasthttp.Server{

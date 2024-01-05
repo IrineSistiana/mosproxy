@@ -61,7 +61,7 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) error {
 		return err
 	}
 	h.localAddr = netAddr2NetipAddr(l.Addr()) // maybe nil
-	h.logger = r.logger.Named("server_http").With(zap.Stringer("addr", l.Addr()))
+	h.logger = r.logger.Named("server_http").With(zap.Stringer("server_addr", l.Addr()))
 	hs.ErrorLog = log.New(mlog.WriteToLogger(h.logger, zap.WarnLevel, "", "msg"), "", 0)
 
 	h.logger.Info("http server started")

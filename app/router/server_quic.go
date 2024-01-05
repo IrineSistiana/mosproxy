@@ -68,7 +68,7 @@ func (r *router) startQuicServer(cfg *ServerConfig) error {
 		r:           r,
 		l:           l,
 		idleTimeout: idleTimeout,
-		logger:      r.logger.Named("server_quic").With(zap.Stringer("addr", l.Addr())),
+		logger:      r.logger.Named("server_quic").With(zap.Stringer("server_addr", l.Addr())),
 	}
 	s.logger.Info("quic server started")
 	go func() {

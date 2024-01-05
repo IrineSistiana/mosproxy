@@ -11,7 +11,6 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"github.com/IrineSistiana/mosproxy/internal/pp"
 	"go.uber.org/zap"
 )
 
@@ -50,7 +49,7 @@ func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) error {
 		idleTimeout:   idleTimeout,
 		maxConcurrent: maxConcurrent,
 		ppv2:          cfg.ProtocolProxyV2,
-		logger:        r.logger.Named("server_tcp").With(zap.Stringer("addr", l.Addr())),
+		logger:        r.logger.Named("server_tcp").With(zap.Stringer("server_addr", l.Addr())),
 	}
 	s.logger.Info("tcp server started")
 	go func() {
@@ -87,22 +86,23 @@ func (s *tcpServer) run() {
 }
 
 func (s *tcpServer) handleConn(c net.Conn) {
+	clientSrcAddr := netAddr2NetipAddr(c.RemoteAddr())
+	clientDstAddr := netAddr2NetipAddr(c.LocalAddr())
+
 	// Read pp2 header
-	var ppHdr pp.HeaderV2 // maybe zero
 	if s.ppv2 {
 		c.SetReadDeadline(time.Now().Add(pp2HeaderReadTimeout))
-		var err error
-		ppHdr, _, err = pp.ReadV2(c)
+		ppHdr, _, err := readIpFromPP2(c)
 		c.SetReadDeadline(time.Time{})
 		if err != nil {
-			s.logger.Error(
-				"failed to read pp2 header",
-				zap.Stringer("local", c.LocalAddr()),
-				zap.Stringer("remote", c.RemoteAddr()),
+			s.logger.Check(zap.ErrorLevel, "failed to read pp2 header").Write(
+				zap.Stringer("so_remote", c.RemoteAddr()),
 				zap.Error(err),
 			)
 			return
 		}
+		clientSrcAddr = ppHdr.SourceAddr
+		clientDstAddr = ppHdr.DestinationAddr
 	}
 
 	// If server is tls enabled, do tls handshake here instead of
@@ -116,21 +116,14 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		cancel()
 		if err != nil {
 			s.logger.Check(zap.WarnLevel, "failed to tls handshake").Write(
-				zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
-				zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
+				zap.Stringer("local", clientDstAddr),
+				zap.Stringer("remote", clientSrcAddr),
 				zap.Error(err),
 			)
 			return
 		}
 		c = tlsConn
 	}
-
-	// Maybe invalid. e.g. No pp2 header and c is unix socket.
-	localAddr := firstValidAddr(ppHdr.DestinationAddr, c.LocalAddr())
-	remoteAddr := firstValidAddr(ppHdr.SourceAddr, c.RemoteAddr())
-
-	connCtx, cancelConn := context.WithCancelCause(context.Background())
-	defer cancelConn(errClientConnClosed)
 
 	concurrent := new(atomic.Int32)
 	emptyConn := true
@@ -152,8 +145,8 @@ func (s *tcpServer) handleConn(c net.Conn) {
 			// Most likely are normal close or idle timeout.
 			if len(errMsg) > 0 {
 				s.logger.Check(zap.WarnLevel, errMsg).Write(
-					zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
-					zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
+					zap.Stringer("local", clientDstAddr),
+					zap.Stringer("remote", clientSrcAddr),
 					zap.Error(err),
 				)
 			}
@@ -163,22 +156,22 @@ func (s *tcpServer) handleConn(c net.Conn) {
 
 		if concurrent.Add(1) > s.maxConcurrent {
 			s.logger.Check(zap.WarnLevel, "too many concurrent requests").Write(
-				zap.Stringer("local", firstValidAddrStringer(ppHdr.DestinationAddr, c.LocalAddr())),
-				zap.Stringer("remote", firstValidAddrStringer(ppHdr.SourceAddr, c.RemoteAddr())),
+				zap.Stringer("local", clientDstAddr),
+				zap.Stringer("remote", clientSrcAddr),
 				zap.Error(err),
 			)
 			return
 		}
 
 		pool.Go(func() {
-			s.handleReq(connCtx, c, m, remoteAddr, localAddr)
+			s.handleReq(c, m, clientSrcAddr, clientDstAddr)
 			dnsmsg.ReleaseMsg(m)
 			concurrent.Add(-1)
 		})
 	}
 }
 
-func (s *tcpServer) handleReq(connCtx context.Context, c net.Conn, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
+func (s *tcpServer) handleReq(c net.Conn, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
 	rc := getRequestContext()
 	rc.RemoteAddr = remoteAddr
 	rc.LocalAddr = localAddr
