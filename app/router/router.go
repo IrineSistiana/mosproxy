@@ -401,6 +401,7 @@ func (r *router) packReq(q *dnsmsg.Question, remoteAddr netip.AddrPort) (*pool.B
 	m.Header.RecursionDesired = true
 	m.Questions.Add(q.Copy())
 	opt := edns0Opt(udpSize)
+	m.Additionals.Add(opt)
 	if r.opt.ecsEnabled && remoteAddr.IsValid() {
 		opt.Data = makeEdns0ClientSubnetReqOpt(remoteAddr.Addr())
 	}
