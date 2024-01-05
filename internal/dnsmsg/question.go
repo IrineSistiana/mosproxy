@@ -24,6 +24,7 @@ func unpackQuestion(msg []byte, off int) (*Question, int, error) {
 
 type Question struct {
 	noCopy
+	linkNode
 
 	Name  *pool.Buffer
 	Type  Type

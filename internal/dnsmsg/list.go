@@ -1,82 +1,117 @@
 package dnsmsg
 
-import "sync"
+type linkNode struct {
+	prev, next Linkable
+}
 
-type List[V any] struct {
+func (n *linkNode) Prev() Linkable {
+	return n.prev
+}
+
+func (n *linkNode) Next() Linkable {
+	return n.next
+}
+
+func (n *linkNode) SetPrev(v Linkable) {
+	n.prev = v
+}
+
+func (n *linkNode) SetNext(v Linkable) {
+	n.next = v
+}
+
+type Linkable interface {
+	Prev() Linkable
+	Next() Linkable
+	SetPrev(Linkable)
+	SetNext(Linkable)
+}
+
+type List[V Linkable] struct {
 	noCopy
 
 	l          int
-	head, tail *node
+	head, tail Linkable
 }
 
 func (l *List[V]) Add(v V) {
-	n := newNode()
-	n.v = v
 	if l.tail != nil {
-		l.tail.next = n
-		n.prev = l.tail
-		l.tail = n
-	} else { // empty set
-		l.head = n
-		l.tail = n
+		l.tail.SetNext(v)
+		v.SetPrev(l.tail)
+		l.tail = v
+	} else {
+		l.head = v
+		l.tail = v
 	}
 	l.l++
 }
 
-// Once remove is called, n MUST not be used again.
-func (l *List[V]) Remove(n *Node[V]) {
-	if n.next != nil {
-		n.next.prev = n.prev
+func (l *List[V]) Remove(v V) {
+	if n := v.Next(); n != nil {
+		n.SetPrev(v.Prev())
 	} else {
-		l.tail = n.prev
+		l.tail = v.Prev()
 	}
-	if n.prev != nil {
-		n.prev.next = n.next
+	if n := v.Prev(); n != nil {
+		n.SetNext(v.Next())
 	} else {
-		l.head = n.next
+		l.head = v.Next()
 	}
-	releaseNode((*node)(n))
 	l.l--
 }
 
-func (l *List[V]) Len() int { return l.l }
-
-func (l *List[V]) Head() *Node[V] {
-	return (*Node[V])(l.head)
+func (l *List[V]) Head() (v V) {
+	if l.head == nil {
+		return
+	}
+	return l.head.(V)
 }
 
-func (l *List[V]) Tail() *Node[V] {
-	return (*Node[V])(l.tail)
+func (l *List[V]) Tail() (v V) {
+	if l.tail == nil {
+		return
+	}
+	return l.tail.(V)
 }
 
-type Node[V any] node
-
-func (n *Node[V]) Value() V {
-	return n.v.(V)
+func (l *List[V]) Len() int {
+	return l.l
 }
 
-func (n *Node[V]) Prev() *Node[V] {
-	return (*Node[V])(n.prev)
+func (l *List[V]) Iter() Iter[V] {
+	return Iter[V]{n: l.head}
 }
 
-func (n *Node[V]) Next() *Node[V] {
-	return (*Node[V])(n.next)
+func (l *List[V]) ReverseIter() Iter[V] {
+	return Iter[V]{reverse: true, n: l.tail}
 }
 
-type node struct {
-	v          any
-	prev, next *node
+type Iter[V Linkable] struct {
+	reverse bool
+	started bool
+	n       Linkable
 }
 
-var nodePool = sync.Pool{
-	New: func() any { return new(node) },
+func (i *Iter[V]) Next() bool {
+	if !i.started {
+		i.started = true
+		return i.n != nil
+	}
+
+	if i.n != nil {
+		if i.reverse {
+			i.n = i.n.Prev()
+		} else {
+			i.n = i.n.Next()
+		}
+		return i.n != nil
+	}
+	return false
 }
 
-func newNode() *node {
-	return nodePool.Get().(*node)
-}
-
-func releaseNode(n *node) {
-	*n = node{}
-	nodePool.Put(n)
+func (i *Iter[V]) Value() (n V) {
+	if i.n != nil {
+		return i.n.(V)
+	}
+	return
 }

@@ -9,6 +9,7 @@ import (
 
 type Resource struct {
 	noCopy
+	linkNode
 
 	Name  *pool.Buffer
 	Type  Type

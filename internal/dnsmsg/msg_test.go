@@ -32,7 +32,7 @@ func Test_Pack_Unpack(t *testing.T) {
 		r.NoError(err)
 
 		r.Equal(1, m.Questions.Len())
-		q := m.Questions.Head().Value()
+		q := m.Questions.Head()
 		r.True(string(q.Name.B()) == name)
 		r.True(q.Class == 1)
 		r.True(q.Type == 1)
@@ -75,8 +75,8 @@ func Test_Pack_Unpack(t *testing.T) {
 			r.NoError(err)
 
 			gotRR := 0
-			for n := rawMsg.Answers.Head(); n != nil; n = n.Next() {
-				rr := n.Value()
+			for iter := rawMsg.Answers.Iter(); iter.Next(); {
+				rr := iter.Value()
 				gotRR++
 				r.True(string(rr.Name.B()) == name)
 			}

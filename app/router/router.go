@@ -254,8 +254,8 @@ func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
 	resp.Response = true
 	resp.RecursionDesired = m.RecursionDesired
 	resp.RCode = rcode
-	for n := m.Questions.Head(); n != nil; n = n.Next() {
-		resp.Questions.Add(n.Value().Copy())
+	for iter := m.Questions.Iter(); iter.Next(); {
+		resp.Questions.Add(iter.Value().Copy())
 	}
 	return resp
 }
@@ -274,15 +274,16 @@ func (r *router) handleReqMsg(ctx context.Context, m *dnsmsg.Msg, rc *RequestCon
 		)
 		rc.Response.Msg = makeEmptyRespM(m, dnsmsg.RCodeNotImplemented)
 	} else {
-		q := m.Questions.Head().Value().Copy()
+		q := m.Questions.Head().Copy()
 		asciiToLower(q.Name.B())
 		defer dnsmsg.ReleaseQuestion(q)
 
 		r.handleReq(ctx, q, rc)
 
 		clientSupportEDNS0 := false
-		for n := m.Additionals.Head(); n != nil; n = n.Next() {
-			if n.Value().Type == dnsmsg.TypeOPT {
+		for iter := m.Additionals.Iter(); iter.Next(); {
+			r := iter.Value()
+			if r.Type == dnsmsg.TypeOPT {
 				clientSupportEDNS0 = true
 				break
 			}

@@ -123,19 +123,16 @@ func (m *Msg) Len() (l int) {
 		return 0
 	}
 	l += 12 // header
-	for n := m.Questions.Head(); n != nil; n = n.Next() {
-		q := n.Value()
-		if q != nil {
-			l += q.len()
-		}
+
+	for iter := m.Questions.Iter(); iter.Next(); {
+		q := iter.Value()
+		l += q.len()
 	}
 
 	for _, list := range [...]*List[*Resource]{&m.Answers, &m.Authorities, &m.Additionals} {
-		for n := list.Head(); n != nil; n = n.Next() {
-			r := n.Value()
-			if r != nil {
-				l += r.len()
-			}
+		for iter := list.Iter(); iter.Next(); {
+			r := iter.Value()
+			l += r.len()
 		}
 	}
 	return l
@@ -149,32 +146,24 @@ func (m *Msg) copy(noOpt bool) *Msg {
 	}
 	newMsg := NewMsg()
 	newMsg.Header = m.Header
-	for n := m.Questions.Head(); n != nil; n = n.Next() {
-		q := n.Value()
-		if q != nil {
-			newMsg.Questions.Add(q.Copy())
-		}
+	for iter := m.Questions.Iter(); iter.Next(); {
+		q := iter.Value()
+		newMsg.Questions.Add(q.Copy())
 	}
-	for n := m.Answers.Head(); n != nil; n = n.Next() {
-		r := n.Value()
-		if r != nil {
-			newMsg.Answers.Add(r.Copy())
-		}
+	for iter := m.Answers.Iter(); iter.Next(); {
+		r := iter.Value()
+		newMsg.Answers.Add(r.Copy())
 	}
-	for n := m.Authorities.Head(); n != nil; n = n.Next() {
-		r := n.Value()
-		if r != nil {
-			newMsg.Authorities.Add(r.Copy())
-		}
+	for iter := m.Authorities.Iter(); iter.Next(); {
+		r := iter.Value()
+		newMsg.Authorities.Add(r.Copy())
 	}
-	for n := m.Additionals.Head(); n != nil; n = n.Next() {
-		r := n.Value()
-		if r != nil {
-			if noOpt && r.Type == TypeOPT {
-				continue
-			}
-			newMsg.Additionals.Add(r.Copy())
+	for iter := m.Additionals.Iter(); iter.Next(); {
+		r := iter.Value()
+		if noOpt && r.Type == TypeOPT {
+			continue
 		}
+		newMsg.Additionals.Add(r.Copy())
 	}
 	return newMsg
 }
@@ -187,27 +176,21 @@ func NewMsg() *Msg {
 
 func ReleaseMsg(m *Msg) {
 	for {
-		n := m.Questions.Head()
-		if n == nil {
+		q := m.Questions.Head()
+		if q == nil {
 			break
 		}
-		q := n.Value()
-		m.Questions.Remove(n)
-		if q != nil {
-			ReleaseQuestion(q)
-		}
+		m.Questions.Remove(q)
+		ReleaseQuestion(q)
 	}
 	for _, list := range [...]*List[*Resource]{&m.Answers, &m.Authorities, &m.Additionals} {
 		for {
-			n := list.Head()
-			if n == nil {
+			r := list.Head()
+			if r == nil {
 				break
 			}
-			r := n.Value()
-			list.Remove(n)
-			if r != nil {
-				ReleaseRR(r)
-			}
+			list.Remove(r)
+			ReleaseRR(r)
 		}
 	}
 	m.Header = Header{}
@@ -349,11 +332,8 @@ func (m *Msg) PackFilter(
 		compressionMap = getCompressionMap()
 		defer releaseCompressionMap(compressionMap)
 	}
-	for n := m.Questions.Head(); n != nil; n = n.Next() {
-		q := n.Value()
-		if q == nil {
-			continue
-		}
+	for iter := m.Questions.Iter(); iter.Next(); {
+		q := iter.Value()
 		if size > 0 && off+q.len() > size {
 			msgHdr.Truncated = true
 			continue
@@ -368,11 +348,8 @@ func (m *Msg) PackFilter(
 		}
 	}
 
-	for n := m.Answers.Head(); n != nil; n = n.Next() {
-		r := n.Value()
-		if r == nil {
-			continue
-		}
+	for iter := m.Answers.Iter(); iter.Next(); {
+		r := iter.Value()
 		if ignoreRr != nil && ignoreRr(SectionAnswer, r) {
 			continue
 		}
@@ -389,11 +366,8 @@ func (m *Msg) PackFilter(
 			return off, errTooManyAnswers
 		}
 	}
-	for n := m.Authorities.Head(); n != nil; n = n.Next() {
-		r := n.Value()
-		if r == nil {
-			continue
-		}
+	for iter := m.Authorities.Iter(); iter.Next(); {
+		r := iter.Value()
 		if ignoreRr != nil && ignoreRr(SectionAuthority, r) {
 			continue
 		}
@@ -410,11 +384,8 @@ func (m *Msg) PackFilter(
 			return off, errTooManyAuthorities
 		}
 	}
-	for n := m.Additionals.Head(); n != nil; n = n.Next() {
-		r := n.Value()
-		if r == nil {
-			continue
-		}
+	for iter := m.Additionals.Iter(); iter.Next(); {
+		r := iter.Value()
 		if ignoreRr != nil && ignoreRr(SectionAdditional, r) {
 			continue
 		}
@@ -454,13 +425,10 @@ func (m *Msg) PackFilter(
 }
 
 func (m *Msg) popEdns0() *Resource {
-	for n := m.Additionals.Tail(); n != nil; n = n.Prev() {
-		r := n.Value()
-		if r == nil {
-			continue
-		}
+	for iter := m.Additionals.ReverseIter(); iter.Next(); {
+		r := iter.Value()
 		if r.Type == TypeOPT {
-			m.Additionals.Remove(n)
+			m.Additionals.Remove(r)
 			return r
 		}
 	}

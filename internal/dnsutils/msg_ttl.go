@@ -8,9 +8,9 @@ import (
 func GetMinimalTTL(m *dnsmsg.Msg) (_ uint32, ok bool) {
 	minTTL := ^uint32(0)
 	hasRecord := false
-	for _, set := range [...]*dnsmsg.List[*dnsmsg.Resource]{&m.Answers, &m.Authorities, &m.Answers} {
-		for n := set.Head(); n != nil; n = n.Next() {
-			rr := n.Value()
+	for _, list := range [...]*dnsmsg.List[*dnsmsg.Resource]{&m.Answers, &m.Authorities, &m.Answers} {
+		for iter := list.Iter(); iter.Next(); {
+			rr := iter.Value()
 			if rr.Type == dnsmsg.TypeOPT {
 				continue // opt record ttl is not ttl.
 			}
@@ -30,9 +30,9 @@ func GetMinimalTTL(m *dnsmsg.Msg) (_ uint32, ok bool) {
 // SubtractTTL subtract delta from every m's RR.
 // If RR's TTL is smaller than delta, the ttl will be set to 1.
 func SubtractTTL(m *dnsmsg.Msg, delta uint32) {
-	for _, set := range [...]*dnsmsg.List[*dnsmsg.Resource]{&m.Answers, &m.Authorities, &m.Additionals} {
-		for n := set.Head(); n != nil; n = n.Next() {
-			rr := n.Value()
+	for _, list := range [...]*dnsmsg.List[*dnsmsg.Resource]{&m.Answers, &m.Authorities, &m.Additionals} {
+		for iter := list.Iter(); iter.Next(); {
+			rr := iter.Value()
 			if rr.Type == dnsmsg.TypeOPT {
 				continue // opt record ttl is not ttl.
 			}

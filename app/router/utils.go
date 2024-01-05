@@ -27,10 +27,10 @@ func edns0Opt(udpSize uint16) *dnsmsg.Resource {
 
 // remove edns0 rr from m.
 func removeOpt(m *dnsmsg.Msg) {
-	for n := m.Additionals.Tail(); n != nil; n = n.Prev() {
-		r := n.Value()
+	for iter := m.Additionals.ReverseIter(); iter.Next(); {
+		r := iter.Value()
 		if r.Type == dnsmsg.TypeOPT {
-			m.Additionals.Remove(n)
+			m.Additionals.Remove(r)
 			dnsmsg.ReleaseRR(r)
 			return
 		}
