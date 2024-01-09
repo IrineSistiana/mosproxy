@@ -201,14 +201,6 @@ Loop:
 				return nil, off, errNameTooLong
 			}
 
-			// Reject names containing dots.
-			// See issue golang/go#56246
-			for _, v := range msg[currOff:endOff] {
-				if v == '.' {
-					return nil, off, errInvalidName
-				}
-			}
-
 			name = append(name, byte(c))
 			name = append(name, msg[currOff:endOff]...)
 			currOff = endOff
