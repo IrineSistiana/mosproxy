@@ -6,9 +6,7 @@ import (
 	"log"
 	"os"
 	"strconv"
-	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/delaywriter"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -22,17 +20,7 @@ var (
 )
 
 func initLogger() *zap.Logger {
-	var out zapcore.WriteSyncer
-	if ok, _ := strconv.ParseBool(os.Getenv("MOSPROXY_BUFFERLOGGER")); ok {
-		opts := delaywriter.Opts{
-			BufSize: 4096,
-			Delay:   time.Millisecond * 10,
-		}
-		out = delaywriter.New(os.Stderr, opts)
-	} else {
-		out = zapcore.Lock(os.Stderr)
-	}
-
+	out := zapcore.Lock(os.Stderr)
 	var logger *zap.Logger
 	if ok, _ := strconv.ParseBool(os.Getenv("MOSPROXY_JSONLOGGER")); ok {
 		logger = zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), out, lvl))
