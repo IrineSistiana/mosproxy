@@ -13,7 +13,7 @@ var quicSrkSalt = []byte{115, 189, 156, 229, 145, 216, 251, 127, 220, 89,
 
 var (
 	quicSrkInitOnce  sync.Once
-	quicSrk          *[32]byte
+	quicSrk          [32]byte
 	quicSrkFromIface net.Interface
 	quicSrkInitErr   error
 )
@@ -35,8 +35,7 @@ func initQUICSrkFromIfaceMac() {
 	}
 	for _, iface := range ifaces {
 		if nonZero(iface.HardwareAddr) {
-			k := sha256.Sum256(append(iface.HardwareAddr, quicSrkSalt...))
-			quicSrk = &k
+			quicSrk = sha256.Sum256(append(iface.HardwareAddr, quicSrkSalt...))
 			quicSrkFromIface = iface
 			return
 		}
@@ -46,7 +45,7 @@ func initQUICSrkFromIfaceMac() {
 
 // A helper func to init quic stateless reset key.
 // It use the first non-zero interface mac + sha256 hash.
-func InitQUICSrkFromIfaceMac() (*[32]byte, net.Interface, error) {
+func InitQUICSrkFromIfaceMac() ([32]byte, net.Interface, error) {
 	quicSrkInitOnce.Do(initQUICSrkFromIfaceMac)
 	return quicSrk, quicSrkFromIface, quicSrkInitErr
 }

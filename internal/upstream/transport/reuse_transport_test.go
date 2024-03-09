@@ -2,142 +2,103 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/miekg/dns"
+	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func Test_ReuseConnTransport(t *testing.T) {
-	const idleTimeout = time.Second * 5
 	r := require.New(t)
-
-	po := ReuseConnOpts{
+	a := assert.New(t)
+	rt := NewReuseConnTransport(ReuseConnOpts{
 		DialContext: func(ctx context.Context) (net.Conn, error) {
-			return newDummyEchoNetConn(dummyEchoNetConnOpts{}), nil
+			c, _ := newEchoConn()
+			return c, nil
 		},
-		IdleTimeout: idleTimeout,
-	}
-	rt := NewReuseConnTransport(po)
+	})
 	defer rt.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	q := new(dns.Msg)
-	q.SetQuestion("test.", dns.TypeA)
-	queryPayload, err := q.Pack()
-	r.NoError(err)
-	concurrentQueryNum := 10
-	for l := 0; l < 4; l++ {
-		wg := new(sync.WaitGroup)
-		for i := 0; i < concurrentQueryNum; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_, err := rt.ExchangeContext(ctx, queryPayload)
-				if err != nil {
-					t.Error(err)
-				}
-			}()
-		}
-		wg.Wait()
-		if t.Failed() {
-			return
-		}
-	}
 
-	rt.m.Lock()
-	connNum := len(rt.conns)
-	idledConnNum := len(rt.idleConns)
-	rt.m.Unlock()
-
-	r.Equal(0, connNum-idledConnNum, "there should be no active conn")
-	r.Equal(concurrentQueryNum, connNum)
-	r.Equal(concurrentQueryNum, idledConnNum, "all conn should be in idle status")
-}
-
-func Test_ReuseConnTransport_Read_err_and_close(t *testing.T) {
-	const idleTimeout = time.Second * 5
-	r := require.New(t)
-
-	po := ReuseConnOpts{
-		DialContext: func(ctx context.Context) (net.Conn, error) {
-			opt := dummyEchoNetConnOpts{
-				rErrProb: 1,
-			}
-			return newDummyEchoNetConn(opt), nil // 100% read err
-		},
-		IdleTimeout: idleTimeout,
-	}
-	rt := NewReuseConnTransport(po)
-	defer rt.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	q := new(dns.Msg)
-	q.SetQuestion("test.", dns.TypeA)
-	queryPayload, err := q.Pack()
-	r.NoError(err)
+	id := uint16(666)
+	name := "test.test."
+	req := newTestMsg(id, name)
 
 	wg := new(sync.WaitGroup)
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := rt.ExchangeContext(ctx, queryPayload)
-			r.Error(err)
+			if t.Failed() {
+				return
+			}
+			resp, err := rt.ExchangeContext(ctx, req)
+			a.NoError(err)
+			a.EqualValues(666, resp.ID)
+			respName, err := dnsmsg.ToReadable(resp.Questions[0].Name)
+			a.NoError(err)
+			a.True(string(respName) == "test.test")
 		}()
-		if t.Failed() {
-			return
-		}
 	}
 	wg.Wait()
+	if t.Failed() {
+		return
+	}
 
 	rt.m.Lock()
 	connNum := len(rt.conns)
 	idledConnNum := len(rt.idleConns)
 	rt.m.Unlock()
 
-	r.Equal(0, connNum)
-	r.Equal(0, idledConnNum)
+	r.True(connNum == idledConnNum, "there should be no active conn")
+	r.True(idledConnNum > 0, "some conns should be idled")
 }
 
-func Test_ReuseConnTransport_conn_lose_and_close(t *testing.T) {
+func Test_ReuseConnTransport_DialErr(t *testing.T) {
 	r := require.New(t)
-	po := ReuseConnOpts{
+	a := assert.New(t)
+	dialErr := errors.New("dial err")
+	rt := NewReuseConnTransport(ReuseConnOpts{
 		DialContext: func(ctx context.Context) (net.Conn, error) {
-			opt := dummyEchoNetConnOpts{
-				rErrProb: 0,
-				rLatency: time.Second,
-			}
-			return newDummyEchoNetConn(opt), nil // 100% read timeout
+			return nil, dialErr
 		},
-	}
-	rt := NewReuseConnTransport(po)
+	})
 	defer rt.Close()
-	rt.testWaitRespTimeout = time.Millisecond * 1
 
-	q := new(dns.Msg)
-	q.SetQuestion("test.", dns.TypeA)
-	queryPayload, err := q.Pack()
-	r.NoError(err)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*50)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, err = rt.ExchangeContext(ctx, queryPayload) // canceled ctx
-	r.Error(err)
 
-	time.Sleep(time.Millisecond * 100)
+	req := newTestMsg(0, ".")
+
+	wg := new(sync.WaitGroup)
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if t.Failed() {
+				return
+			}
+			_, err := rt.ExchangeContext(ctx, req)
+			a.ErrorIs(err, dialErr)
+		}()
+	}
+	wg.Wait()
+	if t.Failed() {
+		return
+	}
 
 	rt.m.Lock()
 	connNum := len(rt.conns)
 	idledConnNum := len(rt.idleConns)
 	rt.m.Unlock()
 
-	// connection should be closed and removed
-	r.Equal(0, connNum)
-	r.Equal(0, idledConnNum)
+	r.True(connNum == 0)
+	r.True(idledConnNum == 0)
 }

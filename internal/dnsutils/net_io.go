@@ -14,22 +14,22 @@ func ReadMsgFromTCP(c io.Reader) (*dnsmsg.Msg, int, error) {
 	hdrBuf := pool.GetBuf(2)
 	defer pool.ReleaseBuf(hdrBuf)
 	var n int
-	nr, err := io.ReadFull(c, hdrBuf.B())
+	nr, err := io.ReadFull(c, hdrBuf)
 	n += nr
 	if err != nil {
 		return nil, n, err
 	}
 
-	length := binary.BigEndian.Uint16(hdrBuf.B())
+	length := binary.BigEndian.Uint16(hdrBuf)
 	msgBuf := pool.GetBuf(int(length))
 	defer pool.ReleaseBuf(msgBuf)
-	nr, err = io.ReadFull(c, msgBuf.B())
+	nr, err = io.ReadFull(c, msgBuf)
 	n += nr
 	if err != nil {
 		return nil, n, err
 	}
 
-	m, err := dnsmsg.UnpackMsg(msgBuf.B())
+	m, err := dnsmsg.UnpackMsg(msgBuf)
 	return m, n, err
 }
 
@@ -39,10 +39,10 @@ func ReadMsgFromUDP(c io.Reader, bufSize int) (*dnsmsg.Msg, int, error) {
 	}
 	b := pool.GetBuf(bufSize)
 	defer pool.ReleaseBuf(b)
-	n, err := c.Read(b.B())
+	n, err := c.Read(b)
 	if err != nil {
 		return nil, n, err
 	}
-	m, err := dnsmsg.UnpackMsg(b.B()[:n])
+	m, err := dnsmsg.UnpackMsg(b[:n])
 	return m, n, err
 }

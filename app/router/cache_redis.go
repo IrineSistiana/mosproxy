@@ -5,23 +5,23 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/rueidis"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 type redisCache struct {
 	client rueidis.Client
-	logger *zap.Logger
+	logger *zerolog.Logger
 
-	disabled atomic.Bool
+	connected atomic.Bool
 
 	setOpChan chan redisSetOp
 
@@ -37,12 +37,15 @@ type redisCache struct {
 }
 
 type redisSetOp struct {
-	k     *pool.Buffer
-	v     *pool.Buffer
+	k     pool.Buffer
+	v     pool.Buffer
 	ttlMs int64
 }
 
-func newRedisCache(u string, logger *zap.Logger) (*redisCache, error) {
+func newRedisCache(u string, logger *zerolog.Logger) (*redisCache, error) {
+	if logger == nil {
+		logger = mlog.Nop()
+	}
 	opt, err := rueidis.ParseURL(u)
 	if err != nil {
 		return nil, fmt.Errorf("invalid redis url, %w", err)
@@ -52,31 +55,13 @@ func newRedisCache(u string, logger *zap.Logger) (*redisCache, error) {
 		return nil, err
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		start := time.Now()
-		info, err := client.Do(ctx, client.B().Info().Build()).ToString()
-		cancel()
-		if err != nil {
-			logger.Error("redis server ping check failed", zap.Error(err))
-		} else {
-			fs := []zap.Field{
-				zap.Duration("latency", time.Since(start)),
-			}
-			fs = parseRedisBasicInfo(info, fs)
-			logger.Info(
-				"redis server connected",
-				fs...,
-			)
-		}
-	}()
-
 	c := &redisCache{
 		client:      client,
 		logger:      logger,
-		setOpChan:   make(chan redisSetOp, 16),
+		setOpChan:   make(chan redisSetOp, 128),
 		closeNotify: make(chan struct{}),
 	}
+
 	c.getTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "cache_redis_get_total",
 		Help: "The total number of get ops",
@@ -122,55 +107,57 @@ func (c *redisCache) Close() error {
 	return nil
 }
 
-func (c *redisCache) buildKey(q *dnsmsg.Question, marker string) *pool.Buffer {
-	bp := pool.GetBuf(1 + q.Name.Len() + 4 + len(marker))
-	b := bp.B()
-	b[0] = byte(q.Name.Len())
-	off := 1
-	off += copy(b[off:], q.Name.B())
+func (c *redisCache) buildKey(q *dnsmsg.Question, marker string) pool.Buffer {
+	b := pool.GetBuf(q.Name.PackLen() + 4 + len(marker))
+	off := copy(b, pool.Buffer(q.Name))
 	binary.BigEndian.PutUint16(b[off:], uint16(q.Class))
 	off += 2
 	binary.BigEndian.PutUint16(b[off:], uint16(q.Type))
 	off += 2
 	copy(b[off:], []byte(marker))
-	return bp
-}
-
-func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) *pool.Buffer {
-	b := pool.GetBuf(16 + len(v))
-	binary.BigEndian.PutUint64(b.B(), uint64(storedTime.Unix()))
-	binary.BigEndian.PutUint64(b.B()[8:], uint64(expireTime.Unix()))
-	copy(b.B()[16:], v)
 	return b
 }
 
-// Returned error is redis connection error.
-// The error of broking/invalid stored data will be logged.
-func (c *redisCache) Get(ctx context.Context, q *dnsmsg.Question, mark string) (storedTime, expireTime time.Time, resp *dnsmsg.Msg, v []byte, err error) {
-	if c.disabled.Load() {
+func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) pool.Buffer {
+	b := pool.GetBuf(16 + len(v))
+	binary.BigEndian.PutUint64(b, uint64(storedTime.Unix()))
+	binary.BigEndian.PutUint64(b[8:], uint64(expireTime.Unix()))
+	copy(b[16:], v)
+	return b
+}
+
+// Get dose not return error.
+// All errors (of broking/invalid stored data, connection lost) will be logged.
+func (c *redisCache) Get(ctx context.Context,
+	q *dnsmsg.Question,
+	mark string) (storedTime, expireTime time.Time,
+	resp *dnsmsg.Msg, v []byte) {
+
+	if !c.connected.Load() {
 		return
 	}
 
 	key := c.buildKey(q, mark)
 	defer pool.ReleaseBuf(key)
 	start := time.Now()
-	cmd := c.client.B().Get().Key(rueidis.BinaryString(key.B())).Build()
+	cmd := c.client.B().Get().Key(rueidis.BinaryString(key)).Build()
 	res := c.client.Do(ctx, cmd)
 	b, err := res.AsBytes()
 	if err != nil {
 		if errors.Is(err, rueidis.Nil) { // miss
 			c.getTotal.Inc()
 			c.getLatency.Observe(float64(time.Since(start).Milliseconds()))
-			err = nil
+		} else {
+			// This is a redis io error.
+			c.logger.Error().Err(err).Msg("get cmd failed")
 		}
-		// This is a redis io error.
-		return time.Time{}, time.Time{}, nil, nil, err
+		return time.Time{}, time.Time{}, nil, nil
 	}
 
 	// hit
 	if len(b) < 16 {
-		c.logger.Error("invalid redis cache data, too short", zap.Error(err))
-		return time.Time{}, time.Time{}, nil, nil, nil
+		c.logger.Error().Msg("invalid cache data, too short")
+		return time.Time{}, time.Time{}, nil, nil
 	}
 	storedTime = time.Unix(int64(binary.BigEndian.Uint64(b[:8])), 0)
 	expireTime = time.Unix(int64(binary.BigEndian.Uint64(b[8:16])), 0)
@@ -178,7 +165,7 @@ func (c *redisCache) Get(ctx context.Context, q *dnsmsg.Question, mark string) (
 
 	resp, err = unpackCacheMsg(v)
 	if err != nil {
-		c.logger.Error("failed to unpack redis cache data", zap.Error(err))
+		c.logger.Error().Err(err).Msg("invalid cache data, failed to unpack")
 		return
 	}
 
@@ -189,7 +176,7 @@ func (c *redisCache) Get(ctx context.Context, q *dnsmsg.Question, mark string) (
 }
 
 func (c *redisCache) AsyncStore(q *dnsmsg.Question, mark string, storedTime, expireTime time.Time, v []byte) {
-	if c.disabled.Load() {
+	if !c.connected.Load() {
 		return
 	}
 
@@ -217,21 +204,25 @@ func (c *redisCache) pingLoop() {
 		case <-c.closeNotify:
 			return
 		case <-ticker.C:
-			start := time.Now()
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			start := time.Now()
 			err := c.client.Do(ctx, c.client.B().Ping().Build()).Error()
+			elapse := time.Since(start)
 			cancel()
 			if err != nil {
-				c.disabled.Store(true)
-				c.logger.Check(zap.ErrorLevel, "redis server ping failed").Write(
-					zap.Duration("elapsed", time.Since(start)),
-					zap.Error(err),
-				)
+				c.connected.Store(false)
+				c.logger.Error().
+					Err(err).
+					Dur("elapse", elapse).
+					Msg("redis server ping lost")
 			} else {
-				c.disabled.Store(false)
-				c.logger.Check(zap.DebugLevel, "redis server ping check successful").Write(
-					zap.Duration("latency", time.Since(start)),
-				)
+				if prevConnected := c.connected.Swap(true); !prevConnected {
+					c.logger.Info().Dur("latency", elapse).
+						Msg("redis server connected")
+				} else {
+					c.logger.Debug().Dur("latency", elapse).
+						Msg("redis server ping")
+				}
 			}
 		}
 	}
@@ -244,33 +235,18 @@ func (c *redisCache) setLoop() {
 			return
 		case op := <-c.setOpChan:
 			start := time.Now()
-			cmd := c.client.B().Set().Key(rueidis.BinaryString(op.k.B())).Value(rueidis.BinaryString(op.v.B())).PxMilliseconds(op.ttlMs).Build()
+			cmd := c.client.B().Set().Key(rueidis.BinaryString(op.k)).Value(rueidis.BinaryString(op.v)).PxMilliseconds(op.ttlMs).Build()
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 			err := c.client.Do(ctx, cmd).Error()
 			cancel()
 			pool.ReleaseBuf(op.k)
 			pool.ReleaseBuf(op.v)
 			if err != nil {
-				c.logger.Warn("redis set failed", zap.Error(err))
+				c.logger.Err(err).Msg("redis set cmd failed")
 			} else {
 				c.setTotal.Inc()
 				c.setLatency.Observe(float64(time.Since(start).Milliseconds()))
 			}
 		}
 	}
-}
-
-// "redis_version", "process_id", "redis_mode"
-func parseRedisBasicInfo(s string, zfs []zap.Field) []zap.Field {
-	fs := strings.Fields(s)
-	for _, ss := range fs {
-		k, v, ok := strings.Cut(ss, ":")
-		if ok {
-			switch k {
-			case "redis_version", "process_id", "redis_mode":
-				zfs = append(zfs, zap.String(k, v))
-			}
-		}
-	}
-	return zfs
 }

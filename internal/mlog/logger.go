@@ -6,72 +6,83 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
 
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"github.com/rs/zerolog"
 )
 
 var (
-	lvl = zap.NewAtomicLevelAt(zap.InfoLevel)
 	l   = initLogger()
-	s   = l.Sugar()
-
-	nop = zap.NewNop()
+	nop = zerolog.Nop()
 )
 
-func initLogger() *zap.Logger {
-	out := zapcore.Lock(os.Stderr)
-	var logger *zap.Logger
+func SetLvl(lvl zerolog.Level) {
+	zerolog.SetGlobalLevel(lvl)
+}
+
+func initLogger() zerolog.Logger {
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
+
+	var w io.Writer
 	if ok, _ := strconv.ParseBool(os.Getenv("MOSPROXY_JSONLOGGER")); ok {
-		logger = zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), out, lvl))
+		w = lock(os.Stderr)
 	} else {
-		logger = zap.New(zapcore.NewCore(zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig()), out, lvl))
+		w = zerolog.NewConsoleWriter()
 	}
 
+	l := zerolog.New(w).With().Timestamp().Logger()
+
 	// Redirect std log
-	w := WriteToLogger(logger, zap.InfoLevel, "redirect std log", "data")
+	redirectWriter := WriteToLogger(l, "redirected std log", "data")
 	log.SetFlags(0) // disable time/date
 	log.SetPrefix("")
-	log.SetOutput(w)
+	log.SetOutput(redirectWriter)
 
 	// quic warning, we don't need this.
 	os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "1")
-	return logger
-}
-
-func L() *zap.Logger {
 	return l
 }
 
-func SetLevel(l zapcore.Level) {
-	lvl.SetLevel(l)
-}
-func Lvl() zapcore.Level {
-	return l.Level()
+func Nop() *zerolog.Logger {
+	return &nop
 }
 
-func S() *zap.SugaredLogger {
-	return s
+func L() *zerolog.Logger {
+	return &l
 }
 
-func Nop() *zap.Logger {
-	return nop
-}
-
-func WriteToLogger(to *zap.Logger, lvl zapcore.Level, msg string, key string) io.Writer {
-	to = to.WithOptions(zap.AddCallerSkip(3)) // Skip log.Logger's stack. This value is copied from zap.RedirectStdLog()
-	return &logCatcher{logger: to, lvl: lvl, msg: msg, key: key}
+func WriteToLogger(to zerolog.Logger, msg string, key string) io.Writer {
+	return &logCatcher{
+		logger: to.With().CallerWithSkipFrameCount(1).Logger(),
+		msg:    msg,
+		key:    key}
 }
 
 type logCatcher struct {
-	logger *zap.Logger
-	lvl    zapcore.Level
+	logger zerolog.Logger
 	msg    string
 	key    string
 }
 
 func (w *logCatcher) Write(b []byte) (int, error) {
-	b = bytes.TrimSpace(b)
-	w.logger.Check(w.lvl, w.msg).Write(zap.ByteString(w.key, b))
+	b = bytes.TrimSpace(b) // trim \n from std logger
+	w.logger.Log().Bytes(w.key, b).Msg(w.msg)
 	return len(b), nil
+}
+
+type safeWriter struct {
+	m sync.Mutex
+	w io.Writer
+}
+
+func lock(w io.Writer) io.Writer {
+	return &safeWriter{
+		w: w,
+	}
+}
+
+func (w *safeWriter) Write(b []byte) (int, error) {
+	w.m.Lock()
+	defer w.m.Unlock()
+	return w.w.Write(b)
 }

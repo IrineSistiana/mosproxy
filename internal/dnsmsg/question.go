@@ -2,51 +2,33 @@ package dnsmsg
 
 import (
 	"sync"
-
-	"github.com/IrineSistiana/mosproxy/internal/pool"
 )
 
-func unpackQuestion(msg []byte, off int) (*Question, int, error) {
-	name, off, err := unpackName(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("name", err)
-	}
-	typ, off, err := unpackUint16Msg(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("type", err)
-	}
-	cls, off, err := unpackUint16Msg(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("class", err)
-	}
-	return newQuestion(name, Class(cls), Type(typ)), off, nil
-}
-
 type Question struct {
-	noCopy
-	linkNode
-
-	Name  *pool.Buffer
+	Name  Name
 	Type  Type
 	Class Class
 }
 
-// no compression len
-func (q *Question) len() int {
+// no compression Len
+func (q *Question) Len() int {
 	l := 0
-	l += nameLen(q.Name)
+	l += q.Name.PackLen()
 	l += 4 // type and class (2*uint16)
 	return l
 }
 
 func (q *Question) Copy() *Question {
-	cq := NewQuestion(q.Name.B(), q.Class, q.Type)
+	cq := NewQuestion()
+	cq.Name = Name(copyBuf(q.Name))
+	cq.Class = q.Class
+	cq.Type = q.Type
 	return cq
 }
 
 // copied from Question.pack
 func (q *Question) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
-	off, err := packName(q.Name, msg, off, compression)
+	off, err := q.Name.pack(msg, off, compression)
 	if err != nil {
 		return off, newSectionErr("name", err)
 	}
@@ -61,26 +43,40 @@ func (q *Question) pack(msg []byte, off int, compression map[string]uint16) (int
 	return off, nil
 }
 
+func unpackQuestion(msg []byte, off int) (*Question, int, error) {
+	name, off, err := unpackName(msg, off)
+	if err != nil {
+		return nil, 0, newSectionErr("name", err)
+	}
+	typ, off, err := unpackUint16Msg(msg, off)
+	if err != nil {
+		return nil, 0, newSectionErr("type", err)
+	}
+	cls, off, err := unpackUint16Msg(msg, off)
+	if err != nil {
+		return nil, 0, newSectionErr("class", err)
+	}
+	q := NewQuestion()
+	q.Name = name
+	q.Type = Type(typ)
+	q.Class = Class(cls)
+	return q, off, nil
+}
+
 var qsPool = sync.Pool{
 	New: func() any {
 		return new(Question)
 	},
 }
 
-func NewQuestion(name []byte, cls Class, typ Type) *Question {
-	return newQuestion(copyBuf(name), cls, typ)
-}
-
-func newQuestion(name *pool.Buffer, cls Class, typ Type) *Question {
-	q := qsPool.Get().(*Question)
-	q.Name = name
-	q.Class = cls
-	q.Type = typ
-	return q
+func NewQuestion() *Question {
+	return qsPool.Get().(*Question)
 }
 
 func ReleaseQuestion(q *Question) {
-	pool.ReleaseBuf(q.Name)
+	if q.Name != nil {
+		ReleaseName(q.Name)
+	}
 	*q = Question{}
 	qsPool.Put(q)
 }

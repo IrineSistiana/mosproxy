@@ -11,7 +11,7 @@ import (
 )
 
 func makeTlsConfig(cfg *TlsConfig, requireCert bool) (*tls.Config, error) {
-	if requireCert && (cfg.Cert == "" || cfg.Key == "") && !cfg.TestUseTempCert {
+	if requireCert && (cfg.Cert == "" || cfg.Key == "") && !cfg.DebugUseTempCert {
 		return nil, errors.New("missing required cert or key")
 	}
 
@@ -25,7 +25,7 @@ func makeTlsConfig(cfg *TlsConfig, requireCert bool) (*tls.Config, error) {
 		c.RootCAs = pool
 	}
 
-	if cfg.TestUseTempCert {
+	if cfg.DebugUseTempCert {
 		cert, err := testutils.GenerateCertificate("test.test")
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate cert, %w", err)

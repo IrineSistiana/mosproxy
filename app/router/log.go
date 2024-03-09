@@ -1,26 +1,52 @@
 package router
 
 import (
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
-)
+	"net"
 
-func inlineQ(q *dnsmsg.Question) zap.Field {
-	return zap.Inline((*qLogObj)(q))
-}
+	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/rs/zerolog"
+)
 
 type qLogObj dnsmsg.Question
 
-func (o *qLogObj) MarshalLogObject(e zapcore.ObjectEncoder) error {
+func (o *qLogObj) MarshalZerologObject(e *zerolog.Event) {
 	q := (*dnsmsg.Question)(o)
-	e.AddByteString("qname", q.Name.B())
-	e.AddUint16("qclass", uint16(q.Class))
-	e.AddUint16("qtype", uint16(q.Type))
-	return nil
+
+	b, err := dnsmsg.ToReadable(q.Name)
+	if err != nil {
+		e.Bytes("invalid_name", q.Name)
+	} else {
+		e.Bytes("name", b)
+		pool.ReleaseBuf(b)
+	}
+	e.Uint16("class", uint16(q.Class))
+	e.Uint16("type", uint16(q.Type))
 }
 
 const (
 	logPackRespErr = "failed to pack resp"
 	logPackReqErr  = "failed to pack req"
 )
+
+type logConn interface {
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
+}
+
+func debugLogServerConnAccepted(c logConn, logger *zerolog.Logger) {
+	logger.Debug().
+		Str("network", c.LocalAddr().Network()).
+		Stringer("local", c.LocalAddr()).
+		Stringer("remote", c.RemoteAddr()).
+		Msg("connection opened")
+}
+
+func debugLogServerConnClosed(c logConn, logger *zerolog.Logger, cause error) {
+	logger.Debug().
+		Str("network", c.LocalAddr().Network()).
+		Stringer("local", c.LocalAddr()).
+		Stringer("remote", c.RemoteAddr()).
+		AnErr("cause", cause).
+		Msg("connection closed")
+}

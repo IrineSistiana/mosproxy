@@ -1,10 +1,6 @@
 package domainmatcher
 
-import (
-	"bytes"
-
-	"github.com/IrineSistiana/mosproxy/internal/pool"
-)
+import "github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 
 type DomainMatcher struct {
 	root        labelNode
@@ -15,26 +11,23 @@ func NewDomainMatcher() *DomainMatcher {
 	return &DomainMatcher{}
 }
 
-func (m *DomainMatcher) MatchString(n string) bool {
-	b := normDomainStr(n)
-	defer pool.ReleaseBuf(b)
-	return m.match(b.B())
-}
 func (m *DomainMatcher) Match(n []byte) bool {
-	b := normDomain(n)
-	defer pool.ReleaseBuf(b)
-	return m.match(b.B())
-}
-
-func (m *DomainMatcher) match(n []byte) bool {
 	if m.rootMatched {
 		return true
 	}
-	off := len(n)
+
+	labels := make([][]byte, 0, 16)
+	scanner := dnsmsg.NewNameScanner(n)
+	for scanner.Scan() {
+		labels = append(labels, scanner.Label())
+	}
+	if scanner.Err() != nil {
+		return false
+	}
+
 	currentNode := &m.root
-	for off > 0 {
-		prevDot := bytes.LastIndexByte(n[:off], '.')
-		label := n[prevDot+1 : off]
+	for i := len(labels) - 1; i >= 0; i-- {
+		label := labels[i]
 		child, ok := currentNode.GetChild(label)
 		if child == nil {
 			// if ok == true, then this label is a leaf and matched.
@@ -42,7 +35,6 @@ func (m *DomainMatcher) match(n []byte) bool {
 			return ok
 		}
 		currentNode = child
-		off = prevDot
 	}
 	return false
 }
@@ -54,35 +46,35 @@ func (m *DomainMatcher) Len() int {
 	return m.root.Len()
 }
 
-func (m *DomainMatcher) Add(s []byte) {
-	b := normDomain(s)
-	defer pool.ReleaseBuf(b)
-	m.add(b.B())
-}
-
-func (m *DomainMatcher) add(n []byte) {
+// Add adds labels to the matcher. Empty label will be ignored.
+// If no label was given, add will add the root domain. Which
+// will match against all domains.
+func (m *DomainMatcher) Add(labels [][]byte) {
 	if m.rootMatched {
 		return
 	}
-	if len(n) == 0 {
-		m.rootMatched = true
-		m.root.l = nil
-		m.root.s = nil
-		return
-	}
 
-	off := len(n)
+	hasLabel := false
 	currentNode := &m.root
-	for off > 0 {
-		prevDot := bytes.LastIndexByte(n[:off], '.')
-		label := n[prevDot+1 : off]
-		if prevDot == -1 { // is leaf
+	for i := len(labels) - 1; i >= 0; i-- {
+		label := labels[i]
+		if len(label) == 0 {
+			continue
+		}
+		hasLabel = true
+		if i == 0 { // is leaf
 			currentNode.AddLeaf(label)
 		} else {
 			child := currentNode.GetOrAddChild(label)
 			currentNode = child
 		}
-		off = prevDot
+	}
+
+	if !hasLabel {
+		m.rootMatched = true
+		m.root.l = nil
+		m.root.s = nil
+		return
 	}
 }
 

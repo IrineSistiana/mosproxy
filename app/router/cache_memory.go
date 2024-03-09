@@ -6,21 +6,25 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/dgraph-io/ristretto"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 type memoryCache struct {
 	backend *ristretto.Cache[uint64, *cacheEntry]
-	logger  *zap.Logger
+	logger  *zerolog.Logger
 
 	getTotal prometheus.Counter
 	hitTotal prometheus.Counter
 }
 
-func newMemoryCache(size int64, logger *zap.Logger) (*memoryCache, error) {
+func newMemoryCache(size int64, logger *zerolog.Logger) (*memoryCache, error) {
+	if logger == nil {
+		logger = mlog.Nop()
+	}
 	backend, err := ristretto.NewCache[uint64, *cacheEntry](&ristretto.Config[uint64, *cacheEntry]{
 		NumCounters: size / 20,
 		MaxCost:     size,
@@ -49,47 +53,55 @@ func (c *memoryCache) RegisterMetricsTo(r prometheus.Registerer) error {
 }
 
 func (c *memoryCache) Store(q *dnsmsg.Question, mark string, storedTime, expireTime time.Time, v []byte) {
-	cost := q.Name.Len() + 4 + len(v) // TODO: Better cost calculation.
+	nameLen := q.Name.PackLen()
+	cost := nameLen + 4 + len(v) // TODO: Better cost calculation.
 	key := hashReq(q, mark)
 
-	qCopy := q.Copy()
+	nameCopy := copyBuf(q.Name)
 	vCopy := copyBuf(v)
 	e := newCacheEntry()
 	e.l.Lock()
-	e.ipMark = mark
 	e.storedTime = storedTime
 	e.expireTime = expireTime
-	e.q = qCopy
+	e.ipMark = mark
+	e.name = dnsmsg.Name(nameCopy)
+	e.typ = q.Type
+	e.cls = q.Class
 	e.v = vCopy
 	e.l.Unlock()
 	c.backend.SetWithTTL(key, e, int64(cost), time.Until(expireTime))
 }
 
 func (c *memoryCache) Get(q *dnsmsg.Question, mark string) (resp *dnsmsg.Msg, storedTime, expireTime time.Time) {
-	sameQuestion := func(n1, n2 *dnsmsg.Question) bool {
-		return n1.Class == n2.Class && n1.Type == n2.Type && bytes.Equal(n1.Name.B(), n2.Name.B())
-	}
 	c.getTotal.Inc()
-
-	key := hashReq(q, mark)
-	e, ok := c.backend.Get(key)
+	hashKey := hashReq(q, mark)
+	e, ok := c.backend.Get(hashKey)
 	if ok { // key hit
 		if e.l.TryRLock() {
-			if e.q == nil {
+			if e.name == nil {
 				e.l.RUnlock()
 				return nil, time.Time{}, time.Time{} // entry has been released
 			}
-			if e.ipMark != mark || !sameQuestion(q, e.q) {
+			sameReq := e.ipMark == mark &&
+				e.typ == q.Type &&
+				e.cls == q.Class &&
+				bytes.Equal(q.Name, e.name)
+			if !sameReq {
 				e.l.RUnlock()
 				return nil, time.Time{}, time.Time{} // collision, or entry was reused just now.
 			}
-			resp, err := unpackCacheMsg(e.v.B())
+			resp, err := unpackCacheMsg(e.v)
+			storedTime = e.storedTime
+			expireTime = e.expireTime
 			e.l.RUnlock()
+
 			if err != nil {
-				c.logger.Error("failed to unpack msg", zap.Error(err))
+				c.backend.Del(hashKey)
+				c.logger.Error().Err(err).Msg("failed to unpack cached resp")
+				return nil, time.Time{}, time.Time{}
 			}
 			c.hitTotal.Inc()
-			return resp, e.storedTime, e.expireTime
+			return resp, storedTime, expireTime
 		}
 		return nil, time.Time{}, time.Time{} // entry is being released
 	}
@@ -106,9 +118,13 @@ type cacheEntry struct {
 	l          sync.RWMutex
 	storedTime time.Time
 	expireTime time.Time
-	ipMark     string
-	q          *dnsmsg.Question // nil if released
-	v          *pool.Buffer     // nil if released
+
+	ipMark string
+	name   dnsmsg.Name // nil if released
+	typ    dnsmsg.Type
+	cls    dnsmsg.Class
+
+	v pool.Buffer // nil if released
 }
 
 var cacheEntryPool = sync.Pool{
@@ -121,13 +137,13 @@ func newCacheEntry() *cacheEntry {
 
 func releaseEntry(e *cacheEntry) {
 	e.l.Lock()
-	dnsmsg.ReleaseQuestion(e.q)
-	pool.ReleaseBuf(e.v)
 	e.storedTime = time.Time{}
 	e.expireTime = time.Time{}
 	e.ipMark = ""
-	e.q = nil
-	e.v = nil
+	dnsmsg.ReleaseName(e.name)
+	e.typ = 0
+	e.cls = 0
+	pool.ReleaseBuf(e.v)
 	e.l.Unlock()
 	cacheEntryPool.Put(e)
 }

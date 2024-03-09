@@ -13,8 +13,7 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"github.com/rs/zerolog"
 	"golang.org/x/net/http2"
 )
 
@@ -39,7 +38,7 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) error {
 
 	if err := http2.ConfigureServer(hs, &http2.Server{
 		MaxReadFrameSize:             16 * 1024, // http2 minimum
-		MaxConcurrentStreams:         cfg.Http.TestMaxStreams,
+		MaxConcurrentStreams:         cfg.Http.DebugMaxStreams,
 		IdleTimeout:                  idleTimeout,
 		MaxUploadBufferPerConnection: 65535, // http2 minimum
 		MaxUploadBufferPerStream:     65535, // http2 minimum
@@ -61,10 +60,13 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) error {
 		return err
 	}
 	h.localAddr = netAddr2NetipAddr(l.Addr()) // maybe nil
-	h.logger = r.logger.Named("server_http").With(zap.Stringer("server_addr", l.Addr()))
-	hs.ErrorLog = log.New(mlog.WriteToLogger(h.logger, zap.WarnLevel, "", "msg"), "", 0)
+	h.logger = r.subLoggerForServer("server_http", cfg.Tag)
+	hs.ErrorLog = log.New(mlog.WriteToLogger(*h.logger, "redirected http log", "msg"), "", 0)
 
-	h.logger.Info("http server started")
+	h.logger.Info().
+		Str("network", l.Addr().Network()).
+		Stringer("addr", l.Addr()).
+		Msg("http server started")
 	go func() {
 		defer l.Close()
 		var err error
@@ -84,27 +86,26 @@ type httpHandler struct {
 	path             string
 	clientAddrHeader string
 
-	logger *zap.Logger
+	logger *zerolog.Logger
 }
 
 type httpReqLoggerObj http.Request
 
-func (req *httpReqLoggerObj) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
-	encoder.AddString("client", req.RemoteAddr)
-	encoder.AddString("method", req.Method)
-	encoder.AddString("url", req.RequestURI)
-	encoder.AddString("proto", req.Proto)
-	return nil
-}
-
-func reqField(req *http.Request) zap.Field {
-	return zap.Object("req", (*httpReqLoggerObj)(req))
+// Note: keep key names same as [fasthttpReqLoggerObj]
+func (req *httpReqLoggerObj) MarshalZerologObject(e *zerolog.Event) {
+	e.Str("proto", req.Proto)
+	e.Str("method", req.Method)
+	e.Str("url", req.RequestURI)
+	e.Str("ua", req.Header.Get("User-Agent"))
+	e.Str("remote", req.RemoteAddr)
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// check path
 	if len(h.path) > 0 && h.path != req.URL.Path {
-		h.logger.Error("invalid path", reqField(req))
+		h.logger.Warn().
+			Object("request", (*httpReqLoggerObj)(req)).
+			Msg("invalid path")
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -115,7 +116,11 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		if xff := req.Header.Get(header); len(xff) != 0 {
 			addr, err := readClientAddrFromXFF(xff)
 			if err != nil {
-				h.logger.Warn("invalid client addr header", reqField(req), zap.String("value", xff), zap.Error(err))
+				h.logger.Warn().
+					Object("request", (*httpReqLoggerObj)(req)).
+					Str("value", xff).
+					Err(err).
+					Msg("invalid client addr header value")
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
@@ -141,18 +146,21 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	buf, err := packResp(rc.Response.Msg, true, 65535)
 	if err != nil {
-		h.logger.Error(logPackRespErr, reqField(req), zap.Error(err))
+		h.logger.Error().
+			Object("request", (*httpReqLoggerObj)(req)).
+			Err(err).
+			Msg(logPackRespErr)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	defer pool.ReleaseBuf(buf)
 
 	w.Header().Set("Content-Type", "application/dns-message")
-	if _, err := w.Write(buf.B()); err != nil {
-		h.logger.Check(zap.WarnLevel, "failed to write http response").Write(
-			reqField(req),
-			zap.Error(err),
-		)
+	if _, err := w.Write(buf); err != nil {
+		h.logger.Error().
+			Object("request", (*httpReqLoggerObj)(req)).
+			Err(err).
+			Msg("failed to write http response")
 		return
 	}
 }
@@ -187,38 +195,52 @@ func (h *httpHandler) readReqMsg(w http.ResponseWriter, req *http.Request) *dnsm
 	case http.MethodGet:
 		// Check accept header
 		if acceptTyp := req.Header.Get("Accept"); acceptTyp != "application/dns-message" {
-			h.logger.Warn("invalid accept header", reqField(req), zap.String("accept", acceptTyp))
+			h.logger.Warn().
+				Object("request", (*httpReqLoggerObj)(req)).
+				Str("value", acceptTyp).
+				Msg("invalid accept header")
 			w.WriteHeader(http.StatusBadRequest)
 			return nil
 		}
 
 		s := getDnsKey(req.URL.RawQuery)
 		if len(s) == 0 {
-			h.logger.Warn("missing dns parameter", reqField(req))
+			h.logger.Warn().
+				Object("request", (*httpReqLoggerObj)(req)).
+				Msg("missing dns parameter")
 			w.WriteHeader(http.StatusBadRequest)
 			return nil
 		}
 
 		msgSize := base64.RawURLEncoding.DecodedLen(len(s))
 		if msgSize > 65535 {
-			h.logger.Warn("query msg overflowed", reqField(req), zap.Int("len", msgSize))
+			h.logger.Warn().
+				Object("request", (*httpReqLoggerObj)(req)).
+				Int("len", msgSize).
+				Msg("query msg too long")
 			w.WriteHeader(http.StatusBadRequest)
 			return nil
 		}
 		buf := pool.GetBuf(msgSize)
 		defer pool.ReleaseBuf(buf)
-		_, err := base64.RawURLEncoding.Decode(buf.B(), str2BytesUnsafe(s))
+		_, err := base64.RawURLEncoding.Decode(buf, str2BytesUnsafe(s))
 		if err != nil {
-			h.logger.Warn("invalid base64", reqField(req), zap.Error(err))
+			h.logger.Warn().
+				Object("request", (*httpReqLoggerObj)(req)).
+				Err(err).
+				Msg("invalid base64 data")
 			w.WriteHeader(http.StatusBadRequest)
 			return nil
 		}
-		reqWireMsg = buf.B()
+		reqWireMsg = buf
 
 	case http.MethodPost:
 		// Check Content-Type header
 		if ct := req.Header.Get("Content-Type"); ct != "application/dns-message" {
-			h.logger.Warn("invalid content-type header", reqField(req), zap.String("content-type", ct))
+			h.logger.Warn().
+				Object("request", (*httpReqLoggerObj)(req)).
+				Str("value", ct).
+				Msg("invalid content-type header")
 			w.WriteHeader(http.StatusBadRequest)
 			return nil
 		}
@@ -227,21 +249,29 @@ func (h *httpHandler) readReqMsg(w http.ResponseWriter, req *http.Request) *dnsm
 		defer bufPool.Release(buf)
 		_, err := buf.ReadFrom(io.LimitReader(req.Body, 65535))
 		if err != nil {
-			h.logger.Warn("failed to read request body", reqField(req), zap.Error(err))
+			h.logger.Warn().
+				Object("request", (*httpReqLoggerObj)(req)).
+				Err(err).
+				Msg("failed to read request body")
 			w.WriteHeader(http.StatusBadRequest)
 			return nil
 		}
 		reqWireMsg = buf.Bytes()
 
 	default:
-		h.logger.Warn("invalid method", reqField(req))
+		h.logger.Warn().
+			Object("request", (*httpReqLoggerObj)(req)).
+			Msg("invalid method")
 		w.WriteHeader(http.StatusNotImplemented)
 		return nil
 	}
 
 	m, err := dnsmsg.UnpackMsg(reqWireMsg)
 	if err != nil {
-		h.logger.Warn("invalid query msg", reqField(req), zap.Error(err))
+		h.logger.Warn().
+			Object("request", (*httpReqLoggerObj)(req)).
+			Err(err).
+			Msg("invalid query msg")
 		w.WriteHeader(http.StatusBadRequest)
 		return nil
 	}

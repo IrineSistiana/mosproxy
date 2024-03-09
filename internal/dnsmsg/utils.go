@@ -7,32 +7,9 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 )
 
-type noCopy struct{}
-
-func (*noCopy) Lock()   {}
-func (*noCopy) Unlock() {}
-
-func nameLen(b *pool.Buffer) int { // let the pack/unpack fail
-	l := b.Len()
-	switch {
-	case l <= 1: // 0: invalid, return minimum, 1: assuming is root
-		return 1
-	case l > 255: // invalid
-		return 255
-	default:
-		return l + 1
-	}
-}
-
-func copyBuf(b []byte) *pool.Buffer {
+func copyBuf(b []byte) pool.Buffer {
 	c := pool.GetBuf(len(b))
-	copy(c.B(), b)
-	return c
-}
-
-func copyBufP(b *pool.Buffer) *pool.Buffer {
-	c := pool.GetBuf(b.Len())
-	copy(c.B(), b.B())
+	copy(c, b)
 	return c
 }
 
@@ -109,10 +86,37 @@ func unpackUint32Msg(msg []byte, off int) (uint32, int, error) {
 	return binary.BigEndian.Uint32(buf), off + 4, nil
 }
 
-func unpackBytesMsg(msg []byte, off int, l int) (*pool.Buffer, int, error) {
+func unpackBytesMsgToBuffer(msg []byte, off int, l int) (pool.Buffer, int, error) {
 	buf := msg[off:]
 	if len(buf) < l {
 		return nil, 0, ErrSmallBuffer
 	}
 	return copyBuf(buf[:l]), off + l, nil
 }
+
+func unpackBytesMsg(msg []byte, off int, dst []byte) (int, error) {
+	buf := msg[off:]
+	if len(buf) < len(dst) {
+		return 0, ErrSmallBuffer
+	}
+	copy(dst, buf)
+	return off + len(dst), nil
+}
+
+func asciiToLower(s []byte) {
+	for i, c := range s {
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+			s[i] = c
+		}
+	}
+}
+
+func isPrintableLabelChar(b uint8) bool {
+	return ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || ('0' <= b && b <= '9') || b == '-'
+}
+
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}

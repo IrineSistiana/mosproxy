@@ -12,7 +12,7 @@ import (
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -25,7 +25,7 @@ var _ Transport = (*DoHTransport)(nil)
 // DoHTransport is a DNS-over-HTTPS (RFC 8484) upstream using GET method.
 type DoHTransport struct {
 	rt     http.RoundTripper
-	logger *zap.Logger
+	logger *zerolog.Logger
 	closer io.Closer
 
 	urlTemplate *urlpkg.URL
@@ -36,11 +36,11 @@ type DoHTransportOpts struct {
 	EndPointUrl  string
 	RoundTripper http.RoundTripper
 	Closer       io.Closer
-	Logger       *zap.Logger
+	Logger       *zerolog.Logger
 }
 
-func NewDoHTransport(opt DoHTransportOpts) (*DoHTransport, error) {
-	req, err := http.NewRequest(http.MethodGet, opt.EndPointUrl, nil)
+func NewDoHTransport(opts DoHTransportOpts) (*DoHTransport, error) {
+	req, err := http.NewRequest(http.MethodGet, opts.EndPointUrl, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse http request, %w", err)
 	}
@@ -49,12 +49,12 @@ func NewDoHTransport(opt DoHTransportOpts) (*DoHTransport, error) {
 	req.Header["User-Agent"] = nil // Don't let go http send a default user agent header.
 
 	t := &DoHTransport{
-		rt:          opt.RoundTripper,
-		closer:      opt.Closer,
+		rt:          opts.RoundTripper,
+		closer:      opts.Closer,
+		logger:      nonNilLogger(opts.Logger),
 		urlTemplate: req.URL,
 		reqTemplate: req,
 	}
-	setNonNilLogger(&t.logger, opt.Logger)
 	return t, nil
 }
 
@@ -78,7 +78,7 @@ func (u *DoHTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.M
 		return nil, ErrPayloadOverFlow
 	}
 	bp := copyMsg(q)
-	bs := bp.B()
+	bs := bp
 	// In order to maximize HTTP cache friendliness, DoH clients using media
 	// formats that include the ID field from the DNS message header, such
 	// as "application/dns-message", SHOULD use a DNS ID of 0 in every DNS
@@ -109,7 +109,7 @@ func (u *DoHTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.M
 		defer cancel()
 		r, err := u.exchange(ctx, bytesToStringUnsafe(rawQuery))
 		if err != nil {
-			u.logger.Check(zap.WarnLevel, "exchange failed").Write(zap.Error(err))
+			u.logger.Warn().Err(err).Msg("query failed")
 		}
 		resChan <- res{r: r, err: err}
 	})
@@ -137,7 +137,7 @@ func (u *DoHTransport) exchange(ctx context.Context, rawQuery string) (*dnsmsg.M
 		return nil, fmt.Errorf("http request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	// check status code
 	if resp.StatusCode != http.StatusOK {
 		body1k, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))

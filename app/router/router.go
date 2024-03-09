@@ -21,8 +21,8 @@ import (
 	"github.com/mitchellh/mapstructure"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -44,13 +44,13 @@ func newRouterCmd() *cobra.Command {
 			logger := mlog.L()
 			b, err := os.ReadFile(cfgPath)
 			if err != nil {
-				logger.Fatal("failed to read config file", zap.Error(err))
+				logger.Fatal().Err(err).Msg("failed to read config file")
 			}
-			cfg := new(Config)
 
+			cfg := new(Config)
 			m := make(map[string]any)
 			if err := yaml.Unmarshal(b, m); err != nil {
-				logger.Fatal("failed to decode yaml config", zap.Error(err))
+				logger.Fatal().Err(err).Msg("failed to decode yaml config")
 			}
 			decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
 				ErrorUnused: true,
@@ -58,13 +58,12 @@ func newRouterCmd() *cobra.Command {
 				Result:      cfg,
 			})
 			if err != nil {
-				logger.Fatal("failed to init yaml decoder", zap.Error(err))
+				logger.Fatal().Err(err).Msg("failed to init yaml decoder")
 			}
 			if err := decoder.Decode(m); err != nil {
-				logger.Fatal("failed to decode yaml struct", zap.Error(err))
+				logger.Fatal().Err(err).Msg("failed to decode yaml struct")
 			}
-
-			logger.Info("config file loaded", zap.String("file", cfgPath))
+			logger.Info().Str("file", cfgPath).Msg("config file loaded")
 			run(cmd.Context(), cfg)
 		},
 	}
@@ -93,7 +92,7 @@ type router struct {
 	// not nil
 	ctx        context.Context
 	cancel     context.CancelCauseFunc
-	logger     *zap.Logger
+	logger     *zerolog.Logger
 	metricsReg *prometheus.Registry
 
 	cache      *cache // not nil, noop if no backend is configured
@@ -115,7 +114,7 @@ func run(ctx context.Context, cfg *Config) {
 	r := &router{
 		ctx:        routerCtx,
 		cancel:     cancel,
-		logger:     mlog.L(),
+		logger:     logger,
 		metricsReg: newMetricsReg(),
 		upstreams:  make(map[string]*upstreamWrapper),
 		domainSets: make(map[string]*domainmatcher.MixMatcher),
@@ -128,9 +127,9 @@ func run(ctx context.Context, cfg *Config) {
 	if addr := cfg.Metrics.Addr; len(addr) > 0 {
 		l, err := net.Listen("tcp", addr)
 		if err != nil {
-			logger.Fatal("failed to start metrics endpoint server", zap.Error(err))
+			logger.Fatal().Err(err).Msg("failed to start prometheus metrics endpoint server")
 		}
-		logger.Info("metrics endpoint server started", zap.Stringer("addr", l.Addr()))
+		logger.Info().Stringer("addr", l.Addr()).Msg("metrics endpoint server started")
 		go func() {
 			err := http.Serve(l, promhttp.HandlerFor(r.metricsReg, promhttp.HandlerOpts{}))
 			r.fatal("metrics endpoint exited", err)
@@ -141,7 +140,7 @@ func run(ctx context.Context, cfg *Config) {
 	for i, upstreamCfg := range cfg.Upstreams {
 		err := r.initUpstream(&upstreamCfg)
 		if err != nil {
-			logger.Fatal("failed to init upstream", zap.Int("idx", i), zap.Error(err))
+			logger.Fatal().Int("index", i).Err(err).Msg("failed to init upstream")
 		}
 	}
 
@@ -149,7 +148,7 @@ func run(ctx context.Context, cfg *Config) {
 	for i, domainSet := range cfg.DomainSets {
 		err := r.loadDomainSet(&domainSet)
 		if err != nil {
-			logger.Fatal("failed to init domain set", zap.Int("idx", i), zap.Error(err))
+			logger.Fatal().Int("index", i).Err(err).Msg("failed to init domain set")
 		}
 	}
 
@@ -157,7 +156,7 @@ func run(ctx context.Context, cfg *Config) {
 	for i, ruleCfg := range cfg.Rules {
 		ru, err := r.loadRule(&ruleCfg)
 		if err != nil {
-			logger.Fatal("invalid rule", zap.Int("idx", i), zap.Error(err))
+			logger.Fatal().Int("index", i).Err(err).Msg("failed to load rule")
 		}
 		r.rules = append(r.rules, ru)
 	}
@@ -165,7 +164,7 @@ func run(ctx context.Context, cfg *Config) {
 	// init cache
 	cache, err := r.initCache(&cfg.Cache)
 	if err != nil {
-		logger.Fatal("failed to init cache", zap.Error(err))
+		logger.Fatal().Err(err).Msg("failed to init cache")
 	}
 	r.cache = cache
 
@@ -173,27 +172,27 @@ func run(ctx context.Context, cfg *Config) {
 	for i, serverCfg := range cfg.Servers {
 		err := r.startServer(&serverCfg)
 		if err != nil {
-			logger.Fatal("failed to start server", zap.Int("idx", i), zap.Error(err))
+			logger.Fatal().Int("index", i).Err(err).Msg("failed to start server")
 		}
 	}
 
 	runtime.GC()
 	debug.FreeOSMemory()
-	logger.Info("router is up and running")
+	logger.Info().Msg("router is up and running")
 
 	// TODO: Graceful shutdown?
 	exitSigChan := make(chan os.Signal, 1)
 	signal.Notify(exitSigChan, append([]os.Signal{os.Interrupt}, exitSig...)...)
 	select {
 	case sig := <-exitSigChan:
-		logger.Info("exit signal received", zap.Stringer("sig", sig))
+		logger.Info().Stringer("signal", sig).Msg("router exiting on signal")
 		os.Exit(0)
 	case <-ctx.Done():
 		err := context.Cause(ctx)
-		logger.Info("router context closed", zap.NamedError("cause", err))
+		logger.Info().AnErr("cause", err).Msg("router exiting, context closed")
 		os.Exit(0)
 	case fatalErr := <-r.fatalErr:
-		logger.Fatal(fatalErr.msg, zap.Error(fatalErr.err))
+		logger.Fatal().Err(fatalErr.err).Msg(fatalErr.msg)
 	}
 }
 
@@ -241,7 +240,7 @@ postMiddlewares:
 			return
 		}
 		if rc.Response.Msg == nil {
-			r.logger.Error("misbehaved post middleware, nil response", zap.Int("middleware_idx", i))
+			r.logger.Error().Int("index", i).Msg("misbehaved post middleware, nil response")
 			break
 		}
 	}
@@ -254,8 +253,8 @@ func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
 	resp.Response = true
 	resp.RecursionDesired = m.RecursionDesired
 	resp.RCode = rcode
-	for iter := m.Questions.Iter(); iter.Next(); {
-		resp.Questions.Add(iter.Value().Copy())
+	for _, q := range m.Questions {
+		resp.Questions = append(resp.Questions, q.Copy())
 	}
 	return resp
 }
@@ -265,25 +264,24 @@ func (r *router) handleReqMsg(ctx context.Context, m *dnsmsg.Msg, rc *RequestCon
 	notImpl := hdr.Response ||
 		!hdr.RecursionDesired ||
 		hdr.OpCode != dnsmsg.OpCode(0) ||
-		m.Questions.Len() != 1
+		len(m.Questions) != 1
 
 	if notImpl {
-		r.logger.Check(zap.WarnLevel, "suspicious query msg").Write(
-			zap.Stringer("remote", rc.RemoteAddr),
-			zap.Stringer("local", rc.LocalAddr),
-		)
+		e := r.logger.Debug()
+		if e != nil {
+			e.Stringer("remote", rc.RemoteAddr).Stringer("local", rc.LocalAddr).Msg("not impl query")
+		}
 		rc.Response.Msg = makeEmptyRespM(m, dnsmsg.RCodeNotImplemented)
 	} else {
-		q := m.Questions.Head().Copy()
-		asciiToLower(q.Name.B())
+		q := m.Questions[0].Copy()
 		defer dnsmsg.ReleaseQuestion(q)
 
+		dnsmsg.ToLowerName(q.Name)
 		r.handleReq(ctx, q, rc)
 
 		clientSupportEDNS0 := false
-		for iter := m.Additionals.Iter(); iter.Next(); {
-			r := iter.Value()
-			if r.Type == dnsmsg.TypeOPT {
+		for _, rr := range m.Additionals {
+			if rr.Hdr().Type == dnsmsg.TypeOPT {
 				clientSupportEDNS0 = true
 				break
 			}
@@ -293,11 +291,14 @@ func (r *router) handleReqMsg(ctx context.Context, m *dnsmsg.Msg, rc *RequestCon
 			addOrReplaceOpt(rc.Response.Msg, udpSize)
 		} else {
 			// remove opt from resp
-			removeOpt(rc.Response.Msg)
+			rr := dnsmsg.PopEDNS0(rc.Response.Msg)
+			if rr != nil {
+				dnsmsg.ReleaseResource(rr)
+			}
 		}
 
 		if r.opt.logQueries {
-			r.logger.Check(zap.InfoLevel, "query summary").Write(inlineQ(q), zap.Inline(rc)) // TODO: Better struct. Do not use inline.
+			r.logger.Log().Object("query", (*qLogObj)(q)).Object("meta", rc).Msg("query log")
 		}
 	}
 
@@ -314,7 +315,7 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 	var matchedRule *rule
 	for i, rule := range r.rules {
 		if rule.matcher != nil {
-			matched := rule.matcher.Match(q.Name.B())
+			matched := rule.matcher.Match(q.Name)
 			if rule.reverse {
 				matched = !matched
 			}
@@ -343,14 +344,13 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 	upstream := matchedRule.upstream
 
 	// lookup cache
-	resp, storedTime, expireTime, err := r.cache.Get(ctx, q, rc)
-	if err != nil {
-		r.logger.Error("cache error", zap.Error(err)) // TODO: Better message.
+	resp, storedTime, expireTime := r.cache.Get(ctx, q, rc)
+	if ctxDone(ctx) {
 		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))
 		return
 	}
 	if r.cache.NeedPrefetch(storedTime, expireTime) {
-		r.cache.AsyncSingleFlightPrefetch(q, rc.RemoteAddr, rc.LocalAddr, upstream)
+		r.cache.AsyncSingleFlightPrefetch(q, rc.RemoteAddr, upstream)
 	}
 	if resp != nil { // cache hit
 		rc.Response.Msg = resp
@@ -358,9 +358,12 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 		return
 	}
 
-	resp, err = r.forward(ctx, upstream, q, rc.RemoteAddr, rc.LocalAddr)
+	resp, err := r.forward(ctx, upstream, q, rc.RemoteAddr)
 	if err != nil {
-		r.logger.Error("failed to forward req", inlineQ(q), zap.String("upstream", upstream.tag), zap.Error(err))
+		r.logger.Warn().
+			Str("upstream", upstream.tag).
+			Err(err).
+			Msg("failed to forward query")
 		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))
 		return
 	}
@@ -370,11 +373,13 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 	r.cache.Store(q, rc.RemoteAddr.Addr(), resp)
 }
 
+// Forward query to upstream and return its response.
+// It will remove the EDNS0 Options from response.
 func (r *router) forward(
 	ctx context.Context,
 	upstream *upstreamWrapper,
 	q *dnsmsg.Question,
-	remoteAddr, localAddr netip.AddrPort,
+	remoteAddr netip.AddrPort,
 ) (*dnsmsg.Msg, error) {
 	reqWire, err := r.packReq(q, remoteAddr)
 	if err != nil {
@@ -382,36 +387,62 @@ func (r *router) forward(
 	}
 	defer pool.ReleaseBuf(reqWire)
 
-	resp, err := upstream.Exchange(ctx, reqWire.B(), remoteAddr, localAddr)
+	resp, err := upstream.Exchange(ctx, reqWire)
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange, %w", err)
 	}
+	dnsmsg.RemoveEDNS0(resp)
 	return resp, nil
 }
 
 func makeEmptyResp(q *dnsmsg.Question, rc *RequestContext, rcode uint16) {
 	resp := dnsmsg.NewMsg()
 	resp.Header.RCode = dnsmsg.RCode(rcode)
-	resp.Questions.Add(q.Copy())
+	resp.Questions = append(resp.Questions, q.Copy())
 	rc.Response.Msg = resp
 }
 
-func (r *router) packReq(q *dnsmsg.Question, remoteAddr netip.AddrPort) (*pool.Buffer, error) {
+func (r *router) packReq(q *dnsmsg.Question, remoteAddr netip.AddrPort) (pool.Buffer, error) {
 	m := dnsmsg.NewMsg()
+	defer dnsmsg.ReleaseMsg(m)
+
 	m.Header.RecursionDesired = true
-	m.Questions.Add(q.Copy())
-	opt := edns0Opt(udpSize)
-	m.Additionals.Add(opt)
+	m.Questions = append(m.Questions, q.Copy())
+
+	opt := newEDNS0(udpSize)
 	if r.opt.ecsEnabled && remoteAddr.IsValid() {
 		opt.Data = makeEdns0ClientSubnetReqOpt(remoteAddr.Addr())
 	}
-	defer dnsmsg.ReleaseMsg(m)
+	m.Additionals = append(m.Additionals, opt)
 
 	b := pool.GetBuf(m.Len())
-	_, err := m.Pack(b.B(), false, 0)
+	_, err := m.Pack(b, false, 0)
 	if err != nil {
 		pool.ReleaseBuf(b)
 		return nil, err
 	}
 	return b, nil
+}
+
+func (r *router) subLogger(modName string) *zerolog.Logger {
+	l := r.logger.With().Str("module", modName).Logger()
+	return &l
+}
+
+func (r *router) subLoggerForServer(modName string, tag string) *zerolog.Logger {
+	ctx := r.logger.With().Str("module", modName)
+	if len(tag) > 0 {
+		ctx = ctx.Str("server_tag", tag)
+	}
+	l := ctx.Logger()
+	return &l
+}
+
+func (r *router) subLoggerForUpstream(tag string) *zerolog.Logger {
+	ctx := r.logger.With().Str("module", "upstream")
+	if len(tag) > 0 {
+		ctx = ctx.Str("upstream_tag", tag)
+	}
+	l := ctx.Logger()
+	return &l
 }

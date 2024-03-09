@@ -1,13 +1,20 @@
 package pool
 
-import "bufio"
+import (
+	"bufio"
+	"io"
+	"sync"
+)
 
-var BufWriterPool1K = NewSyncPool[bufio.Writer](SyncPoolOpts[bufio.Writer]{
-	New:       func() *bufio.Writer { return bufio.NewWriterSize(nil, 1024) },
-	OnRelease: func(v *bufio.Writer) { v.Reset(nil) },
-})
+var br1kPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 1024) }}
 
-var BufReaderPool1K = NewSyncPool[bufio.Reader](SyncPoolOpts[bufio.Reader]{
-	New:       func() *bufio.Reader { return bufio.NewReaderSize(nil, 1024) },
-	OnRelease: func(v *bufio.Reader) { v.Reset(nil) },
-})
+func NewBR1K(r io.Reader) *bufio.Reader {
+	br := br1kPool.Get().(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+func ReleaseBR1K(br *bufio.Reader) {
+	br.Reset(nil)
+	br1kPool.Put(br)
+}

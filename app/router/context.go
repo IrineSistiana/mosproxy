@@ -8,7 +8,7 @@ import (
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"go.uber.org/zap/zapcore"
+	"github.com/rs/zerolog"
 )
 
 type Response struct {
@@ -48,12 +48,12 @@ func releaseRequestContext(rc *RequestContext) {
 	requestContextPool.Put(rc)
 }
 
-func (rc *RequestContext) MarshalLogObject(e zapcore.ObjectEncoder) error {
-	printAddr := func(e zapcore.ObjectEncoder, addr netip.AddrPort, key string) {
-		buf := pool.GetBuf(39 + 2 + 6) // ipv6: maximum 39 bytes string + 2 for "[]" + 6 ":xxxxx" port.
+func (rc *RequestContext) MarshalZerologObject(e *zerolog.Event) {
+	printAddr := func(e *zerolog.Event, addr netip.AddrPort, key string) {
+		buf := pool.GetBuf(64) // ipv6: maximum 39 bytes string + 2 for "[]" + 6 ":xxxxx" port.
 		defer pool.ReleaseBuf(buf)
-		b := addr.AppendTo(buf.B()[:0])
-		e.AddByteString(key, b)
+		b := addr.AppendTo(buf[:0])
+		e.Bytes(key, b)
 	}
 	if rc.RemoteAddr.IsValid() {
 		printAddr(e, rc.RemoteAddr, "remote")
@@ -62,22 +62,21 @@ func (rc *RequestContext) MarshalLogObject(e zapcore.ObjectEncoder) error {
 		printAddr(e, rc.LocalAddr, "local")
 	}
 
-	e.AddInt("rule", rc.Response.RuleIdx)
+	e.Int("rule", rc.Response.RuleIdx)
 
 	resp := rc.Response.Msg
 	if rc.Response.Msg != nil {
-		e.AddUint16("rcode", uint16(resp.Header.RCode))
+		e.Uint16("rcode", uint16(resp.Header.RCode))
 	}
 	if rc.Response.Cached {
-		e.AddBool("cached", true)
+		e.Bool("cached", true)
 	}
-	
+
 	if len(rc.Response.IpMark) > 0 {
-		e.AddString("ip_mark", rc.Response.IpMark)
+		e.Str("ip_mark", rc.Response.IpMark)
 	}
 
 	if !rc.start.IsZero() {
-		e.AddDuration("elapsed", time.Since(rc.start))
+		e.Dur("elapsed", time.Since(rc.start))
 	}
-	return nil
 }

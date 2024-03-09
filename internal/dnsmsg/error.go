@@ -26,6 +26,10 @@ var (
 	errNonCanonicalName   = errors.New("name is not in canonical format (it must end with a .)")
 	errStringTooLong      = errors.New("character string exceeds maximum length (255)")
 	errCompressedSRV      = errors.New("compressed name in SRV resource data")
+
+	errInvalidResourceBodyLen = errors.New("invalid resource body length")
+	errBuilderFinished        = errors.New("builder finished")
+	errInvalidLabelLen        = errors.New("invalid label length")
 )
 
 type sectionErr struct {

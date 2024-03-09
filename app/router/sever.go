@@ -1,13 +1,7 @@
 package router
 
 import (
-	"errors"
 	"fmt"
-)
-
-var (
-	errListenerClosed   = errors.New("listener closed")
-	errClientConnClosed = errors.New("client connection closed")
 )
 
 func (r *router) startServer(cfg *ServerConfig) error {

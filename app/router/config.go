@@ -6,7 +6,6 @@ import (
 	"os"
 
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
-	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
 
@@ -26,16 +25,16 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Protocol        string       `yaml:"protocol"`
-	Listen          string       `yaml:"listen"`
-	IdleTimeout     int          `yaml:"idle_timeout"`
-	ProtocolProxyV2 bool         `yaml:"protocol_proxy_v2"`
-	Udp             UdpConfig    `yaml:"udp"`
-	Tcp             TcpConfig    `yaml:"tcp"`
-	Tls             TlsConfig    `yaml:"tls"`
-	Http            HttpConfig   `yaml:"http"`
-	Quic            QuicConfig   `yaml:"quic"`
-	Socket          SocketConfig `yaml:"socket"`
+	Tag         string       `yaml:"tag"`
+	Protocol    string       `yaml:"protocol"`
+	Listen      string       `yaml:"listen"`
+	IdleTimeout int          `yaml:"idle_timeout"`
+	Udp         UdpConfig    `yaml:"udp"`
+	Tcp         TcpConfig    `yaml:"tcp"`
+	Tls         TlsConfig    `yaml:"tls"`
+	Http        HttpConfig   `yaml:"http"`
+	Quic        QuicConfig   `yaml:"quic"`
+	Socket      SocketConfig `yaml:"socket"`
 }
 
 type UdpConfig struct {
@@ -43,8 +42,7 @@ type UdpConfig struct {
 }
 
 type TcpConfig struct {
-	MaxConcurrentRequests int32 `yaml:"max_concurrent_requests"`
-	EngineNum             int   `yaml:"engine_num"`
+	MaxConcurrentQueries int32 `yaml:"max_concurrent_queries"`
 }
 
 type TlsConfig struct {
@@ -53,14 +51,15 @@ type TlsConfig struct {
 	CA                 string `yaml:"ca"`
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 	VerifyClientCert   bool   `yaml:"verify_client_cert"`
-	TestUseTempCert    bool   `yaml:"test_use_temp_cert,omitempty"`
+
+	DebugUseTempCert bool `yaml:"debug_use_temp_cert,omitempty"`
 }
 
 type HttpConfig struct {
 	Path             string `yaml:"path"`
 	ClientAddrHeader string `yaml:"client_addr_header"`
 
-	TestMaxStreams uint32 `yaml:"test_max_streams,omitempty"`
+	DebugMaxStreams uint32 `yaml:"debug_max_streams,omitempty"`
 }
 
 type QuicConfig struct {
@@ -84,8 +83,6 @@ type UpstreamConfig struct {
 	DialAddr string       `yaml:"dial_addr"`
 	Tls      TlsConfig    `yaml:"tls"`
 	Socket   SocketConfig `yaml:"socket"`
-
-	ProtocolProxyV2 bool `yaml:"protocol_proxy_v2"`
 }
 
 type DomainSetConfig struct {
@@ -103,7 +100,6 @@ type RuleConfig struct {
 type AddonsConfig struct{}
 
 type LogConfig struct {
-	// TODO: More fine-grained log entry control. e.g can disable/enable each log field.
 	Queries bool `yaml:"queries"`
 }
 
@@ -112,7 +108,6 @@ type CacheConfig struct {
 	Redis      string `yaml:"redis"`
 	MaximumTTL int    `yaml:"maximum_ttl"`
 	IpMarker   string `yaml:"ip_marker"`
-	Prefetch   bool   `yaml:"prefetch"`
 }
 
 type ECSConfig struct {
@@ -138,7 +133,7 @@ func genConfigTemplate(o string) {
 
 	err := encoder.Encode(cfg)
 	if err != nil {
-		logger.Fatal("failed to encode config", zap.Error(err))
+		logger.Fatal().Err(err).Msg("failed to encode config")
 	}
 	encoder.Close()
 
@@ -147,7 +142,7 @@ func genConfigTemplate(o string) {
 	} else {
 		err := os.WriteFile(o, b.Bytes(), 0644)
 		if err != nil {
-			logger.Fatal("failed to write config file", zap.Error(err))
+			logger.Fatal().Err(err).Msg("failed to write config file")
 		}
 	}
 }

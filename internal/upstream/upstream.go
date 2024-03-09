@@ -8,20 +8,18 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
-	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"github.com/IrineSistiana/mosproxy/internal/pp"
+	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/upstream/transport"
 	"github.com/IrineSistiana/mosproxy/internal/utils"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 	"golang.org/x/net/http2"
 )
 
@@ -72,15 +70,11 @@ type Opt struct {
 	TLSConfig *tls.Config
 
 	// Logger specifies the logger that the upstream will use.
-	Logger *zap.Logger
+	Logger *zerolog.Logger
 
 	// Set the Control field in net.ListenConfig / net.Dialer when creating
 	// upstream connections.
 	Control func(network, address string, c syscall.RawConn) error
-
-	// Enable Protocol proxy v2. Only support udp.
-	// NewUpstream will return a *UDPWithPP2.
-	ProtocolProxyV2 bool
 }
 
 // NewUpstream creates a upstream.
@@ -93,7 +87,7 @@ type Opt struct {
 func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 	logger := opt.Logger
 	if logger == nil {
-		logger = zap.NewNop()
+		logger = mlog.Nop()
 	}
 
 	// parse protocol and server addr
@@ -144,21 +138,17 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			Logger:             logger,
 		})
 
-		if opt.ProtocolProxyV2 {
-			return &UDPWithPP2{t: ut}, nil
-		} else {
-			dialTcp := func(ctx context.Context) (net.Conn, error) {
-				return dialer.DialContext(ctx, "tcp", dialAddr)
-			}
-			return &udpWithFallback{
-				u: ut,
-				t: transport.NewReuseConnTransport(transport.ReuseConnOpts{
-					DialContext: dialTcp,
-					DialTimeout: opt.DialTimeout,
-					Logger:      logger,
-				}),
-			}, nil
+		dialTcp := func(ctx context.Context) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp", dialAddr)
 		}
+		return &udpWithFallback{
+			u: ut,
+			t: transport.NewReuseConnTransport(transport.ReuseConnOpts{
+				DialContext: dialTcp,
+				DialTimeout: opt.DialTimeout,
+				Logger:      logger,
+			}),
+		}, nil
 	case "tcp":
 		idleTimeout := opt.IdleTimeout
 		if idleTimeout <= 0 {
@@ -326,11 +316,6 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		quicConfig.MaxIncomingStreams = -1
 		quicConfig.MaxIncomingUniStreams = -1
 
-		srk, _, err := utils.InitQUICSrkFromIfaceMac()
-		if err != nil {
-			logger.Warn("failed to init quic stateless reset key, it will be disabled", zap.Error(err))
-		}
-
 		lc := net.ListenConfig{Control: opt.Control}
 		uc, err := lc.ListenPacket(context.Background(), "udp", "")
 		if err != nil {
@@ -339,7 +324,10 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 
 		t := &quic.Transport{
 			Conn:              uc,
-			StatelessResetKey: (*quic.StatelessResetKey)(srk),
+		}
+		srk, _, err := utils.InitQUICSrkFromIfaceMac()
+		if err != nil {
+			t.StatelessResetKey = (*quic.StatelessResetKey)(&srk)
 		}
 		closeIfFuncErr(t)
 
@@ -391,45 +379,6 @@ func (u *udpWithFallback) ExchangeContext(ctx context.Context, q []byte) (*dnsms
 		return u.t.ExchangeContext(ctx, q)
 	}
 	return r, nil
-}
-
-type UDPWithPP2 struct {
-	t *transport.PipelineTransport
-}
-
-func (u *UDPWithPP2) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.Msg, error) {
-	return u.t.ExchangeContext(ctx, q)
-}
-
-func (u *UDPWithPP2) ExchangeContextPP2(ctx context.Context, q []byte, remoteAddr, localAddr netip.AddrPort) (*dnsmsg.Msg, error) {
-	r := remoteAddr.Addr().Unmap()
-	l := localAddr.Addr().Unmap()
-
-	hdr := pp.HeaderV2{}
-	switch {
-	case !r.IsValid() || !l.IsValid():
-		hdr.Command = pp.LOCAL
-	case r.Is6() || l.Is6():
-		hdr.Command = pp.PROXY
-		hdr.TransportProtocol = pp.UDP6
-		hdr.SourceAddr = remoteAddr
-		hdr.DestinationAddr = localAddr
-	default:
-		hdr.Command = pp.PROXY
-		hdr.TransportProtocol = pp.UDP4
-		hdr.SourceAddr = remoteAddr
-		hdr.DestinationAddr = localAddr
-	}
-
-	hdrB := pool.GetBuf(hdr.Size())
-	defer pool.ReleaseBuf(hdrB)
-	hdr.Put(hdrB.B())
-	return u.t.ExchangeContextOff(ctx, hdrB.B(), q)
-}
-
-func (u *UDPWithPP2) Close() error {
-	u.t.Close()
-	return nil
 }
 
 func (u *udpWithFallback) Close() error {

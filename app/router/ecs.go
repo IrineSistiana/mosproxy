@@ -8,7 +8,7 @@ import (
 )
 
 // For convenient, if addr is invalid, it returns nil.
-func makeEdns0ClientSubnetReqOpt(addr netip.Addr) *pool.Buffer {
+func makeEdns0ClientSubnetReqOpt(addr netip.Addr) pool.Buffer {
 	const (
 		// Recommended by rfc7871 11.1
 		mask4 = 24
@@ -30,7 +30,7 @@ func makeEdns0ClientSubnetReqOpt(addr netip.Addr) *pool.Buffer {
 	}
 
 	var (
-		b      *pool.Buffer
+		b      pool.Buffer
 		length uint16
 		family uint16
 		mask   uint8
@@ -44,7 +44,7 @@ func makeEdns0ClientSubnetReqOpt(addr netip.Addr) *pool.Buffer {
 		addr = maskAddr(addr, mask)
 		ip := addr.As4()
 		b = pool.GetBuf(4 + length4)
-		copy(b.B()[8:], ip[:])
+		copy(b[8:], ip[:])
 	case addr.Is6():
 		length = length6
 		family = family6
@@ -52,12 +52,12 @@ func makeEdns0ClientSubnetReqOpt(addr netip.Addr) *pool.Buffer {
 		addr = maskAddr(addr, mask)
 		ip := addr.As16()
 		b = pool.GetBuf(4 + length6)
-		copy(b.B()[8:], ip[:])
+		copy(b[8:], ip[:])
 	default:
 		return nil
 	}
 
-	bb := b.B()
+	bb := b
 
 	// https://tools.ietf.org/html/rfc7871
 	// OPTION-CODE, 2 octets, for ECS is 8 (0x00 0x08).

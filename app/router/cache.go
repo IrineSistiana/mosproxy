@@ -19,7 +19,7 @@ import (
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/klauspost/compress/s2"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -30,7 +30,7 @@ const (
 func (r *router) initCache(cfg *CacheConfig) (*cache, error) {
 	c := new(cache)
 	c.r = r
-	c.logger = r.logger.Named("cache")
+	c.logger = r.subLogger("cache")
 	c.maximumTtl = time.Duration(cfg.MaximumTTL) * time.Second
 	if c.maximumTtl <= 0 {
 		c.maximumTtl = defaultMaxCacheTtl
@@ -38,7 +38,7 @@ func (r *router) initCache(cfg *CacheConfig) (*cache, error) {
 
 	// init memory cache if configured
 	if cfg.MemSize > 0 {
-		memCache, err := newMemoryCache(cfg.MemSize, c.logger.Named("memory"))
+		memCache, err := newMemoryCache(cfg.MemSize, r.subLogger("mem_cache"))
 		if err != nil {
 			return nil, fmt.Errorf("failed to init memory cache backend, %w", err)
 		}
@@ -50,7 +50,7 @@ func (r *router) initCache(cfg *CacheConfig) (*cache, error) {
 
 	// init redis if configured
 	if len(cfg.Redis) > 0 {
-		rc, err := newRedisCache(cfg.Redis, c.logger.Named("redis"))
+		rc, err := newRedisCache(cfg.Redis, r.subLogger("redis_cache"))
 		if err != nil {
 			return nil, fmt.Errorf("failed to init redis cache, %w", err)
 		}
@@ -65,20 +65,15 @@ func (r *router) initCache(cfg *CacheConfig) (*cache, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to load ip marker, %w", err)
 		}
-		c.logger.Info(
-			"ip marker file loaded",
-			zap.String("file", cfg.IpMarker),
-			zap.Int("length", marker.IpLen()),
-			zap.Int("marks", marker.MarkLen()),
-		)
+		c.logger.Info().
+			Str("file", cfg.IpMarker).
+			Int("len", marker.IpLen()).
+			Int("marks", marker.MarkLen()).
+			Msg("ip marker file loaded")
 		c.ipMarker = marker
 	}
 
-	c.prefetch = cfg.Prefetch
-	if c.prefetch {
-		c.prefetching = make(map[uint64]struct{})
-	}
-
+	c.prefetching = make(map[uint64]struct{})
 	c.prefetchTotal = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "cache_prefetch_total",
 		Help: "The total number of queries that prefetched",
@@ -92,20 +87,20 @@ func (r *router) initCache(cfg *CacheConfig) (*cache, error) {
 }
 
 type cache struct {
-	r          *router
-	logger     *zap.Logger
+	r          *router // TODO: Avoid cross ref.
+	logger     *zerolog.Logger
 	maximumTtl time.Duration // Always valid. Has default value.
 	ipMarker   *ipMarker     // Maybe nil.
 	memory     *memoryCache  // Maybe nil
 	redis      *redisCache   // Maybe nil
 
-	prefetch    bool
-	prefetchMu  sync.Mutex
-	prefetching map[uint64]struct{} // nil, if prefetch == false
-
+	prefetchMu    sync.Mutex
+	prefetching   map[uint64]struct{}
 	prefetchTotal prometheus.Counter
 }
 
+// Store resp into cache.
+// Remainder: resp must not contain EDNS0 record.
 func (c *cache) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg.Msg) {
 	if c.memory == nil && c.redis == nil {
 		return
@@ -162,7 +157,7 @@ func (c *cache) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg.Ms
 
 	v, err := packCacheMsg(resp)
 	if err != nil {
-		c.logger.Error(logPackRespErr, zap.Error(err))
+		c.logger.Error().Err(err).Msg(logPackRespErr)
 		return
 	}
 	defer pool.ReleaseBuf(v)
@@ -173,18 +168,26 @@ func (c *cache) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg.Ms
 	storedTime := now
 	expireTime := now.Add(ttl)
 
+	c.logger.Debug().
+		Object("query", (*qLogObj)(q)).
+		Str("mark", mark).
+		Uint16("rcode", uint16(resp.RCode)).
+		Int("ttl", int(ttl.Seconds())).
+		Int("size", len(v)).
+		Msg("store resp")
+
 	// store in memory
 	if c.memory != nil {
-		c.memory.Store(q, mark, storedTime, expireTime, v.B())
+		c.memory.Store(q, mark, storedTime, expireTime, v)
 	}
 
 	// store in redis
 	if c.redis != nil {
-		c.redis.AsyncStore(q, mark, storedTime, expireTime, v.B())
+		c.redis.AsyncStore(q, mark, storedTime, expireTime, v)
 	}
 }
 
-func (c *cache) AsyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr, localAddr netip.AddrPort, u *upstreamWrapper) {
+func (c *cache) AsyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr netip.AddrPort, u *upstreamWrapper) {
 	mark := c.ipMark(remoteAddr.Addr())
 	prefetchKey := hashReq(q, mark)
 	c.prefetchMu.Lock()
@@ -197,22 +200,19 @@ func (c *cache) AsyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr, localA
 		q := q.Copy() // q is not concurrent save. Copy it.
 		pool.Go(func() {
 			defer dnsmsg.ReleaseQuestion(q)
-			c.doPreFetch(prefetchKey, q, remoteAddr, localAddr, u)
+			c.doPreFetch(prefetchKey, q, remoteAddr, u)
 		})
 	}
 }
 
 func (c *cache) NeedPrefetch(storedTime, expireTime time.Time) bool {
-	if !c.prefetch {
-		return false
-	}
 	lifeSpan := expireTime.Sub(storedTime)
 	ttl := time.Until(expireTime)
-	// do prefetch if the ttl is small than its 12.5% life span
-	return ttl < (lifeSpan >> 3)
+	// do prefetch if the ttl is small than its 25% life span
+	return ttl < (lifeSpan >> 2)
 }
 
-func (c *cache) doPreFetch(prefetchKey uint64, q *dnsmsg.Question, remoteAddr, localAddr netip.AddrPort, u *upstreamWrapper) {
+func (c *cache) doPreFetch(prefetchKey uint64, q *dnsmsg.Question, remoteAddr netip.AddrPort, u *upstreamWrapper) {
 	defer func() {
 		c.prefetchMu.Lock()
 		delete(c.prefetching, prefetchKey)
@@ -220,13 +220,10 @@ func (c *cache) doPreFetch(prefetchKey uint64, q *dnsmsg.Question, remoteAddr, l
 	}()
 	ctx, cancel := context.WithTimeout(c.r.ctx, prefetchTimeout)
 	defer cancel()
-	resp, err := c.r.forward(ctx, u, q, remoteAddr, localAddr)
+	resp, err := c.r.forward(ctx, u, q, remoteAddr)
 	if err != nil {
-		c.logger.Check(zap.WarnLevel, "failed to prefetch").Write(
-			inlineQ(q),
-			zap.String("upstream", u.tag),
-			zap.Error(err),
-		)
+		c.logger.Warn().Object("query", (*qLogObj)(q)).Str("upstream", u.tag).Err(err).
+			Msg("failed to prefetch")
 		return
 	}
 	c.prefetchTotal.Inc()
@@ -235,10 +232,7 @@ func (c *cache) doPreFetch(prefetchKey uint64, q *dnsmsg.Question, remoteAddr, l
 
 // If cache hit, Get will return a resp (not shared). It is the caller's
 // responsibility to release the reap. TTLs of the reap are properly subtracted.
-// ip can be invalid, then mark 0 will be used.
-// The ctx is for redis cache, and the error, if not nil, will be a redis io error.
-// Invalid msg/data error will be logged instead of returning an error.
-func (c *cache) Get(ctx context.Context, q *dnsmsg.Question, rc *RequestContext) (resp *dnsmsg.Msg, storedTime, expireTime time.Time, err error) {
+func (c *cache) Get(ctx context.Context, q *dnsmsg.Question, rc *RequestContext) (resp *dnsmsg.Msg, storedTime, expireTime time.Time) {
 	ipMark := c.ipMark(rc.RemoteAddr.Addr())
 	rc.Response.IpMark = ipMark
 
@@ -254,16 +248,12 @@ func (c *cache) Get(ctx context.Context, q *dnsmsg.Question, rc *RequestContext)
 	// memory cache missed, try redis
 	if c.redis != nil {
 		var v []byte
-		storedTime, expireTime, resp, v, err = c.redis.Get(ctx, q, ipMark)
-		if err != nil { // redis io error
-			return
-		}
+		storedTime, expireTime, resp, v = c.redis.Get(ctx, q, ipMark)
 		if resp != nil { // hit
 			if c.memory != nil { // put v into memory cache
 				c.memory.Store(q, ipMark, storedTime, expireTime, v)
 			}
 			dnsutils.SubtractTTL(resp, uint32(time.Since(storedTime).Seconds()))
-			return
 		}
 	}
 	return
@@ -291,34 +281,31 @@ func (c *cache) Close() error {
 
 // Hash the request key.
 func hashReq(q *dnsmsg.Question, ipMark string) (hash uint64) {
-	h1 := z.MemHash(q.Name.B())
+	h1 := z.MemHash(q.Name)
 	h1 += uint64(q.Class) << 16
 	h1 += uint64(q.Type)
 	h2 := z.MemHashString(ipMark)
 	return h1 ^ h2
 }
 
-// Pack m into bytes. EDNS0 Opt will be ignored.
-func packCacheMsg(m *dnsmsg.Msg) (*pool.Buffer, error) {
-	noOpt := func(sec dnsmsg.MsgSection, rr *dnsmsg.Resource) bool {
-		return sec == dnsmsg.SectionAdditional && rr.Type == dnsmsg.TypeOPT
-	}
-
+// Pack m into bytes.
+func packCacheMsg(m *dnsmsg.Msg) (pool.Buffer, error) {
 	packBuf := pool.GetBuf(m.Len())
 	defer pool.ReleaseBuf(packBuf)
-	n, err := m.PackFilter(packBuf.B(), false, 0, noOpt)
+	b := packBuf
+	n, err := m.Pack(b, false, 0)
 	if err != nil {
 		return nil, err
 	}
-	msgBytes := packBuf.B()[:n]
+	b = b[:n]
 
-	compressMaxLen := s2.MaxEncodedLen(len(msgBytes))
+	compressMaxLen := s2.MaxEncodedLen(len(b))
 	if compressMaxLen < 0 {
 		return nil, s2.ErrTooLarge
 	}
 	compressBuf := pool.GetBuf(compressMaxLen)
 	defer pool.ReleaseBuf(compressBuf)
-	compressedMsgBytes := s2.Encode(compressBuf.B(), msgBytes)
+	compressedMsgBytes := s2.Encode(compressBuf, b)
 	return copyBuf(compressedMsgBytes), nil
 }
 
@@ -329,7 +316,7 @@ func unpackCacheMsg(m []byte) (*dnsmsg.Msg, error) {
 	}
 	decodeBuf := pool.GetBuf(l)
 	defer pool.ReleaseBuf(decodeBuf)
-	decoded, err := s2.Decode(decodeBuf.B(), m)
+	decoded, err := s2.Decode(decodeBuf, m)
 	if err != nil {
 		return nil, fmt.Errorf("s2 decode: %w", err)
 	}

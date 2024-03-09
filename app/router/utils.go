@@ -9,32 +9,22 @@ import (
 )
 
 func addOrReplaceOpt(m *dnsmsg.Msg, udpSize uint16) {
-	removeOpt(m)
-	m.Additionals.Add(edns0Opt(udpSize))
+	rr := dnsmsg.PopEDNS0(m)
+	if rr != nil {
+		dnsmsg.ReleaseResource(rr)
+	}
+	m.Additionals = append(m.Additionals, newEDNS0(udpSize))
 }
 
-func edns0Opt(udpSize uint16) *dnsmsg.Resource {
+func newEDNS0(udpSize uint16) *dnsmsg.RawResource {
 	if udpSize < 512 {
 		udpSize = 512
 	}
-	opt := dnsmsg.GetRR()
-	opt.Name = pool.GetBuf(1)
-	opt.Name.B()[0] = '.'
+	opt := dnsmsg.NewRaw()
+	// opt.Name is zero, which equals "."
 	opt.Class = dnsmsg.Class(udpSize)
 	opt.Type = dnsmsg.TypeOPT
 	return opt
-}
-
-// remove edns0 rr from m.
-func removeOpt(m *dnsmsg.Msg) {
-	for iter := m.Additionals.ReverseIter(); iter.Next(); {
-		r := iter.Value()
-		if r.Type == dnsmsg.TypeOPT {
-			m.Additionals.Remove(r)
-			dnsmsg.ReleaseRR(r)
-			return
-		}
-	}
 }
 
 func str2BytesUnsafe(s string) []byte {
@@ -45,18 +35,9 @@ func bytes2StrUnsafe(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
-func asciiToLower(s []byte) {
-	for i, c := range s {
-		if 'A' <= c && c <= 'Z' {
-			c += 'a' - 'A'
-			s[i] = c
-		}
-	}
-}
-
-func copyBuf(b []byte) *pool.Buffer {
+func copyBuf(b []byte) pool.Buffer {
 	c := pool.GetBuf(len(b))
-	copy(c.B(), b)
+	copy(c, b)
 	return c
 }
 

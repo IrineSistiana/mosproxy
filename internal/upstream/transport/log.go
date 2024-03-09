@@ -3,7 +3,7 @@ package transport
 import (
 	"net"
 
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 type logConn interface {
@@ -11,19 +11,19 @@ type logConn interface {
 	RemoteAddr() net.Addr
 }
 
-func debugLogTransportNewConn(c logConn, logger *zap.Logger) {
-	logger.Check(zap.DebugLevel, "new conn").Write(
-		zap.String("network", c.LocalAddr().Network()),
-		zap.Stringer("local", c.LocalAddr()),
-		zap.Stringer("remote", c.RemoteAddr()),
-	)
+func debugLogTransportConnOpen(c logConn, logger *zerolog.Logger) {
+	logger.Debug().
+		Str("network", c.LocalAddr().Network()).
+		Stringer("local", c.LocalAddr()).
+		Stringer("remote", c.RemoteAddr()).
+		Msg("connection opened")
 }
 
-func debugLogTransportConnClosed(c logConn, logger *zap.Logger, cause error) {
-	logger.Check(zap.DebugLevel, "conn closed").Write(
-		zap.String("network", c.LocalAddr().Network()),
-		zap.Stringer("local", c.LocalAddr()),
-		zap.Stringer("remote", c.RemoteAddr()),
-		zap.NamedError("cause", cause),
-	)
+func debugLogTransportConnClosed(c logConn, logger *zerolog.Logger, cause error) {
+	logger.Debug().
+		Str("network", c.LocalAddr().Network()).
+		Stringer("local", c.LocalAddr()).
+		Stringer("remote", c.RemoteAddr()).
+		AnErr("cause", cause).
+		Msg("connection closed")
 }

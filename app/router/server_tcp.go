@@ -4,14 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
-	"net/netip"
-	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -19,15 +17,6 @@ const (
 )
 
 func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) error {
-	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
-	if idleTimeout <= 0 {
-		idleTimeout = defaultTCPIdleTimeout
-	}
-	maxConcurrent := cfg.Tcp.MaxConcurrentRequests
-	if maxConcurrent <= 0 {
-		maxConcurrent = defaultMaxConcurrentRequestPreTCPConn
-	}
-
 	var tlsConfig *tls.Config
 	if useTls {
 		var err error
@@ -42,16 +31,26 @@ func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) error {
 		return err
 	}
 
+	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
+	if idleTimeout <= 0 {
+		idleTimeout = defaultTCPIdleTimeout
+	}
+	maxConcurrent := cfg.Tcp.MaxConcurrentQueries
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrentRequestPreTCPConn
+	}
 	s := &tcpServer{
 		r:             r,
 		l:             l,
 		tlsConfig:     tlsConfig,
 		idleTimeout:   idleTimeout,
 		maxConcurrent: maxConcurrent,
-		ppv2:          cfg.ProtocolProxyV2,
-		logger:        r.logger.Named("server_tcp").With(zap.Stringer("server_addr", l.Addr())),
+		logger:        r.subLoggerForServer("server_tcp", cfg.Tag),
 	}
-	s.logger.Info("tcp server started")
+	s.logger.Info().
+		Str("network", l.Addr().Network()).
+		Stringer("addr", l.Addr()).
+		Msg("tcp server started")
 	go func() {
 		defer l.Close()
 		s.run()
@@ -63,11 +62,10 @@ type tcpServer struct {
 	r *router
 
 	l             net.Listener
-	tlsConfig     *tls.Config // maybe nil
-	idleTimeout   time.Duration
-	maxConcurrent int32
-	ppv2          bool
-	logger        *zap.Logger
+	tlsConfig     *tls.Config   // nil if tls is disabled
+	idleTimeout   time.Duration // valid
+	maxConcurrent int32         // valid
+	logger        *zerolog.Logger
 }
 
 func (s *tcpServer) run() {
@@ -86,27 +84,9 @@ func (s *tcpServer) run() {
 }
 
 func (s *tcpServer) handleConn(c net.Conn) {
-	clientSrcAddr := netAddr2NetipAddr(c.RemoteAddr())
-	clientDstAddr := netAddr2NetipAddr(c.LocalAddr())
+	debugLogServerConnAccepted(c, s.logger)
 
-	// Read pp2 header
-	if s.ppv2 {
-		c.SetReadDeadline(time.Now().Add(pp2HeaderReadTimeout))
-		ppHdr, _, err := readIpFromPP2(c)
-		c.SetReadDeadline(time.Time{})
-		if err != nil {
-			s.logger.Check(zap.ErrorLevel, "failed to read pp2 header").Write(
-				zap.Stringer("so_remote", c.RemoteAddr()),
-				zap.Error(err),
-			)
-			return
-		}
-		clientSrcAddr = ppHdr.SourceAddr
-		clientDstAddr = ppHdr.DestinationAddr
-	}
-
-	// If server is tls enabled, do tls handshake here instead of
-	// in the io calls. Because we can set deadline and handle error easily.
+	// TLS handshake
 	if s.tlsConfig != nil {
 		tlsConn := tls.Server(c, s.tlsConfig)
 		defer tlsConn.Close()
@@ -115,83 +95,68 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		err := tlsConn.HandshakeContext(ctx)
 		cancel()
 		if err != nil {
-			s.logger.Check(zap.WarnLevel, "failed to tls handshake").Write(
-				zap.Stringer("local", clientDstAddr),
-				zap.Stringer("remote", clientSrcAddr),
-				zap.Error(err),
-			)
+			s.logger.Warn().
+				Stringer("local", c.LocalAddr()).
+				Stringer("remote", c.RemoteAddr()).
+				Err(err).
+				Msg("failed to tls handshake")
 			return
 		}
 		c = tlsConn
 	}
 
-	concurrent := new(atomic.Int32)
-	emptyConn := true
-
-	br := pool.BufReaderPool1K.Get()
-	br.Reset(c)
-	defer pool.BufReaderPool1K.Release(br)
+	concurrent := make(chan struct{}, s.maxConcurrent)
+	br := pool.NewBR1K(c)
+	defer pool.ReleaseBR1K(br)
 	for {
 		c.SetReadDeadline(time.Now().Add(s.idleTimeout))
 		m, n, err := dnsutils.ReadMsgFromTCP(br)
 		if err != nil {
-			var errMsg string
-			if n > 0 {
-				errMsg = "invalid tcp msg"
-			} else if emptyConn {
-				errMsg = "empty tcp connection"
+			if n > 0 { // invalid msg
+				s.logger.Warn().
+					Stringer("local", c.LocalAddr()).
+					Stringer("remote", c.RemoteAddr()).
+					Err(err).
+					Msg("invalid query msg")
 			}
-			// Other cases: n == 0, has error, not empty conn.
-			// Most likely are normal close or idle timeout.
-			if len(errMsg) > 0 {
-				s.logger.Check(zap.WarnLevel, errMsg).Write(
-					zap.Stringer("local", clientDstAddr),
-					zap.Stringer("remote", clientSrcAddr),
-					zap.Error(err),
-				)
-			}
-			return
-		}
-		emptyConn = false
-
-		if concurrent.Add(1) > s.maxConcurrent {
-			s.logger.Check(zap.WarnLevel, "too many concurrent requests").Write(
-				zap.Stringer("local", clientDstAddr),
-				zap.Stringer("remote", clientSrcAddr),
-				zap.Error(err),
-			)
+			// eof
+			debugLogServerConnClosed(c, s.logger, err)
 			return
 		}
 
+		concurrent <- struct{}{}
 		pool.Go(func() {
-			s.handleReq(c, m, clientSrcAddr, clientDstAddr)
+			defer func() { <-concurrent }()
+			s.handleReq(c, m)
 			dnsmsg.ReleaseMsg(m)
-			concurrent.Add(-1)
 		})
 	}
 }
 
-func (s *tcpServer) handleReq(c net.Conn, m *dnsmsg.Msg, remoteAddr, localAddr netip.AddrPort) {
+func (s *tcpServer) handleReq(c net.Conn, m *dnsmsg.Msg) {
 	rc := getRequestContext()
-	rc.RemoteAddr = remoteAddr
-	rc.LocalAddr = localAddr
+	rc.RemoteAddr = netAddr2NetipAddr(c.RemoteAddr())
+	rc.LocalAddr = netAddr2NetipAddr(c.LocalAddr())
 	defer releaseRequestContext(rc)
 
 	s.r.handleServerReq(m, rc)
 
 	buf, err := packRespTCP(rc.Response.Msg, true)
 	if err != nil {
-		s.logger.Error(logPackRespErr, zap.Error(err))
+		s.logger.Error().
+			Err(err).
+			Msg(logPackRespErr)
 		return
 	}
 
-	_, err = c.Write(buf.B())
+	_, err = c.Write(buf)
 	pool.ReleaseBuf(buf)
 	if err != nil {
-		s.logger.Check(zap.WarnLevel, "write error").Write(
-			zap.Stringer("local", localAddr),
-			zap.Stringer("remote", remoteAddr),
-			zap.Error(err),
-		)
+		s.logger.Warn().
+			Stringer("local", c.LocalAddr()).
+			Stringer("remote", c.RemoteAddr()).
+			Err(err).
+			Msg("failed to write response")
+		c.Close()
 	}
 }

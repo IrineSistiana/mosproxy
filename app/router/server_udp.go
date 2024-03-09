@@ -1,15 +1,13 @@
 package router
 
 import (
-	"bytes"
 	"fmt"
 	"net"
 	"net/netip"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"github.com/IrineSistiana/mosproxy/internal/pp"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 func (r *router) startUdpServer(cfg *ServerConfig) (err error) {
@@ -26,10 +24,10 @@ func (r *router) startUdpServer(cfg *ServerConfig) (err error) {
 	s := &udpServer{
 		r:      r,
 		c:      c,
-		ppv2:   cfg.ProtocolProxyV2,
-		logger: r.logger.Named("server_udp").With(zap.Stringer("server_addr", pc.LocalAddr())),
+		logger: r.subLoggerForServer("server_udp", cfg.Tag),
 	}
-	if cfg.Udp.MultiRoutes {
+
+	if cfg.Udp.MultiRoutes && c.LocalAddr().(*net.UDPAddr).IP.IsUnspecified() {
 		var err error
 		s.oobSize, s.dstReader, s.srcWriter, err = initOobHandler(c)
 		if err != nil {
@@ -38,7 +36,9 @@ func (r *router) startUdpServer(cfg *ServerConfig) (err error) {
 		}
 	}
 
-	s.logger.Info("udp server started")
+	s.logger.Info().
+		Stringer("addr", c.LocalAddr()).
+		Msg("udp server started")
 	go func() {
 		defer c.Close()
 		s.run()
@@ -49,8 +49,7 @@ func (r *router) startUdpServer(cfg *ServerConfig) (err error) {
 type udpServer struct {
 	r      *router
 	c      *net.UDPConn
-	ppv2   bool
-	logger *zap.Logger
+	logger *zerolog.Logger
 
 	oobSize   int
 	dstReader func(oob []byte) (net.IP, error)
@@ -64,25 +63,17 @@ func (s *udpServer) run() {
 
 	rbp := pool.GetBuf(65535)
 	defer pool.ReleaseBuf(rbp)
-	rb := rbp.B()
+	rb := rbp
 
 	var oob []byte // maybe nil
 	if s.oobSize > 0 {
 		oobp := pool.GetBuf(s.oobSize)
 		defer pool.ReleaseBuf(oobp)
-		oob = oobp.B()
-	}
-
-	var pp2Reader *bytes.Reader // nil if pp2 disabled
-	if s.ppv2 {
-		pp2Reader = new(bytes.Reader)
+		oob = oobp
 	}
 
 	for {
-		var clientDstAddr netip.AddrPort
-		var clientSrcAddr netip.AddrPort
-
-		n, oobn, _, soRemoteAddr, err := c.ReadMsgUDPAddrPort(rb, oob)
+		n, oobn, _, remoteAddr, err := c.ReadMsgUDPAddrPort(rb, oob)
 		if err != nil {
 			if n == 0 {
 				// Err with zero read. Most likely because c was closed.
@@ -90,96 +81,79 @@ func (s *udpServer) run() {
 				return
 			}
 			// Temporary err.
-			s.logger.Check(zap.ErrorLevel, "temporary udp read err").Write(
-				zap.String("so_remote", soRemoteAddr.String()),
-				zap.Error(err),
-			)
+			s.logger.Error().
+				Stringer("remote", remoteAddr).
+				Err(err).
+				Msg("temporary read err")
 			continue
 		}
-		clientSrcAddr = soRemoteAddr
 		payload := rb[:n]
 
 		var (
 			sessionOob   []byte     // maybe nil
 			oobLocalAddr netip.Addr // maybe invalid
 		)
+		localAddr := listenerAddr
 		if oobn > 0 {
 			ip, err := s.dstReader(oob[:oobn])
 			if err != nil {
-				s.logger.Error(
-					"failed to get remote dst address from socket oob",
-					zap.Stringer("so_remote", soRemoteAddr),
-					zap.Error(err),
-				)
+				s.logger.Error().
+					Stringer("remote", remoteAddr).
+					Err(err).
+					Msg("failed to get remote dst address from socket oob")
 				continue
 			}
 			oobLocalAddr, _ = netip.AddrFromSlice(ip)
 			sessionOob = s.srcWriter(ip)
-			clientDstAddr = netip.AddrPortFrom(oobLocalAddr, listenerAddr.Port())
-		}
-
-		// Read pp2 header
-		if s.ppv2 {
-			pp2Reader.Reset(payload)
-			ppHdr, n, err := pp.ReadV2(pp2Reader)
-			pp2Reader.Reset(nil)
-			if err != nil {
-				s.logger.Check(zap.ErrorLevel, "failed to read pp2 header").Write(
-					zap.Stringer("so_remote", soRemoteAddr),
-					zap.Error(err),
-				)
-				continue
-			}
-			payload = payload[n:]
-			clientSrcAddr = ppHdr.SourceAddr
-			clientDstAddr = ppHdr.DestinationAddr
+			localAddr = netip.AddrPortFrom(oobLocalAddr, listenerAddr.Port())
 		}
 
 		m, err := dnsmsg.UnpackMsg(payload)
 		if err != nil {
-			s.logger.Check(zap.WarnLevel, "invalid udp msg").Write(
-				zap.String("local", clientDstAddr.String()),
-				zap.String("remote", clientSrcAddr.String()),
-				zap.Error(err),
-			)
+			s.logger.Error().
+				Stringer("remote", remoteAddr).
+				Err(err).
+				Msg("invalid query msg")
 			continue
 		}
 
 		rc := getRequestContext()
-		rc.RemoteAddr = clientSrcAddr
-		rc.LocalAddr = clientDstAddr
+		rc.RemoteAddr = remoteAddr
+		rc.LocalAddr = localAddr
 		pool.Go(func() {
 			defer dnsmsg.ReleaseMsg(m)
 			defer releaseRequestContext(rc)
-			s.handleReq(soRemoteAddr, sessionOob, m, rc)
+			s.handleReq(remoteAddr, sessionOob, m, rc)
 		})
 	}
 }
 
-func (s *udpServer) handleReq(remoteC netip.AddrPort, oob []byte, m *dnsmsg.Msg, rc *RequestContext) {
+func (s *udpServer) handleReq(remoteAddr netip.AddrPort, oob []byte, m *dnsmsg.Msg, rc *RequestContext) {
 	s.r.handleServerReq(m, rc)
 
 	// Determine the client udp size. Try to find edns0.
-	clientUdpSize := 512
-	for iter := m.Additionals.Iter(); iter.Next(); {
-		r := iter.Value()
-		if r.Type == dnsmsg.TypeOPT {
-			if r.Class > dnsmsg.Class(clientUdpSize) {
-				clientUdpSize = int(r.Class)
-			}
+	clientUdpSize := 0
+	for _, r := range m.Additionals {
+		hdr := r.Hdr()
+		if hdr.Type == dnsmsg.TypeOPT {
+			clientUdpSize = int(hdr.Class)
 		}
+	}
+	if clientUdpSize < 512 {
+		clientUdpSize = 512
 	}
 
 	b, err := packResp(rc.Response.Msg, true, clientUdpSize)
 	if err != nil {
-		s.logger.Error(logPackRespErr, zap.Error(err))
+		s.logger.Error().
+			Err(err).
+			Msg(logPackRespErr)
 		return
 	}
-	if _, _, err := s.c.WriteMsgUDPAddrPort(b.B(), oob, remoteC); err != nil {
-		s.logger.Check(zap.WarnLevel, "failed to write udp response").Write(
-			zap.Stringer("so_local", s.c.LocalAddr()),
-			zap.String("so_remote", remoteC.String()),
-			zap.Error(err),
-		)
+	if _, _, err := s.c.WriteMsgUDPAddrPort(b, oob, remoteAddr); err != nil {
+		s.logger.Warn().
+			Stringer("remote", remoteAddr).
+			Err(err).
+			Msg("failed to write response")
 	}
 }

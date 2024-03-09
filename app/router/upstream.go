@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/netip"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/upstream"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
 )
 
 func (r *router) initUpstream(cfg *UpstreamConfig) error {
@@ -32,11 +30,10 @@ func (r *router) initUpstream(cfg *UpstreamConfig) error {
 	controlOpts := cfg.Socket
 	controlOpts._TCP_USER_TIMEOUT = 5000 // 5s
 	opt := upstream.Opt{
-		DialAddr:        cfg.DialAddr,
-		Logger:          r.logger.Named("upstream").With(zap.String("upstream", cfg.Tag)),
-		TLSConfig:       tlsConfig,
-		Control:         controlSocket(controlOpts),
-		ProtocolProxyV2: cfg.ProtocolProxyV2,
+		DialAddr:  cfg.DialAddr,
+		Logger:    r.subLoggerForUpstream(cfg.Tag),
+		TLSConfig: tlsConfig,
+		Control:   controlSocket(controlOpts),
 	}
 	u, err := upstream.NewUpstream(cfg.Addr, opt)
 	if err != nil {
@@ -95,7 +92,7 @@ func (uw *upstreamWrapper) RegisterMetricsTo(r prometheus.Registerer) error {
 	return regMetrics(r, uw.queryTotal, uw.errTotal, uw.thread, uw.responseLatency)
 }
 
-func (uw *upstreamWrapper) Exchange(ctx context.Context, m []byte, remoteAddr, localAddr netip.AddrPort) (*dnsmsg.Msg, error) {
+func (uw *upstreamWrapper) Exchange(ctx context.Context, m []byte) (*dnsmsg.Msg, error) {
 	uw.queryTotal.Inc()
 	var (
 		r   *dnsmsg.Msg
@@ -103,11 +100,7 @@ func (uw *upstreamWrapper) Exchange(ctx context.Context, m []byte, remoteAddr, l
 	)
 	start := time.Now()
 	uw.thread.Inc()
-	if u, ok := uw.u.(*upstream.UDPWithPP2); ok {
-		r, err = u.ExchangeContextPP2(ctx, m, remoteAddr, localAddr)
-	} else {
-		r, err = uw.u.ExchangeContext(ctx, m)
-	}
+	r, err = uw.u.ExchangeContext(ctx, m)
 	uw.thread.Dec()
 
 	if err != nil {

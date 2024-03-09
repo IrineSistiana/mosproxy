@@ -3,10 +3,11 @@ package domainmatcher
 import (
 	"regexp"
 
+	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 )
 
-// Note: regexp matcher will match against a NON-FQDN.
+// Note: regexp matcher will match a NON-FQDN.
 type RegexpMatcher struct {
 	m map[string]*regexp.Regexp
 }
@@ -15,19 +16,20 @@ func NewRegexpMatcher() *RegexpMatcher {
 	return &RegexpMatcher{m: make(map[string]*regexp.Regexp)}
 }
 
-func (m *RegexpMatcher) MatchString(n string) bool {
-	b := normDomainStr(n)
-	defer pool.ReleaseBuf(b)
-	return m.matchNormed(b.B())
-}
-
 func (m *RegexpMatcher) Match(n []byte) bool {
-	b := normDomain(n)
+	if len(m.m) == 0 {
+		return false
+	}
+
+	b, err := dnsmsg.ToReadable(n)
+	if err != nil {
+		return false
+	}
 	defer pool.ReleaseBuf(b)
-	return m.matchNormed(b.B())
+	return m.matchReadable(b)
 }
 
-func (m *RegexpMatcher) matchNormed(n []byte) bool {
+func (m *RegexpMatcher) matchReadable(n []byte) bool {
 	for _, r := range m.m {
 		if r.Match(n) {
 			return true

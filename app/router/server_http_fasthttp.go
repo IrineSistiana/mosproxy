@@ -11,9 +11,8 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 func (r *router) startFastHttpServer(cfg *ServerConfig) error {
@@ -31,9 +30,12 @@ func (r *router) startFastHttpServer(cfg *ServerConfig) error {
 	h := &fasthttpHandler{
 		r:                r,
 		clientAddrHeader: cfg.Http.ClientAddrHeader,
-		logger:           r.logger.Named("server_fasthttp").With(zap.Stringer("server_addr", l.Addr())),
+		logger:           r.subLoggerForServer("server_fasthttp", cfg.Tag),
 	}
-	h.logger.Info("fasthttp server started")
+	h.logger.Info().
+		Str("network", l.Addr().Network()).
+		Stringer("addr", l.Addr()).
+		Msg("fasthttp server started")
 	s := &fasthttp.Server{
 		Handler:                      h.HandleFastHTTP,
 		ReadTimeout:                  time.Second * 5,
@@ -44,7 +46,7 @@ func (r *router) startFastHttpServer(cfg *ServerConfig) error {
 		NoDefaultServerHeader:        true,
 		NoDefaultDate:                true,
 		StreamRequestBody:            true,
-		Logger:                       log.New(mlog.WriteToLogger(h.logger, zap.WarnLevel, "", "msg"), "", 0),
+		Logger:                       log.New(mlog.WriteToLogger(*h.logger, "redirected fasthttp log", "msg"), "", 0),
 	}
 
 	go func() {
@@ -59,30 +61,27 @@ type fasthttpHandler struct {
 	r                *router
 	path             string
 	clientAddrHeader string
-	logger           *zap.Logger
+	logger           *zerolog.Logger
 }
 
 type fasthttpReqLoggerObj fasthttp.RequestCtx
 
-func (o *fasthttpReqLoggerObj) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
+func (o *fasthttpReqLoggerObj) MarshalZerologObject(e *zerolog.Event) {
 	ctx := (*fasthttp.RequestCtx)(o)
-	encoder.AddString("remote", ctx.Conn().RemoteAddr().String())
-	encoder.AddString("local", ctx.Conn().LocalAddr().String())
-	encoder.AddByteString("method", ctx.Method())
-	encoder.AddByteString("url", ctx.URI().FullURI())
-	encoder.AddByteString("proto", ctx.Request.Header.Protocol())
-	encoder.AddByteString("ua", ctx.UserAgent())
-	return nil
-}
-
-func fasthttpCtxField(ctx *fasthttp.RequestCtx) zap.Field {
-	return zap.Object("req", (*fasthttpReqLoggerObj)(ctx))
+	e.Bytes("proto", ctx.Request.Header.Protocol())
+	e.Bytes("method", ctx.Method())
+	e.Bytes("url", ctx.URI().FullURI())
+	e.Bytes("ua", ctx.UserAgent())
+	e.Str("remote", ctx.Conn().RemoteAddr().String())
+	e.Str("local", ctx.Conn().LocalAddr().String())
 }
 
 func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 	// check path
 	if len(h.path) > 0 && h.path != string(ctx.Request.URI().Path()) {
-		h.logger.Error("invalid path", fasthttpCtxField(ctx))
+		h.logger.Warn().
+			Object("request", (*fasthttpReqLoggerObj)(ctx)).
+			Msg("invalid path")
 		ctx.SetStatusCode(fasthttp.StatusNotFound)
 		return
 	}
@@ -93,12 +92,11 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 		if xff := ctx.Request.Header.Peek(header); len(xff) != 0 {
 			addr, err := readClientAddrFromXFFBytes(xff)
 			if err != nil {
-				h.logger.Warn(
-					"invalid client addr header",
-					fasthttpCtxField(ctx),
-					zap.ByteString("value", xff),
-					zap.Error(err),
-				)
+				h.logger.Warn().
+					Object("request", (*fasthttpReqLoggerObj)(ctx)).
+					Bytes("value", xff).
+					Err(err).
+					Msg("invalid client addr header value")
 				ctx.SetStatusCode(fasthttp.StatusBadRequest)
 				return
 			}
@@ -127,14 +125,17 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 
 	msgBody, err := packResp(rc.Response.Msg, true, 65535)
 	if err != nil {
-		h.logger.Warn(logPackRespErr, fasthttpCtxField(ctx), zap.Error(err))
+		h.logger.Error().
+			Object("request", (*fasthttpReqLoggerObj)(ctx)).
+			Err(err).
+			Msg(logPackRespErr)
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 		return
 	}
 	defer pool.ReleaseBuf(msgBody)
 
 	ctx.Response.Header.Add("Content-Type", "application/dns-message")
-	ctx.SetBody(msgBody.B())
+	ctx.SetBody(msgBody)
 }
 
 func readClientAddrFromXFFBytes(b []byte) (netip.Addr, error) {
@@ -150,38 +151,52 @@ func (h *fasthttpHandler) readReqMsg(ctx *fasthttp.RequestCtx) *dnsmsg.Msg {
 	case ctx.IsGet():
 		// Check accept header
 		if acceptTyp := ctx.Request.Header.Peek("Accept"); string(acceptTyp) != "application/dns-message" {
-			h.logger.Warn("invalid accept header", fasthttpCtxField(ctx), zap.ByteString("accept", acceptTyp))
+			h.logger.Warn().
+				Object("request", (*fasthttpReqLoggerObj)(ctx)).
+				Bytes("value", acceptTyp).
+				Msg("invalid accept header")
 			ctx.SetStatusCode(fasthttp.StatusBadRequest)
 			return nil
 		}
 
 		base64Dns := ctx.Request.URI().QueryArgs().Peek("dns")
 		if len(base64Dns) == 0 {
-			h.logger.Warn("missing dns parameter", fasthttpCtxField(ctx))
+			h.logger.Warn().
+				Object("request", (*fasthttpReqLoggerObj)(ctx)).
+				Msg("missing dns parameter")
 			ctx.SetStatusCode(fasthttp.StatusBadRequest)
 			return nil
 		}
 
 		msgSize := base64.RawURLEncoding.DecodedLen(len(base64Dns))
 		if msgSize > 65535 {
-			h.logger.Warn("query msg overflowed", fasthttpCtxField(ctx), zap.Int("len", msgSize))
+			h.logger.Warn().
+				Object("request", (*fasthttpReqLoggerObj)(ctx)).
+				Int("len", msgSize).
+				Msg("query msg too long")
 			ctx.SetStatusCode(fasthttp.StatusBadRequest)
 			return nil
 		}
 		buf := pool.GetBuf(msgSize)
 		defer pool.ReleaseBuf(buf)
-		_, err := base64.RawURLEncoding.Decode(buf.B(), base64Dns)
+		_, err := base64.RawURLEncoding.Decode(buf, base64Dns)
 		if err != nil {
-			h.logger.Warn("invalid base64", fasthttpCtxField(ctx), zap.Error(err))
+			h.logger.Warn().
+				Object("request", (*fasthttpReqLoggerObj)(ctx)).
+				Err(err).
+				Msg("invalid base64 data")
 			ctx.SetStatusCode(fasthttp.StatusBadRequest)
 			return nil
 		}
-		reqWireMsg = buf.B()
+		reqWireMsg = buf
 
 	case ctx.IsPost():
 		// Check Content-Type header
 		if ct := ctx.Request.Header.Peek("Content-Type"); string(ct) != "application/dns-message" {
-			h.logger.Warn("invalid content-type header", fasthttpCtxField(ctx), zap.ByteString("content-type", ct))
+			h.logger.Warn().
+				Object("request", (*fasthttpReqLoggerObj)(ctx)).
+				Bytes("value", ct).
+				Msg("invalid content-type header")
 			ctx.SetStatusCode(fasthttp.StatusBadRequest)
 			return nil
 		}
@@ -190,21 +205,29 @@ func (h *fasthttpHandler) readReqMsg(ctx *fasthttp.RequestCtx) *dnsmsg.Msg {
 		defer bufPool.Release(buf)
 		_, err := buf.ReadFrom(io.LimitReader(ctx.Request.BodyStream(), 65535))
 		if err != nil {
-			h.logger.Warn("failed to read request body", fasthttpCtxField(ctx), zap.Error(err))
+			h.logger.Warn().
+				Object("request", (*fasthttpReqLoggerObj)(ctx)).
+				Err(err).
+				Msg("failed to read request body")
 			ctx.SetStatusCode(fasthttp.StatusBadRequest)
 			return nil
 		}
 		reqWireMsg = buf.Bytes()
 
 	default:
-		h.logger.Warn("invalid method", fasthttpCtxField(ctx))
+		h.logger.Warn().
+			Object("request", (*fasthttpReqLoggerObj)(ctx)).
+			Msg("invalid method")
 		ctx.SetStatusCode(fasthttp.StatusNotImplemented)
 		return nil
 	}
 
 	m, err := dnsmsg.UnpackMsg(reqWireMsg)
 	if err != nil {
-		h.logger.Warn("invalid query msg", fasthttpCtxField(ctx), zap.Error(err))
+		h.logger.Warn().
+			Object("request", (*fasthttpReqLoggerObj)(ctx)).
+			Err(err).
+			Msg("invalid query msg")
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		return nil
 	}

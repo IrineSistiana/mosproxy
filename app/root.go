@@ -9,9 +9,8 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
+	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 var (
@@ -31,22 +30,22 @@ func init() {
 		if *GOMAXPROCS > 0 {
 			runtime.GOMAXPROCS(*GOMAXPROCS)
 		}
-		lvl, err := zapcore.ParseLevel(*logLvl)
+		lvl, err := zerolog.ParseLevel(*logLvl)
 		if err != nil {
 			return fmt.Errorf("invalid log lvl [%s]. %w", *logLvl, err)
 		}
-		mlog.SetLevel(lvl)
+		mlog.SetLvl(lvl)
 
 		if len(*pprofServer) > 0 {
 			l, err := net.Listen("tcp", *pprofServer)
 			if err != nil {
-				logger.Fatal("failed to listen pprof server socket", zap.Error(err))
+				logger.Fatal().Err(err).Msg("failed to listen pprof server socket")
 			}
-			logger.Info("pprof server started", zap.Stringer("addr", l.Addr()))
+			logger.Info().Stringer("addr", l.Addr()).Msg("pprof server started")
 			go func() {
 				defer l.Close()
 				err := http.Serve(l, nil)
-				logger.Fatal("pprof server exited", zap.Error(err))
+				logger.Fatal().Err(err).Msg("pprof server exited")
 			}()
 		}
 		return nil

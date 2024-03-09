@@ -4,11 +4,10 @@ package router
 
 import (
 	"bufio"
-	"context"
 	"encoding/binary"
 	"errors"
-	"io"
 	"net/netip"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,7 +15,7 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/panjf2000/gnet/v2"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 func (r *router) startGnetServer(cfg *ServerConfig) error {
@@ -24,13 +23,9 @@ func (r *router) startGnetServer(cfg *ServerConfig) error {
 	if idleTimeout <= 0 {
 		idleTimeout = defaultTCPIdleTimeout
 	}
-	maxConcurrent := cfg.Tcp.MaxConcurrentRequests
+	maxConcurrent := cfg.Tcp.MaxConcurrentQueries
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultMaxConcurrentRequestPreTCPConn
-	}
-	engineNum := cfg.Tcp.EngineNum
-	if engineNum <= 1 {
-		engineNum = 1
 	}
 
 	var proto string
@@ -40,24 +35,31 @@ func (r *router) startGnetServer(cfg *ServerConfig) error {
 		proto = "tcp"
 	}
 	addr := proto + "://" + cfg.Listen
-	logger := r.logger.Named("server_gnet").With(zap.String("engine_addr", addr))
-	e := &engine{
-		logger:        logger,
+	e := &gnetEngine{
+		logger:        r.subLoggerForServer("server_gnet", cfg.Tag),
 		r:             r,
 		idleTimeout:   idleTimeout,
 		maxConcurrent: maxConcurrent,
 	}
 
-	e.logger.Info("engine is starting")
 	socketOpts := cfg.Socket // TODO: Impl all options.
 	go func() {
+		cpuNum := runtime.NumCPU()
+		if cpuNum > 4 {
+			cpuNum = 4
+		}
+		e.logger.Info().
+			Str("addr", addr).
+			Int("threads", cpuNum).
+			Msg("gnet engine is starting")
+
 		err := gnet.Run(e, addr,
-			gnet.WithNumEventLoop(engineNum),
+			gnet.WithNumEventLoop(cpuNum),
 			gnet.WithSocketRecvBuffer(socketOpts.SO_RCVBUF),
 			gnet.WithSocketSendBuffer(socketOpts.SO_SNDBUF),
 			gnet.WithReusePort(socketOpts.SO_REUSEPORT),
-			gnet.WithLogger(logger.Sugar()),
-			gnet.WithReadBufferCap(2+65535), // This is the maximum tcp payload.
+			gnet.WithLogger(&gnetLogger{l: *e.logger}),
+			gnet.WithReadBufferCap(128*1024), // Note: minimum is 65535+2 (maximum tcp payload).
 		)
 		r.fatal("gnet engine exited", err)
 	}()
@@ -65,19 +67,15 @@ func (r *router) startGnetServer(cfg *ServerConfig) error {
 	return nil
 }
 
-type engine struct {
-	logger *zap.Logger
+type gnetEngine struct {
 	r      *router
+	logger *zerolog.Logger
 
 	idleTimeout   time.Duration
 	maxConcurrent int32
 }
 
 type connCtx struct {
-	// ctx
-	ctx    context.Context
-	cancel context.CancelCauseFunc // will be called when conn was closed.
-
 	// info, static, may be invalid, e.g. unix socket
 	remoteAddr netip.AddrPort
 	localAddr  netip.AddrPort
@@ -88,15 +86,15 @@ type connCtx struct {
 
 // OnBoot fires when the engine is ready for accepting connections.
 // The parameter engine has information and various utilities.
-func (e *engine) OnBoot(eng gnet.Engine) (action gnet.Action) {
-	e.logger.Info("engine started")
+func (e *gnetEngine) OnBoot(eng gnet.Engine) (action gnet.Action) {
+	e.logger.Info().Msg("engine started")
 	return gnet.None
 }
 
 // OnShutdown fires when the engine is being shut down, it is called right after
 // all event-loops and connections are closed.
-func (e *engine) OnShutdown(eng gnet.Engine) {
-	e.logger.Info("engine stopped")
+func (e *gnetEngine) OnShutdown(eng gnet.Engine) {
+	e.logger.Info().Msg("engine stopped")
 }
 
 // OnOpen fires when a new connection has been opened.
@@ -104,12 +102,11 @@ func (e *engine) OnShutdown(eng gnet.Engine) {
 // The Conn c has information about the connection such as its local and remote addresses.
 // The parameter out is the return value which is going to be sent back to the peer.
 // Sending large amounts of data back to the peer in OnOpen is usually not recommended.
-func (e *engine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
-	ctx, cancel := context.WithCancelCause(context.Background())
+func (e *gnetEngine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
+	debugLogServerConnAccepted(c, e.logger)
+
 	// TODO: Reuse cc?
 	cc := &connCtx{
-		ctx:        ctx,
-		cancel:     cancel,
 		remoteAddr: netAddr2NetipAddr(c.RemoteAddr()),
 		localAddr:  netAddr2NetipAddr(c.LocalAddr()),
 	}
@@ -120,17 +117,15 @@ func (e *engine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 
 // OnClose fires when a connection has been closed.
 // The parameter err is the last known connection error.
-func (e *engine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+func (e *gnetEngine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+	debugLogServerConnClosed(c, e.logger, err)
 	cc := c.Context().(*connCtx)
-	cc.cancel(err)
-	if err != nil && !errors.Is(err, io.EOF) {
-		// TODO: This log will be annoying. So the lvl is debug. Filter out the common errors?
-		e.logger.Check(zap.DebugLevel, "conn closed").Write(
-			zap.Stringer("remote", cc.remoteAddr),
-			zap.Stringer("local", cc.localAddr),
-			zap.Error(err),
-		)
-	}
+
+	e.logger.Debug(). // TODO: Remove this.
+				Stringer("remote", cc.remoteAddr).
+				Stringer("local", cc.localAddr).
+				Err(err).
+				Msg("conn closed")
 	return gnet.None
 }
 
@@ -140,7 +135,7 @@ func (e *engine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 // as this []byte will be reused within event-loop after OnTraffic() returns.
 // If you have to use this []byte in a new goroutine, you should either make a copy of it or call Conn.Read([]byte)
 // to read data into your own []byte, then pass the new []byte to the new goroutine.
-func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
+func (e *gnetEngine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	cc := c.Context().(*connCtx)
 
 	// Read all msgs in the buffer.
@@ -148,7 +143,7 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		// Check read buffer, is there a fully msg?
 		hdr, err := c.Peek(2)
 		if err != nil {
-			if err == bufio.ErrBufferFull {
+			if errors.Is(err, bufio.ErrBufferFull) {
 				panic("gnet recv buffer is too small")
 			}
 			break // partial hdr
@@ -157,7 +152,7 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		l := binary.BigEndian.Uint16(hdr)
 		hdrBody, err := c.Peek(2 + int(l))
 		if err != nil {
-			if err == bufio.ErrBufferFull {
+			if errors.Is(err, bufio.ErrBufferFull) {
 				panic("gnet recv buffer is too small")
 			}
 			break // partial body
@@ -168,11 +163,10 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		if cc.concurrentRequests.Load() > e.maxConcurrent {
 			// Too many concurrent requests.
 			// TODO: Return a REFUSE instead of closing the connection?
-			e.logger.Check(zap.WarnLevel, "too many concurrent requests").Write(
-				zap.Stringer("remote", cc.remoteAddr),
-				zap.Stringer("local", cc.localAddr),
-				zap.Error(err),
-			)
+			e.logger.Warn().
+				Stringer("remote", cc.remoteAddr).
+				Stringer("local", cc.localAddr).
+				Msg("too many concurrent requests")
 			return gnet.Close
 		}
 
@@ -180,50 +174,52 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 		c.Discard(2 + int(l))
 		c.SetReadDeadline(time.Now().Add(e.idleTimeout))
 		if err != nil {
-			e.logger.Check(zap.WarnLevel, "invalid msg").Write(
-				zap.Stringer("remote", cc.remoteAddr),
-				zap.Stringer("local", cc.localAddr),
-				zap.Error(err),
-			)
+			e.logger.Warn().
+				Stringer("remote", cc.remoteAddr).
+				Stringer("local", cc.localAddr).
+				Err(err).
+				Msg("invalid msg")
 			return gnet.Close
 		}
 
 		pool.Go(func() {
 			rc := getRequestContext()
+			defer releaseRequestContext(rc)
 			rc.RemoteAddr = cc.remoteAddr
 			rc.LocalAddr = cc.localAddr
-			defer releaseRequestContext(rc)
 
 			e.r.handleServerReq(m, rc)
 			dnsmsg.ReleaseMsg(m)
 
 			buf, err := packRespTCP(rc.Response.Msg, true)
 			if err != nil {
-				e.logger.Error(logPackRespErr, zap.Error(err))
+				e.logger.Error().
+					Err(err).
+					Msg(logPackRespErr)
 				return
 			}
 
-			err = c.AsyncWrite(buf.B(), func(c gnet.Conn, err error) error {
+			err = c.AsyncWrite(buf, func(c gnet.Conn, err error) error {
 				pool.ReleaseBuf(buf)
 				if err == nil {
 					err = c.Flush()
 				}
 				cc.concurrentRequests.Add(-1)
 				if err != nil {
-					e.logger.Check(zap.WarnLevel, "failed to write").Write(
-						zap.Stringer("remote", cc.remoteAddr),
-						zap.Stringer("local", cc.localAddr),
-						zap.Error(err),
-					)
+					e.logger.Warn().
+						Stringer("remote", cc.remoteAddr).
+						Stringer("local", cc.localAddr).
+						Err(err).
+						Msg("failed to write resp")
 				}
 				return nil
 			})
 			if err != nil {
-				e.logger.Check(zap.WarnLevel, "failed to async write").Write(
-					zap.Stringer("remote", cc.remoteAddr),
-					zap.Stringer("local", cc.localAddr),
-					zap.Error(err),
-				)
+				e.logger.Warn().
+					Stringer("remote", cc.remoteAddr).
+					Stringer("local", cc.localAddr).
+					Err(err).
+					Msg("failed to async write resp")
 			}
 		})
 	}
@@ -232,6 +228,30 @@ func (e *engine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 
 // OnTick fires immediately after the engine starts and will fire again
 // following the duration specified by the delay return value.
-func (e *engine) OnTick() (delay time.Duration, action gnet.Action) {
+func (e *gnetEngine) OnTick() (delay time.Duration, action gnet.Action) {
 	return
+}
+
+type gnetLogger struct {
+	l zerolog.Logger
+}
+
+func (l *gnetLogger) Debugf(format string, args ...interface{}) {
+	l.l.Debug().Msgf(format, args...)
+}
+
+func (l *gnetLogger) Infof(format string, args ...interface{}) {
+	l.l.Info().Msgf(format, args...)
+}
+
+func (l *gnetLogger) Warnf(format string, args ...interface{}) {
+	l.l.Warn().Msgf(format, args...)
+}
+
+func (l *gnetLogger) Errorf(format string, args ...interface{}) {
+	l.l.Error().Msgf(format, args...)
+}
+
+func (l *gnetLogger) Fatalf(format string, args ...interface{}) {
+	l.l.Fatal().Msgf(format, args...)
 }

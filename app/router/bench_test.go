@@ -17,8 +17,8 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/upstream"
 	"github.com/miekg/dns"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 )
 
 const (
@@ -187,32 +187,31 @@ func Benchmark_gnet(b *testing.B) {
 
 var initBenchServerOnce = sync.OnceFunc(func() {
 	tlsOpts := TlsConfig{
-		TestUseTempCert: true,
+		DebugUseTempCert: true,
 	}
 	cfg := &Config{
 		Servers: []ServerConfig{
 			{Protocol: "udp", Listen: udpAddr, Socket: SocketConfig{SO_RCVBUF: 1024 * 1024, SO_SNDBUF: 1024 * 1024}},
 
-			{Protocol: "tcp", Listen: tcpAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt32}},
-			{Protocol: "tcp", Listen: tcpUnixAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt32}},
+			{Protocol: "tcp", Listen: tcpAddr, Tcp: TcpConfig{MaxConcurrentQueries: math.MaxInt32}},
+			{Protocol: "tcp", Listen: tcpUnixAddr, Tcp: TcpConfig{MaxConcurrentQueries: math.MaxInt32}},
 
-			{Protocol: "tls", Listen: tlsAddr, Tcp: TcpConfig{MaxConcurrentRequests: math.MaxInt32}, Tls: tlsOpts},
+			{Protocol: "tls", Listen: tlsAddr, Tcp: TcpConfig{MaxConcurrentQueries: math.MaxInt32}, Tls: tlsOpts},
 
 			{Protocol: "http", Listen: httpAddr},
 			{Protocol: "http", Listen: httpUnixAddr},
-			{Protocol: "https", Listen: httpsAddr, Tls: tlsOpts, Http: HttpConfig{TestMaxStreams: h2MaxStreams}},
+			{Protocol: "https", Listen: httpsAddr, Tls: tlsOpts, Http: HttpConfig{DebugMaxStreams: h2MaxStreams}},
 
-			// fasthttp
 			{Protocol: "http", Listen: fasthttpAddr},
 			{Protocol: "http", Listen: fasthttpUnixAddr},
 
 			{Protocol: "quic", Listen: quicAddr, Tls: tlsOpts, Quic: QuicConfig{MaxStreams: math.MaxInt}},
 
-			{Protocol: "gnet", Listen: gnetAddr, Tcp: TcpConfig{EngineNum: 4}},
+			{Protocol: "gnet", Listen: gnetAddr, Tcp: TcpConfig{}},
 		},
 	}
 	go func() {
-		mlog.SetLevel(zap.WarnLevel) // disable log
+		mlog.SetLvl(zerolog.Disabled) // disable log
 		run(context.Background(), cfg)
 	}()
 	// TODO: Use chan to sync
@@ -254,11 +253,21 @@ func loopBench(b *testing.B, opts benchmarkOpts) {
 
 	lw := new(latencyWatcher)
 	var failed atomic.Uint32
-	b.SetParallelism(opts.concurrent)
-	b.ResetTimer()
-	start := time.Now()
-	b.RunParallel(func(p *testing.PB) {
-		for p.Next() {
+
+	n := b.N
+	var nm sync.Mutex
+	next := func() bool {
+		nm.Lock()
+		defer nm.Unlock()
+		if n <= 0 {
+			return false
+		}
+		n--
+		return true
+	}
+
+	concurrentFn := func() {
+		for next() {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 			start := time.Now()
 			m, err := u.ExchangeContext(ctx, payload)
@@ -272,8 +281,22 @@ func loopBench(b *testing.B, opts benchmarkOpts) {
 			dnsmsg.ReleaseMsg(m)
 			lw.observe(uint32(latency.Milliseconds()))
 		}
-	})
+	}
+
+	b.ResetTimer()
+	start := time.Now()
+
+	wg := new(sync.WaitGroup)
+	for i := 0; i < opts.concurrent; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			concurrentFn()
+		}()
+	}
+	wg.Wait()
 	b.StopTimer()
+
 	elapsed := time.Since(start).Seconds()
 	if elapsed > 0 {
 		b.ReportMetric(float64(b.N)/elapsed, "op/s")

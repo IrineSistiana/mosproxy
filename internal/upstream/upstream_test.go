@@ -81,7 +81,7 @@ var m = map[string]newTestServerFunc{
 	"tls": newDoTTestServer,
 }
 
-func Test_fastUpstream(t *testing.T) {
+func Test_Upstream(t *testing.T) {
 	// TODO: add test for doh
 
 	// server config

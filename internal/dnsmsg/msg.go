@@ -108,13 +108,11 @@ func (h *header) unpack(msg []byte, off int) (int, error) {
 }
 
 type Msg struct {
-	noCopy
-
 	Header
-	Questions   List[*Question]
-	Answers     List[*Resource]
-	Authorities List[*Resource]
-	Additionals List[*Resource]
+	Questions   []*Question
+	Answers     []Resource
+	Authorities []Resource
+	Additionals []Resource
 }
 
 // Len is the msg length without compression.
@@ -124,48 +122,16 @@ func (m *Msg) Len() (l int) {
 	}
 	l += 12 // header
 
-	for iter := m.Questions.Iter(); iter.Next(); {
-		q := iter.Value()
-		l += q.len()
+	for _, q := range m.Questions {
+		l += q.Len()
 	}
 
-	for _, list := range [...]*List[*Resource]{&m.Answers, &m.Authorities, &m.Additionals} {
-		for iter := list.Iter(); iter.Next(); {
-			r := iter.Value()
-			l += r.len()
+	for _, rs := range [...][]Resource{m.Answers, m.Authorities, m.Additionals} {
+		for _, r := range rs {
+			l += r.packLen()
 		}
 	}
 	return l
-}
-
-func (m *Msg) Copy() *Msg      { return m.copy(false) }
-func (m *Msg) CopyNoOpt() *Msg { return m.copy(true) }
-func (m *Msg) copy(noOpt bool) *Msg {
-	if m == nil {
-		return nil
-	}
-	newMsg := NewMsg()
-	newMsg.Header = m.Header
-	for iter := m.Questions.Iter(); iter.Next(); {
-		q := iter.Value()
-		newMsg.Questions.Add(q.Copy())
-	}
-	for iter := m.Answers.Iter(); iter.Next(); {
-		r := iter.Value()
-		newMsg.Answers.Add(r.Copy())
-	}
-	for iter := m.Authorities.Iter(); iter.Next(); {
-		r := iter.Value()
-		newMsg.Authorities.Add(r.Copy())
-	}
-	for iter := m.Additionals.Iter(); iter.Next(); {
-		r := iter.Value()
-		if noOpt && r.Type == TypeOPT {
-			continue
-		}
-		newMsg.Additionals.Add(r.Copy())
-	}
-	return newMsg
 }
 
 var msgPool = sync.Pool{New: func() any { return new(Msg) }}
@@ -175,25 +141,23 @@ func NewMsg() *Msg {
 }
 
 func ReleaseMsg(m *Msg) {
-	for {
-		q := m.Questions.Head()
-		if q == nil {
-			break
-		}
-		m.Questions.Remove(q)
+	m.Header = Header{}
+
+	for _, q := range m.Questions {
 		ReleaseQuestion(q)
 	}
-	for _, list := range [...]*List[*Resource]{&m.Answers, &m.Authorities, &m.Additionals} {
-		for {
-			r := list.Head()
-			if r == nil {
-				break
-			}
-			list.Remove(r)
-			ReleaseRR(r)
+	clear(m.Questions)
+	m.Questions = m.Questions[:0]
+
+	for _, rs := range [...][]Resource{m.Answers, m.Authorities, m.Additionals} {
+		for _, r := range rs {
+			ReleaseResource(r)
 		}
+		clear(rs)
 	}
-	m.Header = Header{}
+	m.Answers = m.Answers[:0]
+	m.Authorities = m.Authorities[:0]
+	m.Additionals = m.Additionals[:0]
 	msgPool.Put(m)
 }
 
@@ -220,36 +184,36 @@ func (m *Msg) Unpack(msg []byte) error {
 		var q *Question
 		q, off, err = unpackQuestion(msg, off)
 		if err != nil {
-			return newSectionErr("question", err)
+			return newSectionErr("questions", err)
 		}
-		m.Questions.Add(q)
+		m.Questions = append(m.Questions, q)
 	}
 
 	for i := 0; i < int(h.answers); i++ {
-		var r *Resource
-		r, off, err = unpackRawResource(msg, off)
+		var r Resource
+		r, off, err = unpackResource(msg, off)
 		if err != nil {
 			return newSectionErr("answers", err)
 		}
-		m.Answers.Add(r)
+		m.Answers = append(m.Answers, r)
 	}
 
 	for i := 0; i < int(h.authorities); i++ {
-		var r *Resource
-		r, off, err = unpackRawResource(msg, off)
+		var r Resource
+		r, off, err = unpackResource(msg, off)
 		if err != nil {
 			return newSectionErr("authorities", err)
 		}
-		m.Authorities.Add(r)
+		m.Authorities = append(m.Authorities, r)
 	}
 
 	for i := 0; i < int(h.additionals); i++ {
-		var r *Resource
-		r, off, err = unpackRawResource(msg, off)
+		var r Resource
+		r, off, err = unpackResource(msg, off)
 		if err != nil {
 			return newSectionErr("additionals", err)
 		}
-		m.Additionals.Add(r)
+		m.Additionals = append(m.Additionals, r)
 	}
 	return nil
 }
@@ -260,7 +224,7 @@ var compressMapPool = sync.Pool{
 	},
 }
 
-func getCompressionMap() map[string]uint16 {
+func newCompressionMap() map[string]uint16 {
 	return compressMapPool.Get().(map[string]uint16)
 }
 
@@ -269,34 +233,37 @@ func releaseCompressionMap(m map[string]uint16) {
 	compressMapPool.Put(m)
 }
 
-type MsgSection uint8
-
-const (
-	SectionAnswer MsgSection = iota
-	SectionAuthority
-	SectionAdditional
-)
-
-type PackFilter func(sec MsgSection, rr *Resource) bool
-
-func (m *Msg) Pack(b []byte, compression bool, size int) (int, error) {
-	return m.PackFilter(b, compression, size, nil)
-}
-
 // Pack m into b. Returns the msg size.
 // compression == true will only compress rr header.
 // Size is the msg size limit. Upon reach the limit, no rr will be
 // packed and the msg will be "Truncated". Minimum is 512. 0 means no limit.
-// If ignoreRr returns true, this rr will be ignored during packing.
 // The size of b should be m.Len(). If b is not big enough, an error will be returned.
 // Without compression, the msg will have the size of m.Len().
 // TODO: Calculate compressed length?
-func (m *Msg) PackFilter(
-	b []byte,
-	compression bool,
-	size int,
-	ignoreRr func(sec MsgSection, rr *Resource) bool,
-) (int, error) {
+func (m *Msg) Pack(b []byte, compression bool, size int) (int, error) {
+	// Validate the lengths. It is very unlikely that anyone will try to
+	// pack more than 65535 of any particular type, but it is possible and
+	// we should fail gracefully.
+	if len(m.Questions) > int(^uint16(0)) {
+		return 0, errTooManyQuestions
+	}
+	if len(m.Answers) > int(^uint16(0)) {
+		return 0, errTooManyAnswers
+	}
+	if len(m.Authorities) > int(^uint16(0)) {
+		return 0, errTooManyAuthorities
+	}
+	if len(m.Additionals) > int(^uint16(0)) {
+		return 0, errTooManyAdditionals
+	}
+
+	var h header
+	h.id, h.bits = m.Header.pack()
+	h.questions = uint16(len(m.Questions))
+	h.answers = uint16(len(m.Answers))
+	h.authorities = uint16(len(m.Authorities))
+	h.additionals = uint16(len(m.Additionals))
+
 	if size > 0 && size < 512 {
 		size = 512
 	}
@@ -307,34 +274,21 @@ func (m *Msg) PackFilter(
 		return 0, newSectionErr("header", ErrSmallBuffer)
 	}
 
-	var edns0Opt *Resource
+	var edns0Opt Resource
 	if size > 0 {
-		edns0Opt = m.popEdns0()
+		edns0Opt = PopEDNS0(m)
 		if edns0Opt != nil {
-			size -= edns0Opt.len()
+			size -= edns0Opt.packLen()
 		}
 	}
 
-	// Validate the lengths. It is very unlikely that anyone will try to
-	// pack more than 65535 of any particular type, but it is possible and
-	// we should fail gracefully.
-	var (
-		questions   int
-		answers     int
-		authorities int
-		additionals int
-	)
-	if edns0Opt != nil {
-		additionals++
-	}
 	var compressionMap map[string]uint16
 	if compression {
-		compressionMap = getCompressionMap()
+		compressionMap = newCompressionMap()
 		defer releaseCompressionMap(compressionMap)
 	}
-	for iter := m.Questions.Iter(); iter.Next(); {
-		q := iter.Value()
-		if size > 0 && off+q.len() > size {
+	for _, q := range m.Questions {
+		if size > 0 && off+q.Len() > size {
 			msgHdr.Truncated = true
 			continue
 		}
@@ -342,18 +296,10 @@ func (m *Msg) PackFilter(
 		if off, err = q.pack(b, off, compressionMap); err != nil {
 			return off, newSectionErr("question", err)
 		}
-		questions++
-		if questions > 65535 {
-			return off, errTooManyQuestions
-		}
 	}
 
-	for iter := m.Answers.Iter(); iter.Next(); {
-		r := iter.Value()
-		if ignoreRr != nil && ignoreRr(SectionAnswer, r) {
-			continue
-		}
-		if size > 0 && off+r.len() > size {
+	for _, r := range m.Answers {
+		if size > 0 && off+r.packLen() > size {
 			msgHdr.Truncated = true
 			continue
 		}
@@ -361,17 +307,9 @@ func (m *Msg) PackFilter(
 		if off, err = r.pack(b, off, compressionMap); err != nil {
 			return off, newSectionErr("answer", err)
 		}
-		answers++
-		if answers > 65535 {
-			return off, errTooManyAnswers
-		}
 	}
-	for iter := m.Authorities.Iter(); iter.Next(); {
-		r := iter.Value()
-		if ignoreRr != nil && ignoreRr(SectionAuthority, r) {
-			continue
-		}
-		if size > 0 && off+r.len() > size {
+	for _, r := range m.Authorities {
+		if size > 0 && off+r.packLen() > size {
 			msgHdr.Truncated = true
 			continue
 		}
@@ -379,17 +317,9 @@ func (m *Msg) PackFilter(
 		if off, err = r.pack(b, off, compressionMap); err != nil {
 			return off, newSectionErr("authority", err)
 		}
-		authorities++
-		if authorities > 65535 {
-			return off, errTooManyAuthorities
-		}
 	}
-	for iter := m.Additionals.Iter(); iter.Next(); {
-		r := iter.Value()
-		if ignoreRr != nil && ignoreRr(SectionAdditional, r) {
-			continue
-		}
-		if size > 0 && off+r.len() > size {
+	for _, r := range m.Additionals {
+		if size > 0 && off+r.packLen() > size {
 			msgHdr.Truncated = true
 			continue
 		}
@@ -397,40 +327,36 @@ func (m *Msg) PackFilter(
 		if off, err = r.pack(b, off, compressionMap); err != nil {
 			return off, newSectionErr("additional", err)
 		}
-		additionals++
-		if additionals > 65535 {
-			return off, errTooManyAdditionals
-		}
 	}
 
 	if edns0Opt != nil {
-		ignoreOpt := ignoreRr != nil && ignoreRr(SectionAdditional, edns0Opt)
-		if !ignoreOpt {
-			m.Additionals.Add(edns0Opt)
-			var err error
-			if off, err = edns0Opt.pack(b, off, compressionMap); err != nil {
-				return off, newSectionErr("additional", err)
-			}
+		m.Additionals = append(m.Additionals, edns0Opt)
+		var err error
+		if off, err = edns0Opt.pack(b, off, compressionMap); err != nil {
+			return off, newSectionErr("additional", err)
 		}
 	}
 
-	var h header
-	h.id, h.bits = msgHdr.pack()
-	h.questions = uint16(questions)
-	h.answers = uint16(answers)
-	h.authorities = uint16(authorities)
-	h.additionals = uint16(additionals)
 	h.pack(b[:12])
 	return off, nil
 }
 
-func (m *Msg) popEdns0() *Resource {
-	for iter := m.Additionals.ReverseIter(); iter.Next(); {
-		r := iter.Value()
-		if r.Type == TypeOPT {
-			m.Additionals.Remove(r)
+func PopEDNS0(m *Msg) Resource {
+	end := len(m.Additionals) - 1
+	for i := end; i >= 0; i-- {
+		r := m.Additionals[i]
+		if r.Hdr().Type == TypeOPT {
+			m.Additionals[i] = m.Additionals[end]
+			m.Additionals[end] = nil
+			m.Additionals = m.Additionals[:end]
 			return r
 		}
 	}
 	return nil
+}
+
+func RemoveEDNS0(m *Msg) {
+	if rr := PopEDNS0(m); rr != nil {
+		ReleaseResource(rr)
+	}
 }

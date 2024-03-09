@@ -6,7 +6,6 @@ import (
 	"os"
 
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
-	"go.uber.org/zap"
 )
 
 func (r *router) loadDomainSet(cfg *DomainSetConfig) error {
@@ -28,9 +27,9 @@ func (r *router) loadDomainSet(cfg *DomainSetConfig) error {
 		if err != nil {
 			return fmt.Errorf("failed to load data, %w", err)
 		}
-		r.logger.Info("domain file loaded", zap.String("tag", cfg.Tag), zap.String("file", fp))
+		r.logger.Info().Str("tag", cfg.Tag).Str("file", fp).Msg("domain file loaded")
 	}
-	r.logger.Info("domain set loaded", zap.String("tag", cfg.Tag), zap.Int("len", m.Len()))
+	r.logger.Info().Str("tag", cfg.Tag).Int("rules", m.Len()).Msg("domain set loaded")
 	r.domainSets[cfg.Tag] = m
 	return nil
 }

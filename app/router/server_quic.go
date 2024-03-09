@@ -12,7 +12,7 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/IrineSistiana/mosproxy/internal/utils"
 	"github.com/quic-go/quic-go"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -49,15 +49,15 @@ func (r *router) startQuicServer(cfg *ServerConfig) error {
 		return fmt.Errorf("failed to listen socket, %w", err)
 	}
 
-	srk, _, err := utils.InitQUICSrkFromIfaceMac()
-	if err != nil {
-		r.logger.Warn("failed to init quic stateless reset key, it will be disabled", zap.Error(err))
+	qt := &quic.Transport{
+		Conn: uc,
 	}
 
-	qt := &quic.Transport{
-		Conn:              uc,
-		StatelessResetKey: (*quic.StatelessResetKey)(srk),
+	srk, _, err := utils.InitQUICSrkFromIfaceMac()
+	if err == nil {
+		qt.StatelessResetKey = (*quic.StatelessResetKey)(&srk)
 	}
+
 	l, err := qt.Listen(tlsConfig, quicConfig)
 	if err != nil {
 		qt.Close()
@@ -68,9 +68,11 @@ func (r *router) startQuicServer(cfg *ServerConfig) error {
 		r:           r,
 		l:           l,
 		idleTimeout: idleTimeout,
-		logger:      r.logger.Named("server_quic").With(zap.Stringer("server_addr", l.Addr())),
+		logger:      r.subLoggerForServer("server_quic", cfg.Tag),
 	}
-	s.logger.Info("quic server started")
+	s.logger.Info().
+		Stringer("addr", l.Addr()).
+		Msg("quic server started")
 	go func() {
 		defer l.Close()
 		s.run()
@@ -82,7 +84,7 @@ type quicServer struct {
 	r           *router
 	l           *quic.Listener
 	idleTimeout time.Duration
-	logger      *zap.Logger
+	logger      *zerolog.Logger
 }
 
 func (s *quicServer) run() {
@@ -96,12 +98,14 @@ func (s *quicServer) run() {
 
 		pool.Go(func() {
 			defer c.CloseWithError(0, "")
-			s.handleConn(c)
+			debugLogServerConnAccepted(c, s.logger)
+			err := s.handleConn(c)
+			debugLogServerConnClosed(c, s.logger, err)
 		})
 	}
 }
 
-func (s *quicServer) handleConn(c quic.Connection) {
+func (s *quicServer) handleConn(c quic.Connection) error {
 	localAddr := netAddr2NetipAddr(c.LocalAddr())
 	remoteAddr := netAddr2NetipAddr(c.RemoteAddr())
 	for {
@@ -109,7 +113,7 @@ func (s *quicServer) handleConn(c quic.Connection) {
 		stream, err := c.AcceptStream(streamAcceptCtx)
 		cancelAccept()
 		if err != nil {
-			return
+			return err
 		}
 
 		// Handle stream.
@@ -130,11 +134,12 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 	stream.SetReadDeadline(time.Now().Add(quicStreamReadTimeout))
 	m, _, err := dnsutils.ReadMsgFromTCP(stream)
 	if err != nil {
-		s.logger.Check(zap.WarnLevel, "invalid quic msg").Write(
-			zap.Stringer("local", c.LocalAddr()),
-			zap.Stringer("remote", c.RemoteAddr()),
-			zap.Error(err),
-		)
+		s.logger.Warn().
+			Stringer("local", c.LocalAddr()).
+			Stringer("remote", c.RemoteAddr()).
+			Err(err).
+			Msg("invalid query msg")
+		return
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
@@ -147,15 +152,17 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 
 	respBuf, err := packRespTCP(rc.Response.Msg, true)
 	if err != nil {
-		s.logger.Error(logPackRespErr, zap.Error(err))
+		s.logger.Error().
+			Err(err).
+			Msg(logPackRespErr)
 		return
 	}
 	defer pool.ReleaseBuf(respBuf)
-	if _, err := stream.Write(respBuf.B()); err != nil {
-		s.logger.Check(zap.WarnLevel, "failed to write quic response").Write(
-			zap.Stringer("local", c.LocalAddr()),
-			zap.Stringer("remote", c.RemoteAddr()),
-			zap.Error(err),
-		)
+	if _, err := stream.Write(respBuf); err != nil {
+		s.logger.Warn().
+			Stringer("local", c.LocalAddr()).
+			Stringer("remote", c.RemoteAddr()).
+			Err(err).
+			Msg("failed to write response")
 	}
 }

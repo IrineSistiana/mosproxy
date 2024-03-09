@@ -1,167 +1,489 @@
 package dnsmsg
 
 import (
-	"encoding/binary"
-	"sync"
-
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 )
 
-type Resource struct {
-	noCopy
-	linkNode
-
-	Name  *pool.Buffer
-	Type  Type
-	Class Class
-	TTL   uint32
-	Data  *pool.Buffer
+type Resource interface {
+	Hdr() *ResourceHdr
+	packLen() int
+	pack(msg []byte, off int, compression map[string]uint16) (int, error)
+	unpack(msg []byte, off int, hdr ResourceHdr) (int, error)
 }
 
-// no compression len
-func (rr *Resource) len() int {
-	l := 0
-	l += nameLen(rr.Name)
-	l += 10 // type, class, ttl (uint32), length
-	dataLen := rr.Data.Len()
-	if dataLen > 65535 {
-		dataLen = 65535 // let the pack/unpack fail
-	}
-	l += rr.Data.Len()
-	return l
+type ResourceHdr struct {
+	Name   Name
+	Type   Type
+	Class  Class
+	TTL    uint32
+	Length uint16 // When unpacking is field is ignored.
 }
 
-func (rr *Resource) Copy() *Resource {
-	n := GetRR()
-	n.Name = copyBufP(rr.Name)
-	n.Type = rr.Type
-	n.Class = rr.Class
-	n.TTL = rr.TTL
-	n.Data = copyBufP(rr.Data)
-	return n
+func (h *ResourceHdr) packLen() int {
+	return h.Name.PackLen() + 10 // type, class, ttl (uint32), length
 }
 
-func unpackRawResource(msg []byte, off int) (*Resource, int, error) {
-	name, off, err := unpackName(msg, off)
+func (h *ResourceHdr) unpack(msg []byte, off int) (int, error) {
+	var err error
+	h.Name, off, err = unpackName(msg, off)
 	if err != nil {
-		return nil, 0, newSectionErr("name", err)
+		return 0, newSectionErr("name", err)
 	}
 	typ, off, err := unpackUint16Msg(msg, off)
 	if err != nil {
-		return nil, 0, newSectionErr("type", err)
+		return 0, newSectionErr("type", err)
 	}
+	h.Type = Type(typ)
 	cls, off, err := unpackUint16Msg(msg, off)
 	if err != nil {
-		return nil, 0, newSectionErr("class", err)
+		return 0, newSectionErr("class", err)
 	}
+	h.Class = Class(cls)
 	ttl, off, err := unpackUint32Msg(msg, off)
 	if err != nil {
-		return nil, 0, newSectionErr("ttl", err)
+		return 0, newSectionErr("ttl", err)
 	}
+	h.TTL = ttl
 	dataLen, off, err := unpackUint16Msg(msg, off)
 	if err != nil {
-		return nil, 0, newSectionErr("length", err)
+		return 0, newSectionErr("length", err)
 	}
-	dataBound := off + int(dataLen)
-	if dataBound > len(msg) {
-		return nil, 0, newSectionErr("data_length", ErrSmallBuffer)
+	h.Length = dataLen
+	return off, err
+}
+
+func (h *ResourceHdr) pack(msg []byte, off int, compression map[string]uint16, dataLen uint16) (int, error) {
+	off, err := h.Name.pack(msg, off, compression)
+	if err != nil {
+		return off, newSectionErr("name", err)
+	}
+	off, err = packUint16(msg, off, uint16(h.Type))
+	if err != nil {
+		return off, newSectionErr("type", err)
+	}
+	off, err = packUint16(msg, off, uint16(h.Class))
+	if err != nil {
+		return off, newSectionErr("class", err)
+	}
+	off, err = packUint32(msg, off, h.TTL)
+	if err != nil {
+		return off, newSectionErr("ttl", err)
 	}
 
-	var data *pool.Buffer
-	switch typ {
-	case uint16(TypeCNAME), uint16(TypePTR), uint16(TypeNS):
-		data, off, err = decompressName(msg[:dataBound], off)
-		if err != nil {
-			return nil, 0, newSectionErr("data_name", err)
-		}
-	case uint16(TypeMX):
-		data, off, err = unpackMX(msg[:dataBound], off)
-		if err != nil {
-			return nil, 0, newSectionErr("data_mx", err)
-		}
-	case uint16(TypeSOA):
-		data, off, err = unpackSOA(msg[:dataBound], off)
-		if err != nil {
-			return nil, 0, newSectionErr("data_soa", err)
-		}
+	// h.Length may be invalid in most packing calls.
+	off, err = packUint16(msg, off, dataLen)
+	if err != nil {
+		return off, newSectionErr("length", err)
+	}
+	return off, nil
+}
+
+type A struct {
+	ResourceHdr
+	A [4]byte
+}
+
+var _ Resource = (*A)(nil)
+
+func (r *A) Hdr() *ResourceHdr {
+	return &r.ResourceHdr
+}
+
+func (r *A) packLen() int {
+	return r.ResourceHdr.packLen() + 4
+}
+
+func (r *A) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
+	off, err := r.ResourceHdr.pack(msg, off, compression, 4)
+	if err != nil {
+		return off, err
+	}
+	off, err = packBytes(msg, off, r.A[:])
+	if err != nil {
+		return off, newSectionErr("a", err)
+	}
+	return off, nil
+}
+
+func (r *A) unpack(msg []byte, off int, hdr ResourceHdr) (int, error) {
+	r.ResourceHdr = hdr
+	if r.ResourceHdr.Length != 4 {
+		return off, errInvalidResourceBodyLen
+	}
+	return unpackBytesMsg(msg, off, r.A[:])
+}
+
+type AAAA struct {
+	ResourceHdr
+	AAAA [16]byte
+}
+
+var _ Resource = (*AAAA)(nil)
+
+func (r *AAAA) Hdr() *ResourceHdr {
+	return &r.ResourceHdr
+}
+
+func (r *AAAA) packLen() int {
+	return r.ResourceHdr.packLen() + 16
+}
+
+func (r *AAAA) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
+	off, err := r.ResourceHdr.pack(msg, off, compression, 16)
+	if err != nil {
+		return off, err
+	}
+	off, err = packBytes(msg, off, r.AAAA[:])
+	if err != nil {
+		return off, newSectionErr("aaaa", err)
+	}
+	return off, nil
+}
+
+func (r *AAAA) unpack(msg []byte, off int, hdr ResourceHdr) (int, error) {
+	r.ResourceHdr = hdr
+	if r.ResourceHdr.Length != 16 {
+		return off, errInvalidResourceBodyLen
+	}
+	return unpackBytesMsg(msg, off, r.AAAA[:])
+}
+
+// CNAME, NS, PTR
+type NAMEResource struct {
+	ResourceHdr
+	NameData Name
+}
+
+var _ Resource = (*NAMEResource)(nil)
+
+func (r *NAMEResource) Hdr() *ResourceHdr {
+	return &r.ResourceHdr
+}
+
+func (r *NAMEResource) packLen() int {
+	return r.ResourceHdr.packLen() + r.NameData.PackLen()
+}
+
+func (r *NAMEResource) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
+	off, err := r.ResourceHdr.pack(msg, off, compression, 0)
+	if err != nil {
+		return off, err
+	}
+	dataLenPlaceholder := msg[off-2 : off]
+
+	dataStartOff := off
+	off, err = r.NameData.pack(msg, off, compression)
+	if err != nil {
+		return off, newSectionErr("data", err)
+	}
+	putUint16(dataLenPlaceholder, uint16(off)-uint16(dataStartOff))
+	return off, nil
+}
+
+func (r *NAMEResource) unpack(msg []byte, off int, hdr ResourceHdr) (int, error) {
+	oldOff := off
+	r.ResourceHdr = hdr
+	name, off, err := unpackName(msg, off)
+	if err != nil {
+		return off, newSectionErr("data", err)
+	}
+	r.NameData = name
+
+	if off-oldOff != int(r.Length) {
+		return off, errInvalidResourceBodyLen
+	}
+	return off, nil
+}
+
+type SOA struct {
+	ResourceHdr
+	NS      Name
+	MBox    Name
+	Serial  uint32
+	Refresh uint32
+	Retry   uint32
+	Expire  uint32
+	MinTTL  uint32
+}
+
+var _ Resource = (*SOA)(nil)
+
+func (r *SOA) Hdr() *ResourceHdr {
+	return &r.ResourceHdr
+}
+
+func (r *SOA) packLen() int {
+	return r.ResourceHdr.packLen() + r.NS.PackLen() + r.MBox.PackLen() + 20
+}
+
+func (r *SOA) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
+	off, err := r.ResourceHdr.pack(msg, off, compression, 0)
+	if err != nil {
+		return off, err
+	}
+	dataLenPlaceholder := msg[off-2 : off]
+
+	dataStartOff := off
+	off, err = r.NS.pack(msg, off, compression)
+	if err != nil {
+		return 0, newSectionErr("ns", err)
+	}
+	off, err = r.MBox.pack(msg, off, compression)
+	if err != nil {
+		return 0, newSectionErr("mbox", err)
+	}
+	off, err = packUint32(msg, off, r.Serial)
+	if err != nil {
+		return 0, newSectionErr("serial", err)
+	}
+	off, err = packUint32(msg, off, r.Refresh)
+	if err != nil {
+		return 0, newSectionErr("refresh", err)
+	}
+	off, err = packUint32(msg, off, r.Retry)
+	if err != nil {
+		return 0, newSectionErr("retry", err)
+	}
+	off, err = packUint32(msg, off, r.Expire)
+	if err != nil {
+		return 0, newSectionErr("expire", err)
+	}
+	off, err = packUint32(msg, off, r.MinTTL)
+	if err != nil {
+		return 0, newSectionErr("minttl", err)
+	}
+	putUint16(dataLenPlaceholder, uint16(off)-uint16(dataStartOff))
+	return off, nil
+}
+
+func (r *SOA) unpack(msg []byte, off int, hdr ResourceHdr) (int, error) {
+	r.ResourceHdr = hdr
+	dataStartOff := off
+
+	var err error
+	r.NS, off, err = unpackName(msg, off)
+	if err != nil {
+		return 0, newSectionErr("ns", err)
+	}
+	r.MBox, off, err = unpackName(msg, off)
+	if err != nil {
+		return 0, newSectionErr("mbox", err)
+	}
+	r.Serial, off, err = unpackUint32Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("serial", err)
+	}
+	r.Refresh, off, err = unpackUint32Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("refresh", err)
+	}
+	r.Retry, off, err = unpackUint32Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("retry", err)
+	}
+	r.Expire, off, err = unpackUint32Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("expire", err)
+	}
+	r.MinTTL, off, err = unpackUint32Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("minttl", err)
+	}
+
+	if off-dataStartOff != int(r.Length) {
+		return off, errInvalidResourceBodyLen
+	}
+	return off, nil
+}
+
+type MX struct {
+	ResourceHdr
+	Pref uint16
+	MX   Name
+}
+
+func (r *MX) Hdr() *ResourceHdr {
+	return &r.ResourceHdr
+}
+
+func (r *MX) packLen() int {
+	return r.ResourceHdr.packLen() + 2 + r.MX.PackLen()
+}
+
+func (r *MX) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
+	off, err := r.ResourceHdr.pack(msg, off, compression, 0)
+	if err != nil {
+		return off, err
+	}
+	dataLenPlaceholder := msg[off-2 : off]
+
+	dataStartOff := off
+	off, err = packUint16(msg, off, r.Pref)
+	if err != nil {
+		return off, newSectionErr("pref", err)
+	}
+	off, err = r.MX.pack(msg, off, compression)
+	if err != nil {
+		return off, newSectionErr("mx", err)
+	}
+	putUint16(dataLenPlaceholder, uint16(off)-uint16(dataStartOff))
+	return off, nil
+}
+
+func (r *MX) unpack(msg []byte, off int, hdr ResourceHdr) (int, error) {
+	r.ResourceHdr = hdr
+	dataStartOff := off
+
+	var err error
+	r.Pref, off, err = unpackUint16Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("pref", err)
+	}
+	r.MX, off, err = unpackName(msg, off)
+	if err != nil {
+		return 0, newSectionErr("mx", err)
+	}
+	if off-dataStartOff != int(r.Length) {
+		return off, errInvalidResourceBodyLen
+	}
+	return off, nil
+}
+
+type SRV struct {
+	ResourceHdr
+	Priority uint16
+	Weight   uint16
+	Port     uint16
+	Target   Name // Not compressed as per RFC 2782.
+}
+
+func (r *SRV) Hdr() *ResourceHdr {
+	return &r.ResourceHdr
+}
+
+func (r *SRV) packLen() int {
+	return r.ResourceHdr.packLen() + 6 + r.Target.PackLen()
+}
+
+func (r *SRV) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
+	off, err := r.ResourceHdr.pack(msg, off, compression, 0)
+	if err != nil {
+		return off, err
+	}
+	dataLenPlaceholder := msg[off-2 : off]
+
+	dataStartOff := off
+	off, err = packUint16(msg, off, r.Priority)
+	if err != nil {
+		return off, newSectionErr("priority", err)
+	}
+	off, err = packUint16(msg, off, r.Weight)
+	if err != nil {
+		return off, newSectionErr("weight", err)
+	}
+	off, err = packUint16(msg, off, r.Port)
+	if err != nil {
+		return off, newSectionErr("port", err)
+	}
+	off, err = r.Target.pack(msg, off, compression)
+	if err != nil {
+		return off, newSectionErr("target", err)
+	}
+	putUint16(dataLenPlaceholder, uint16(off)-uint16(dataStartOff))
+	return off, nil
+}
+
+func (r *SRV) unpack(msg []byte, off int, hdr ResourceHdr) (int, error) {
+	r.ResourceHdr = hdr
+	dataStartOff := off
+
+	var err error
+	r.Priority, off, err = unpackUint16Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("priority", err)
+	}
+	r.Weight, off, err = unpackUint16Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("weight", err)
+	}
+	r.Port, off, err = unpackUint16Msg(msg, off)
+	if err != nil {
+		return 0, newSectionErr("port", err)
+	}
+	r.Target, off, err = unpackName(msg, off)
+	if err != nil {
+		return 0, newSectionErr("target", err)
+	}
+	if off-dataStartOff != int(r.Length) {
+		return off, errInvalidResourceBodyLen
+	}
+	return off, nil
+}
+
+type RawResource struct {
+	ResourceHdr
+	Data pool.Buffer
+}
+
+func (r *RawResource) Hdr() *ResourceHdr {
+	return &r.ResourceHdr
+}
+
+func (rr *RawResource) packLen() int {
+	l := rr.ResourceHdr.packLen()
+	dataLen := len(rr.Data)
+	if dataLen > 65535 {
+		dataLen = 65535 // let the pack/unpack fail
+	}
+	l += dataLen
+	return l
+}
+
+func (r *RawResource) unpack(msg []byte, off int, hdr ResourceHdr) (int, error) {
+	r.ResourceHdr = hdr
+	b, off, err := unpackBytesMsgToBuffer(msg, off, int(hdr.Length))
+	if err != nil {
+		return off, newSectionErr("data", err)
+	}
+	r.Data = b
+	return off, nil
+}
+
+func unpackResource(msg []byte, off int) (Resource, int, error) {
+	var hdr ResourceHdr
+	off, err := hdr.unpack(msg, off)
+	if err != nil {
+		return nil, off, err
+	}
+
+	var r Resource
+	switch hdr.Type {
+	case TypeA:
+		r = NewA()
+	case TypeAAAA:
+		r = NewAAAA()
+	case TypeMX:
+		r = NewMX()
+	case TypeCNAME, TypeNS, TypePTR:
+		r = NewNAME()
+	case TypeSOA:
+		r = NewSOA()
+	case TypeSRV:
+		r = NewSRV()
 	default:
-		data, off, err = unpackBytesMsg(msg[:dataBound], off, int(dataLen))
-		if err != nil {
-			return nil, 0, newSectionErr("data_other", err)
-		}
+		r = NewRaw()
 	}
 
-	r := GetRR()
-	r.Name = name
-	r.Type = Type(typ)
-	r.Class = Class(cls)
-	r.TTL = ttl
-	r.Data = data
+	off, err = r.unpack(msg, off, hdr)
+	if err != nil {
+		ReleaseResource(r)
+		return nil, off, err
+	}
 	return r, off, nil
 }
 
-func unpackSOA(msg []byte, off int) (*pool.Buffer, int, error) {
-	ns, off, err := decompressName(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("ns", err)
-	}
-	defer pool.ReleaseBuf(ns)
-	mBox, off, err := decompressName(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("mbox", err)
-	}
-	defer pool.ReleaseBuf(mBox)
-	serial, off, err := unpackUint32Msg(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("serial", err)
-	}
-	refresh, off, err := unpackUint32Msg(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("refresh", err)
-	}
-	retry, off, err := unpackUint32Msg(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("retry", err)
-	}
-	expire, off, err := unpackUint32Msg(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("expire", err)
-	}
-	minTTL, off, err := unpackUint32Msg(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("minttl", err)
-	}
-
-	b := pool.GetBuf(ns.Len() + mBox.Len() + 20)
-	repackOff := 0
-	repackOff += copy(b.B(), ns.B())
-	repackOff += copy(b.B()[repackOff:], mBox.B())
-	for _, v := range [...]uint32{serial, refresh, retry, expire, minTTL} {
-		binary.BigEndian.PutUint32(b.B()[repackOff:], v)
-		repackOff += 4
-	}
-	return b, off, nil
-}
-
-func unpackMX(msg []byte, off int) (*pool.Buffer, int, error) {
-	pref, off, err := unpackUint16Msg(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("pref", err)
-	}
-	mx, off, err := decompressName(msg, off)
-	if err != nil {
-		return nil, 0, newSectionErr("mx", err)
-	}
-	defer pool.ReleaseBuf(mx)
-
-	b := pool.GetBuf(2 + mx.Len())
-	putUint16(b.B()[:2], pref)
-	copy(b.B()[2:], mx.B())
-	return b, off, nil
-}
-
-func (rr *Resource) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
-	off, err := packName(rr.Name, msg, off, compression)
+func (rr *RawResource) pack(msg []byte, off int, compression map[string]uint16) (int, error) {
+	off, err := rr.Name.pack(msg, off, compression)
 	if err != nil {
 		return off, newSectionErr("name", err)
 	}
@@ -177,7 +499,7 @@ func (rr *Resource) pack(msg []byte, off int, compression map[string]uint16) (in
 	if err != nil {
 		return off, newSectionErr("ttl", err)
 	}
-	rrLen := rr.Data.Len()
+	rrLen := len(rr.Data)
 	if rrLen > 65535 {
 		return off, errResTooLong
 	}
@@ -185,26 +507,9 @@ func (rr *Resource) pack(msg []byte, off int, compression map[string]uint16) (in
 	if err != nil {
 		return off, newSectionErr("length", err)
 	}
-	off, err = packBytes(msg, off, rr.Data.B())
+	off, err = packBytes(msg, off, rr.Data)
 	if err != nil {
 		return off, newSectionErr("data", err)
 	}
 	return off, nil
-}
-
-var rrPool = sync.Pool{
-	New: func() any {
-		return new(Resource)
-	},
-}
-
-func GetRR() *Resource {
-	return rrPool.Get().(*Resource)
-}
-
-func ReleaseRR(r *Resource) {
-	pool.ReleaseBuf(r.Name)
-	pool.ReleaseBuf(r.Data)
-	*r = Resource{}
-	rrPool.Put(r)
 }

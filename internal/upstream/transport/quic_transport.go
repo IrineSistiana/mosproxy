@@ -11,7 +11,7 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/quic-go/quic-go"
-	"go.uber.org/zap"
+	"github.com/rs/zerolog"
 )
 
 const (
@@ -24,11 +24,10 @@ const (
 var _ Transport = (*QuicTransport)(nil)
 
 type QuicTransport struct {
-	ctx         context.Context
-	cancelCtx   context.CancelCauseFunc
-	dial        func(ctx context.Context) (quic.Connection, error)
-	dialTimeout time.Duration
-	logger      *zap.Logger
+	opts      QuicTransportOpts
+	ctx       context.Context
+	cancelCtx context.CancelCauseFunc
+	logger    *zerolog.Logger
 
 	m           sync.Mutex
 	closed      bool
@@ -44,19 +43,22 @@ type QuicTransportOpts struct {
 	// DialTimeout specifies the timeout for DialFunc.
 	// Default is defaultDialTimeout.
 	DialTimeout time.Duration
-	Logger      *zap.Logger
+	Logger      *zerolog.Logger
 }
 
-func NewQuicTransport(opt QuicTransportOpts) *QuicTransport {
+func NewQuicTransport(opts QuicTransportOpts) *QuicTransport {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	t := &QuicTransport{
+		opts:      opts,
 		ctx:       ctx,
 		cancelCtx: cancel,
+		logger:    nonNilLogger(opts.Logger),
 	}
-	t.dial = opt.DialContext
-	setDefaultGZ(&t.dialTimeout, opt.DialTimeout, defaultDialTimeout)
-	setNonNilLogger(&t.logger, opt.Logger)
 	return t
+}
+
+func (t *QuicTransport) dialTimeout() time.Duration {
+	return defaultIfLeZero(t.opts.DialTimeout, defaultDialTimeout)
 }
 
 func (t *QuicTransport) Close() error {
@@ -89,10 +91,10 @@ func (t *QuicTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.
 	//    be set to 0.  The stream mapping for DoQ allows for unambiguous
 	//    correlation of queries and responses, so the Message ID field is not
 	//    required.
-	orgQid := binary.BigEndian.Uint16(payload.B()[2:])
-	binary.BigEndian.PutUint16(payload.B()[2:], 0)
+	orgQid := binary.BigEndian.Uint16(payload[2:])
+	binary.BigEndian.PutUint16(payload[2:], 0)
 
-	resp, err := t.exchangePayload(ctx, payload.B())
+	resp, err := t.exchangePayload(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -101,50 +103,21 @@ func (t *QuicTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.
 }
 
 func (t *QuicTransport) exchangePayload(ctx context.Context, payload []byte) (*dnsmsg.Msg, error) {
-	start := time.Now()
 	retry := 0
 	for {
-		c, call, closed := t.getConn()
-		if closed {
-			return nil, ErrClosedTransport
-		}
-		if c != nil {
-			b, err := t.exchangeConn(ctx, payload, c)
-			if err != nil {
-				if retry < 3 && time.Since(start) < time.Second && !ctxIsDone(ctx) {
-					retry++
-					continue
-				}
-			}
-			return b, err
-		}
-		return t.exchangeDialingCall(ctx, payload, call)
-	}
-
-}
-
-type ErrNoAvailableQuicConn struct {
-	cause error
-}
-
-func (e *ErrNoAvailableQuicConn) Error() string {
-	return fmt.Sprintf("failed to get available quic conn, %s", e.cause)
-}
-
-func (e *ErrNoAvailableQuicConn) Unwrap() error {
-	return e.cause
-}
-
-func (t *QuicTransport) exchangeDialingCall(ctx context.Context, payload []byte, call *dialingQuicCall) (*dnsmsg.Msg, error) {
-	select {
-	case <-ctx.Done():
-		return nil, &ErrNoAvailableQuicConn{cause: context.Cause(ctx)}
-	case <-call.done:
-		c, err := call.c, call.err
+		c, newConn, err := t.getConn(ctx)
 		if err != nil {
-			return nil, &ErrNoAvailableQuicConn{cause: err}
+			return nil, err
 		}
-		return t.exchangeConn(ctx, payload, c)
+
+		b, err := t.exchangeConn(ctx, payload, c)
+		if err != nil {
+			if !newConn && retry < 5 && !ctxIsDone(ctx) {
+				retry++
+				continue
+			}
+		}
+		return b, err
 	}
 }
 
@@ -198,34 +171,40 @@ func (t *QuicTransport) exchangeStream(ctx context.Context, payload []byte, stre
 	}
 }
 
-func (t *QuicTransport) getConn() (_ quic.Connection, _ *dialingQuicCall, closed bool) {
+func (t *QuicTransport) getConn(ctx context.Context) (_ quic.Connection, newConn bool, _ error) {
 	t.m.Lock()
 	if t.closed {
 		t.m.Unlock()
-		return nil, nil, true
+		return nil, false, ErrClosedTransport
 	}
 
 	if t.c != nil {
-		t.m.Unlock()
-		return t.c, nil, false
+		if !ctxIsDone(t.c.Context()) {
+			t.m.Unlock()
+			return t.c, false, nil
+		}
+		// dead conn
+		t.c = nil
 	}
-	if t.dialingCall != nil {
+	if dc := t.dialingCall; dc != nil {
 		t.m.Unlock()
-		return nil, t.dialingCall, false
+		c, err := dc.wait(ctx)
+		return c, true, err
 	}
 
-	call := &dialingQuicCall{
+	dc := &dialingQuicCall{
 		done: make(chan struct{}),
 	}
-	t.dialingCall = call
+	t.dialingCall = dc
 	t.m.Unlock()
-	go t.runDialingCall(call)
-	return nil, call, false
+	go t.runDialingCall(dc)
+	c, err := dc.wait(ctx)
+	return c, true, err
 }
 
 func (t *QuicTransport) runDialingCall(call *dialingQuicCall) {
-	ctx, cancel := context.WithTimeout(t.ctx, t.dialTimeout)
-	c, err := t.dial(ctx)
+	ctx, cancel := context.WithTimeout(t.ctx, t.dialTimeout())
+	c, err := t.opts.DialContext(ctx)
 	cancel()
 
 	t.m.Lock()
@@ -240,32 +219,31 @@ func (t *QuicTransport) runDialingCall(call *dialingQuicCall) {
 	t.c = c
 	t.m.Unlock()
 
-	if err != nil {
-		t.logger.Check(zap.WarnLevel, "failed to dial quic conn").Write(zap.Error(err))
-	}
-	if c != nil {
-		debugLogTransportNewConn(c, t.logger)
-	}
 	call.c, call.err = c, err
 	close(call.done)
 
-	if c != nil {
-		connCtx := c.Context()
-		select {
-		case <-t.ctx.Done():
-		case <-connCtx.Done():
-			t.m.Lock()
-			t.c = nil
-			t.m.Unlock()
-			c.CloseWithError(quic.ApplicationErrorCode(_DOQ_NO_ERROR), "")
-			cause := context.Cause(connCtx)
-			debugLogTransportConnClosed(c, t.logger, cause)
-		}
+	if err != nil {
+		t.logger.Warn().
+			Err(err).
+			Msg("failed to dial conn")
 	}
+	if c != nil {
+		debugLogTransportConnOpen(c, t.logger)
+	}
+
 }
 
 type dialingQuicCall struct {
 	done chan struct{}
 	c    quic.Connection
 	err  error
+}
+
+func (call *dialingQuicCall) wait(ctx context.Context) (quic.Connection, error) {
+	select {
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
+	case <-call.done:
+		return call.c, call.err
+	}
 }
