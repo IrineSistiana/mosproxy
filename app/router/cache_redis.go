@@ -40,6 +40,7 @@ type redisSetOp struct {
 	k     pool.Buffer
 	v     pool.Buffer
 	ttlMs int64
+	nx    bool
 }
 
 func newRedisCache(u string, logger *zerolog.Logger) (*redisCache, error) {
@@ -107,17 +108,6 @@ func (c *redisCache) Close() error {
 	return nil
 }
 
-func (c *redisCache) buildKey(q *dnsmsg.Question, marker string) pool.Buffer {
-	b := pool.GetBuf(q.Name.PackLen() + 4 + len(marker))
-	off := copy(b, pool.Buffer(q.Name))
-	binary.BigEndian.PutUint16(b[off:], uint16(q.Class))
-	off += 2
-	binary.BigEndian.PutUint16(b[off:], uint16(q.Type))
-	off += 2
-	copy(b[off:], []byte(marker))
-	return b
-}
-
 func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) pool.Buffer {
 	b := pool.GetBuf(16 + len(v))
 	binary.BigEndian.PutUint64(b, uint64(storedTime.Unix()))
@@ -128,19 +118,13 @@ func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) pool
 
 // Get dose not return error.
 // All errors (of broking/invalid stored data, connection lost) will be logged.
-func (c *redisCache) Get(ctx context.Context,
-	q *dnsmsg.Question,
-	mark string) (storedTime, expireTime time.Time,
-	resp *dnsmsg.Msg, v []byte) {
-
+func (c *redisCache) Get(ctx context.Context, k []byte) (storedTime, expireTime time.Time, resp *dnsmsg.Msg, v []byte) {
 	if !c.connected.Load() {
 		return
 	}
 
-	key := c.buildKey(q, mark)
-	defer pool.ReleaseBuf(key)
 	start := time.Now()
-	cmd := c.client.B().Get().Key(rueidis.BinaryString(key)).Build()
+	cmd := c.client.B().Get().Key(rueidis.BinaryString(k)).Build()
 	res := c.client.Do(ctx, cmd)
 	b, err := res.AsBytes()
 	if err != nil {
@@ -161,21 +145,19 @@ func (c *redisCache) Get(ctx context.Context,
 	}
 	storedTime = time.Unix(int64(binary.BigEndian.Uint64(b[:8])), 0)
 	expireTime = time.Unix(int64(binary.BigEndian.Uint64(b[8:16])), 0)
-	v = b[16:]
-
-	resp, err = unpackCacheMsg(v)
+	resp, err = unpackCacheMsg(b[16:])
 	if err != nil {
 		c.logger.Error().Err(err).Msg("invalid cache data, failed to unpack")
-		return
+		return time.Time{}, time.Time{}, nil, nil
 	}
-
+	v = b[16:]
 	c.getTotal.Inc()
 	c.hitTotal.Inc()
 	c.getLatency.Observe(float64(time.Since(start).Milliseconds()))
 	return
 }
 
-func (c *redisCache) AsyncStore(q *dnsmsg.Question, mark string, storedTime, expireTime time.Time, v []byte) {
+func (c *redisCache) AsyncStore(k []byte, storedTime, expireTime time.Time, v []byte, setNX bool) {
 	if !c.connected.Load() {
 		return
 	}
@@ -185,10 +167,10 @@ func (c *redisCache) AsyncStore(q *dnsmsg.Question, mark string, storedTime, exp
 		return
 	}
 
-	key := c.buildKey(q, mark)
+	key := copyBuf(k)
 	value := c.buildValue(storedTime, expireTime, v)
 	select {
-	case c.setOpChan <- redisSetOp{k: key, v: value, ttlMs: ttlMs}:
+	case c.setOpChan <- redisSetOp{k: key, v: value, ttlMs: ttlMs, nx: setNX}:
 	default:
 		pool.ReleaseBuf(key)
 		pool.ReleaseBuf(value)
@@ -235,7 +217,14 @@ func (c *redisCache) setLoop() {
 			return
 		case op := <-c.setOpChan:
 			start := time.Now()
-			cmd := c.client.B().Set().Key(rueidis.BinaryString(op.k)).Value(rueidis.BinaryString(op.v)).PxMilliseconds(op.ttlMs).Build()
+
+			var cmd rueidis.Completed
+			if op.nx {
+				cmd = c.client.B().Set().Key(rueidis.BinaryString(op.k)).Value(rueidis.BinaryString(op.v)).Nx().PxMilliseconds(op.ttlMs).Build()
+			} else {
+				cmd = c.client.B().Set().Key(rueidis.BinaryString(op.k)).Value(rueidis.BinaryString(op.v)).PxMilliseconds(op.ttlMs).Build()
+			}
+
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 			err := c.client.Do(ctx, cmd).Error()
 			cancel()

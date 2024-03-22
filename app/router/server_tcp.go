@@ -76,10 +76,10 @@ func (s *tcpServer) run() {
 			r.fatal("tcp server exited", err)
 			return
 		}
-		pool.Go(func() {
+		go func() {
 			defer c.Close()
 			s.handleConn(c)
-		})
+		}()
 	}
 }
 
@@ -125,11 +125,11 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		}
 
 		concurrent <- struct{}{}
-		pool.Go(func() {
+		go func() {
 			defer func() { <-concurrent }()
 			s.handleReq(c, m)
 			dnsmsg.ReleaseMsg(m)
-		})
+		}()
 	}
 }
 

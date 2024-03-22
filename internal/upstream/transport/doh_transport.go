@@ -100,7 +100,7 @@ func (u *DoHTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.M
 		err error
 	}
 	resChan := make(chan res, 1)
-	pool.Go(func() {
+	go func() {
 		// We overwrite the ctx with a fixed timeout context here.
 		// Because the http package may close the underlay connection
 		// if the context is done before the query is completed. This
@@ -112,7 +112,7 @@ func (u *DoHTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.M
 			u.logger.Warn().Err(err).Msg("query failed")
 		}
 		resChan <- res{r: r, err: err}
-	})
+	}()
 
 	select {
 	case <-ctx.Done():

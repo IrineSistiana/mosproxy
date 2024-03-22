@@ -135,7 +135,7 @@ func (t *QuicTransport) exchangeStream(ctx context.Context, payload []byte, stre
 		err  error
 	}
 	rc := make(chan res, 1)
-	pool.Go(func() {
+	go func() {
 		_, err = stream.Write(payload)
 		if err != nil {
 			stream.CancelRead(_DOQ_REQUEST_CANCELLED)
@@ -154,7 +154,7 @@ func (t *QuicTransport) exchangeStream(ctx context.Context, payload []byte, stre
 		r, _, err := dnsutils.ReadMsgFromTCP(stream)
 		stream.CancelRead(_DOQ_REQUEST_CANCELLED)
 		rc <- res{resp: r, err: err}
-	})
+	}()
 
 	select {
 	case <-ctx.Done():

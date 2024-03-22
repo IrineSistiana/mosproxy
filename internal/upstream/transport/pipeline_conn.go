@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/IrineSistiana/connpool"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"github.com/IrineSistiana/mosproxy/internal/upstream/transport/connpool"
 )
 
 var (
@@ -31,11 +31,10 @@ type pipelineConn struct {
 	ctx         context.Context
 	cancelCause context.CancelCauseFunc
 
-	m        sync.RWMutex
-	closed   bool
-	qid      int
-	reserved int
-	queue    map[uint32]chan *dnsmsg.Msg // uint32 for faster map
+	m       sync.RWMutex
+	closed  bool
+	nextQid int
+	queue   map[uint32]chan *dnsmsg.Msg // uint32 for faster map
 }
 
 func newPipelineConn(c net.Conn, t *PipelineTransport) *pipelineConn {
@@ -175,29 +174,12 @@ func (c *pipelineConn) Close() error {
 }
 
 func (c *pipelineConn) Status() (s connpool.ConnStatus) {
-	maxConcurrent := c.t.maxConcurrentQuery()
 	c.m.RLock()
 	defer c.m.RUnlock()
 
 	s.Closed = c.closed
-
-	availableConcurrent := 0
-	if maxConcurrent > len(c.queue)+c.reserved {
-		availableConcurrent = maxConcurrent - len(c.queue) - c.reserved
-	}
-	availableQid := 0
-	if 65535 > c.qid {
-		availableQid = 65535 - c.qid
-	}
-	s.AvailableReq = uint64(min(availableConcurrent, availableQid))
-	s.CurrentReq = uint64(len(c.queue))
+	s.Available = c.nextQid <= 65535
 	return s
-}
-
-func (c *pipelineConn) ReserveReq(l uint64) {
-	c.m.Lock()
-	defer c.m.Unlock()
-	c.reserved += int(l)
 }
 
 // closeWithErr closes this pipelineConn. The error will be sent
@@ -227,19 +209,16 @@ func (c *pipelineConn) getQueueC(qid uint16) chan<- *dnsmsg.Msg {
 	return c.queue[uint32(qid)]
 }
 
-// Add resp chan to queue. Returns assigned qid, or false if connection is EOL.
+// Add resp chan to queue. Returns assigned qid, or errPipelineConnEoL if connection is EOL.
 func (c *pipelineConn) addQueueC(respChan chan *dnsmsg.Msg) (uint16, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
 
-	if c.qid > 65535 {
+	if c.nextQid > 65535 {
 		return 0, errPipelineConnEoL
 	}
-	qid := uint16(c.qid)
-	c.qid++
-	if c.reserved > 0 {
-		c.reserved--
-	}
+	qid := uint16(c.nextQid)
+	c.nextQid++
 	c.queue[uint32(qid)] = respChan
 	return qid, nil
 }
@@ -247,9 +226,9 @@ func (c *pipelineConn) addQueueC(respChan chan *dnsmsg.Msg) (uint16, error) {
 func (c *pipelineConn) deleteQueueC(qid uint16) {
 	c.m.Lock()
 	delete(c.queue, uint32(qid))
-	eol := c.qid > 65535 && len(c.queue) == 0
-
+	eol := c.nextQid > 65535 && len(c.queue) == 0
 	c.m.Unlock()
+
 	if eol {
 		c.closeWithErr(errPipelineConnEoL)
 	}

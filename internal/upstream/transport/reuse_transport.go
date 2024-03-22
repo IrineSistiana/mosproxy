@@ -117,11 +117,11 @@ func (t *ReuseConnTransport) exchangeConnCtx(ctx context.Context, payload []byte
 	}
 	resChan := make(chan res, 1)
 
-	pool.Go(func() {
+	go func() {
 		resp, err := t.exchangeConn(payload, c)
 		resChan <- res{m: resp, err: err}
 		t.releaseConn(c, err)
-	})
+	}()
 	select {
 	case r := <-resChan:
 		return r.m, r.err

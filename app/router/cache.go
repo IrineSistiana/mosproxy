@@ -3,8 +3,10 @@ package router
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"net/netip"
 	"os"
@@ -16,7 +18,6 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/netlist"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"github.com/dgraph-io/ristretto/z"
 	"github.com/klauspost/compress/s2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
@@ -176,20 +177,24 @@ func (c *cache) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg.Ms
 		Int("size", len(v)).
 		Msg("store resp")
 
+	k := cacheKey(q, mark)
+	defer pool.ReleaseBuf(k)
+	negativeResp := resp.RCode != dnsmsg.RCodeSuccess
+
 	// store in memory
 	if c.memory != nil {
-		c.memory.Store(q, mark, storedTime, expireTime, v)
+		c.memory.Store(k, storedTime, expireTime, v, negativeResp)
 	}
 
 	// store in redis
 	if c.redis != nil {
-		c.redis.AsyncStore(q, mark, storedTime, expireTime, v)
+		c.redis.AsyncStore(k, storedTime, expireTime, v, negativeResp)
 	}
 }
 
 func (c *cache) AsyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr netip.AddrPort, u *upstreamWrapper) {
 	mark := c.ipMark(remoteAddr.Addr())
-	prefetchKey := hashReq(q, mark)
+	prefetchKey := prefetchKey(q, mark)
 	c.prefetchMu.Lock()
 	_, dup := c.prefetching[prefetchKey]
 	if !dup {
@@ -198,10 +203,14 @@ func (c *cache) AsyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr netip.A
 	c.prefetchMu.Unlock()
 	if !dup {
 		q := q.Copy() // q is not concurrent save. Copy it.
-		pool.Go(func() {
-			defer dnsmsg.ReleaseQuestion(q)
-			c.doPreFetch(prefetchKey, q, remoteAddr, u)
-		})
+		go func() {
+			c.doPreFetch(q, remoteAddr, u)
+
+			dnsmsg.ReleaseQuestion(q)
+			c.prefetchMu.Lock()
+			delete(c.prefetching, prefetchKey)
+			c.prefetchMu.Unlock()
+		}()
 	}
 }
 
@@ -212,12 +221,9 @@ func (c *cache) NeedPrefetch(storedTime, expireTime time.Time) bool {
 	return ttl < (lifeSpan >> 2)
 }
 
-func (c *cache) doPreFetch(prefetchKey uint64, q *dnsmsg.Question, remoteAddr netip.AddrPort, u *upstreamWrapper) {
-	defer func() {
-		c.prefetchMu.Lock()
-		delete(c.prefetching, prefetchKey)
-		c.prefetchMu.Unlock()
-	}()
+func (c *cache) doPreFetch(q *dnsmsg.Question, remoteAddr netip.AddrPort, u *upstreamWrapper) {
+	c.logger.Debug().Object("query", (*qLogObj)(q)).Str("upstream", u.tag).Msg("prefetching cache")
+
 	ctx, cancel := context.WithTimeout(c.r.ctx, prefetchTimeout)
 	defer cancel()
 	resp, err := c.r.forward(ctx, u, q, remoteAddr)
@@ -236,9 +242,16 @@ func (c *cache) Get(ctx context.Context, q *dnsmsg.Question, rc *RequestContext)
 	ipMark := c.ipMark(rc.RemoteAddr.Addr())
 	rc.Response.IpMark = ipMark
 
+	if c.memory == nil && c.redis == nil {
+		return
+	}
+
+	key := cacheKey(q, ipMark)
+	defer pool.ReleaseBuf(key)
+
 	// memory cache
 	if c.memory != nil {
-		resp, storedTime, expireTime = c.memory.Get(q, ipMark)
+		resp, storedTime, expireTime = c.memory.Get(key)
 		if resp != nil {
 			dnsutils.SubtractTTL(resp, uint32(time.Since(storedTime).Seconds()))
 			return
@@ -248,10 +261,10 @@ func (c *cache) Get(ctx context.Context, q *dnsmsg.Question, rc *RequestContext)
 	// memory cache missed, try redis
 	if c.redis != nil {
 		var v []byte
-		storedTime, expireTime, resp, v = c.redis.Get(ctx, q, ipMark)
+		storedTime, expireTime, resp, v = c.redis.Get(ctx, key)
 		if resp != nil { // hit
 			if c.memory != nil { // put v into memory cache
-				c.memory.Store(q, ipMark, storedTime, expireTime, v)
+				c.memory.Store(key, storedTime, expireTime, v, true)
 			}
 			dnsutils.SubtractTTL(resp, uint32(time.Since(storedTime).Seconds()))
 		}
@@ -279,12 +292,14 @@ func (c *cache) Close() error {
 	return nil
 }
 
-// Hash the request key.
-func hashReq(q *dnsmsg.Question, ipMark string) (hash uint64) {
-	h1 := z.MemHash(q.Name)
+var mhSeed = maphash.MakeSeed()
+
+// Hash the request for prefetch
+func prefetchKey(q *dnsmsg.Question, ipMark string) uint64 {
+	h1 := maphash.Bytes(mhSeed, q.Name)
 	h1 += uint64(q.Class) << 16
 	h1 += uint64(q.Type)
-	h2 := z.MemHashString(ipMark)
+	h2 := maphash.String(mhSeed, ipMark)
 	return h1 ^ h2
 }
 
@@ -425,4 +440,15 @@ func loadIpMarkerFromFile(fp string) (*ipMarker, error) {
 	}
 	defer f.Close()
 	return loadIpMarkerFromReader(f)
+}
+
+func cacheKey(q *dnsmsg.Question, mark string) pool.Buffer {
+	b := pool.GetBuf(len(q.Name) + 4 + len(mark))
+	off := copy(b, q.Name)
+	binary.BigEndian.AppendUint16(b[off:], uint16(q.Class))
+	off += 2
+	binary.BigEndian.PutUint16(b[off:], uint16(q.Type))
+	off += 2
+	copy(b[off:], []byte(mark))
+	return b
 }

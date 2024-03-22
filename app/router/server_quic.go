@@ -96,12 +96,12 @@ func (s *quicServer) run() {
 			return
 		}
 
-		pool.Go(func() {
+		go func() {
 			defer c.CloseWithError(0, "")
 			debugLogServerConnAccepted(c, s.logger)
 			err := s.handleConn(c)
 			debugLogServerConnClosed(c, s.logger, err)
-		})
+		}()
 	}
 }
 
@@ -118,13 +118,13 @@ func (s *quicServer) handleConn(c quic.Connection) error {
 
 		// Handle stream.
 		// For doq, one stream, one query.
-		pool.Go(func() {
+		go func() {
 			defer func() {
 				stream.Close()
 				stream.CancelRead(0) // TODO: Needs a proper error code.
 			}()
 			s.handleStream(stream, c, remoteAddr, localAddr)
-		})
+		}()
 	}
 }
 

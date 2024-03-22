@@ -6,8 +6,8 @@ import (
 	"net"
 	"time"
 
+	"github.com/IrineSistiana/connpool"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
-	"github.com/IrineSistiana/mosproxy/internal/upstream/transport/connpool"
 	"github.com/rs/zerolog"
 )
 
@@ -56,7 +56,7 @@ func NewPipelineTransport(opts PipelineOpts) *PipelineTransport {
 		logger: nonNilLogger(opts.Logger),
 	}
 	t.pool = connpool.NewPool(connpool.Opts{
-		Dial: func(ctx context.Context) (connpool.PoolConn, error) {
+		Dial: func(ctx context.Context) (connpool.Conn, error) {
 			ctx, cancel := context.WithTimeout(ctx, t.dialTimeout())
 			defer cancel()
 			c, err := opts.DialContext(ctx)
@@ -65,7 +65,7 @@ func NewPipelineTransport(opts PipelineOpts) *PipelineTransport {
 			}
 			return newPipelineConn(c, t), nil
 		},
-		MaxDialingConnReq: uint64(t.maxConcurrentQuery()),
+		MaxStream: t.maxConcurrentQuery(),
 	})
 	return t
 }
@@ -90,7 +90,7 @@ func (t *PipelineTransport) ExchangeContext(ctx context.Context, m []byte) (*dns
 	retry := 0
 	errs := make([]error, 0)
 	for {
-		conn, newConn, err := t.getConn()
+		conn, newConn, err := t.getConn(ctx)
 		if err != nil {
 			errs = append(errs, err)
 			return nil, joinErr(errs)
@@ -113,8 +113,8 @@ func setQid(payload []byte, off int, qid uint16) {
 	binary.BigEndian.PutUint16(payload[off:], qid)
 }
 
-func (t *PipelineTransport) getConn() (_ *pipelineConn, newConn bool, err error) {
-	c, newConn, err := t.pool.GetConn()
+func (t *PipelineTransport) getConn(ctx context.Context) (_ *pipelineConn, newConn bool, err error) {
+	c, newConn, err := t.pool.Get(ctx)
 	if err != nil {
 		return nil, false, err
 	}

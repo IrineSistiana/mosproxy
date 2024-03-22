@@ -120,11 +120,11 @@ func (s *udpServer) run() {
 		rc := getRequestContext()
 		rc.RemoteAddr = remoteAddr
 		rc.LocalAddr = localAddr
-		pool.Go(func() {
+		go func() {
 			defer dnsmsg.ReleaseMsg(m)
 			defer releaseRequestContext(rc)
 			s.handleReq(remoteAddr, sessionOob, m, rc)
-		})
+		}()
 	}
 }
 

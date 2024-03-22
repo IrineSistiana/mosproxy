@@ -104,7 +104,7 @@ type LogConfig struct {
 }
 
 type CacheConfig struct {
-	MemSize    int64  `yaml:"mem_size"`
+	MemSize    int    `yaml:"mem_size"`
 	Redis      string `yaml:"redis"`
 	MaximumTTL int    `yaml:"maximum_ttl"`
 	IpMarker   string `yaml:"ip_marker"`

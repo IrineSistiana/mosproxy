@@ -349,7 +349,7 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))
 		return
 	}
-	if r.cache.NeedPrefetch(storedTime, expireTime) {
+	if resp != nil && r.cache.NeedPrefetch(storedTime, expireTime) {
 		r.cache.AsyncSingleFlightPrefetch(q, rc.RemoteAddr, upstream)
 	}
 	if resp != nil { // cache hit

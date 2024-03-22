@@ -111,7 +111,7 @@ func (e *gnetEngine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		localAddr:  netAddr2NetipAddr(c.LocalAddr()),
 	}
 	c.SetContext(cc)
-	c.SetReadDeadline(time.Now().Add(e.idleTimeout))
+	c.SetReadDeadline(time.Now().Add(e.idleTimeout)) // TODO: Bug: gnet dose not impl this method.
 	return nil, gnet.None
 }
 
@@ -182,7 +182,7 @@ func (e *gnetEngine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 			return gnet.Close
 		}
 
-		pool.Go(func() {
+		go func() {
 			rc := getRequestContext()
 			defer releaseRequestContext(rc)
 			rc.RemoteAddr = cc.remoteAddr
@@ -221,7 +221,7 @@ func (e *gnetEngine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 					Err(err).
 					Msg("failed to async write resp")
 			}
-		})
+		}()
 	}
 	return gnet.None
 }

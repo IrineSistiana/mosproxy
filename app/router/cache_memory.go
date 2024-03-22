@@ -1,38 +1,41 @@
 package router
 
 import (
-	"bytes"
 	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"github.com/dgraph-io/ristretto"
+	"github.com/maypok86/otter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
 
 type memoryCache struct {
-	backend *ristretto.Cache[uint64, *cacheEntry]
+	backend otter.CacheWithVariableTTL[string, *cacheEntry]
 	logger  *zerolog.Logger
 
 	getTotal prometheus.Counter
 	hitTotal prometheus.Counter
+	size     prometheus.Collector
 }
 
-func newMemoryCache(size int64, logger *zerolog.Logger) (*memoryCache, error) {
+func newMemoryCache(size int, logger *zerolog.Logger) (*memoryCache, error) {
 	if logger == nil {
 		logger = mlog.Nop()
 	}
-	backend, err := ristretto.NewCache[uint64, *cacheEntry](&ristretto.Config[uint64, *cacheEntry]{
-		NumCounters: size / 20,
-		MaxCost:     size,
-		BufferItems: 64,
-		Metrics:     false,
-		KeyToHash:   func(key uint64) (uint64, uint64) { return key, 0 }, // Default func will alloc the uint64 to heap.
-		OnExit:      releaseEntry,
-	})
+	builder, err := otter.NewBuilder[string, *cacheEntry](size)
+	if err != nil {
+		return nil, err
+	}
+	backend, err := builder.WithVariableTTL().
+		Cost(func(key string, value *cacheEntry) uint32 {
+			return uint32(len(key) + len(value.v))
+		}).
+		DeletionListener(func(key string, value *cacheEntry, cause otter.DeletionCause) {
+			releaseEntry(value)
+		}).Build()
 	if err != nil {
 		return nil, err
 	}
@@ -45,58 +48,54 @@ func newMemoryCache(size int64, logger *zerolog.Logger) (*memoryCache, error) {
 		Name: "cache_memory_hit_total",
 		Help: "The total number of get ops that returned a value (hit the cache)",
 	})
+	c.size = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "cache_memory_size",
+		Help: "The current number of entries in the cache (Note: not the memory cost)",
+	}, func() float64 { return float64(backend.Size()) })
 	return c, nil
 }
 
 func (c *memoryCache) RegisterMetricsTo(r prometheus.Registerer) error {
-	return regMetrics(r, c.getTotal, c.hitTotal)
+	return regMetrics(r, c.getTotal, c.hitTotal, c.size)
 }
 
-func (c *memoryCache) Store(q *dnsmsg.Question, mark string, storedTime, expireTime time.Time, v []byte) {
-	nameLen := q.Name.PackLen()
-	cost := nameLen + 4 + len(v) // TODO: Better cost calculation.
-	key := hashReq(q, mark)
-
-	nameCopy := copyBuf(q.Name)
+func (c *memoryCache) Store(k []byte, storedTime, expireTime time.Time, v []byte, setNX bool) {
+	ks := string(k)
 	vCopy := copyBuf(v)
 	e := newCacheEntry()
 	e.l.Lock()
 	e.storedTime = storedTime
 	e.expireTime = expireTime
-	e.ipMark = mark
-	e.name = dnsmsg.Name(nameCopy)
-	e.typ = q.Type
-	e.cls = q.Class
+	e.k = ks
 	e.v = vCopy
 	e.l.Unlock()
-	c.backend.SetWithTTL(key, e, int64(cost), time.Until(expireTime))
+
+	ttl := time.Until(expireTime)
+	if setNX {
+		c.backend.SetIfAbsent(ks, e, ttl)
+	} else {
+		c.backend.Set(ks, e, ttl)
+	}
 }
 
-func (c *memoryCache) Get(q *dnsmsg.Question, mark string) (resp *dnsmsg.Msg, storedTime, expireTime time.Time) {
+func (c *memoryCache) Get(k []byte) (resp *dnsmsg.Msg, storedTime, expireTime time.Time) {
+	c.backend.Stats()
 	c.getTotal.Inc()
-	hashKey := hashReq(q, mark)
-	e, ok := c.backend.Get(hashKey)
+	e, ok := c.backend.Get(bytes2StrUnsafe(k))
 	if ok { // key hit
 		if e.l.TryRLock() {
-			if e.name == nil {
+			if e.v == nil || e.k != string(k) { // entry has been released or reused
 				e.l.RUnlock()
-				return nil, time.Time{}, time.Time{} // entry has been released
+				return nil, time.Time{}, time.Time{}
 			}
-			sameReq := e.ipMark == mark &&
-				e.typ == q.Type &&
-				e.cls == q.Class &&
-				bytes.Equal(q.Name, e.name)
-			if !sameReq {
-				e.l.RUnlock()
-				return nil, time.Time{}, time.Time{} // collision, or entry was reused just now.
-			}
+
 			resp, err := unpackCacheMsg(e.v)
 			storedTime = e.storedTime
 			expireTime = e.expireTime
 			e.l.RUnlock()
 
-			if err != nil {
-				c.backend.Del(hashKey)
+			if err != nil { // Broken data, internal error
+				c.backend.Delete(bytes2StrUnsafe(k))
 				c.logger.Error().Err(err).Msg("failed to unpack cached resp")
 				return nil, time.Time{}, time.Time{}
 			}
@@ -118,13 +117,8 @@ type cacheEntry struct {
 	l          sync.RWMutex
 	storedTime time.Time
 	expireTime time.Time
-
-	ipMark string
-	name   dnsmsg.Name // nil if released
-	typ    dnsmsg.Type
-	cls    dnsmsg.Class
-
-	v pool.Buffer // nil if released
+	k          string
+	v          pool.Buffer
 }
 
 var cacheEntryPool = sync.Pool{
@@ -139,11 +133,11 @@ func releaseEntry(e *cacheEntry) {
 	e.l.Lock()
 	e.storedTime = time.Time{}
 	e.expireTime = time.Time{}
-	e.ipMark = ""
-	dnsmsg.ReleaseName(e.name)
-	e.typ = 0
-	e.cls = 0
-	pool.ReleaseBuf(e.v)
+	e.k = ""
+	if e.v != nil {
+		pool.ReleaseBuf(e.v)
+		e.v = nil
+	}
 	e.l.Unlock()
 	cacheEntryPool.Put(e)
 }
