@@ -1,10 +1,30 @@
 package pool
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"sync"
+
+	"github.com/IrineSistiana/bytespool"
 )
+
+type Buffer []byte
+
+func GetBuf(size int) Buffer {
+	return bytespool.Get(size)
+}
+
+func ReleaseBuf(b Buffer) {
+	bytespool.Release(b)
+}
+
+func CopyBuf(b []byte) Buffer {
+	bb := GetBuf(len(b))
+	copy(bb, b)
+	return bb
+}
 
 type BytesBufPool struct {
 	p sync.Pool
@@ -31,4 +51,17 @@ func (p *BytesBufPool) Get() *bytes.Buffer {
 func (p *BytesBufPool) Release(b *bytes.Buffer) {
 	b.Reset()
 	p.p.Put(b)
+}
+
+var br1kPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 1024) }}
+
+func NewBR1K(r io.Reader) *bufio.Reader {
+	br := br1kPool.Get().(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+func ReleaseBR1K(br *bufio.Reader) {
+	br.Reset(nil)
+	br1kPool.Put(br)
 }

@@ -1,30 +1,24 @@
-package router
+package cache
 
 import (
 	"sync"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
-	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/internal/utils"
 	"github.com/maypok86/otter"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/rs/zerolog"
 )
 
-type memoryCache struct {
+type MemoryCache struct {
 	backend otter.CacheWithVariableTTL[string, *cacheEntry]
-	logger  *zerolog.Logger
 
 	getTotal prometheus.Counter
 	hitTotal prometheus.Counter
 	size     prometheus.Collector
 }
 
-func newMemoryCache(size int, logger *zerolog.Logger) (*memoryCache, error) {
-	if logger == nil {
-		logger = mlog.Nop()
-	}
+func NewMemoryCache(size int) (*MemoryCache, error) {
 	builder, err := otter.NewBuilder[string, *cacheEntry](size)
 	if err != nil {
 		return nil, err
@@ -39,29 +33,29 @@ func newMemoryCache(size int, logger *zerolog.Logger) (*memoryCache, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := &memoryCache{backend: backend, logger: logger}
+	c := &MemoryCache{backend: backend}
 	c.getTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "cache_memory_get_total",
+		Name: "get_total",
 		Help: "The total number of get ops",
 	})
 	c.hitTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "cache_memory_hit_total",
+		Name: "hit_total",
 		Help: "The total number of get ops that returned a value (hit the cache)",
 	})
 	c.size = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "cache_memory_size",
+		Name: "size",
 		Help: "The current number of entries in the cache (Note: not the memory cost)",
 	}, func() float64 { return float64(backend.Size()) })
 	return c, nil
 }
 
-func (c *memoryCache) RegisterMetricsTo(r prometheus.Registerer) error {
-	return regMetrics(r, c.getTotal, c.hitTotal, c.size)
+func (c *MemoryCache) Collectors() []prometheus.Collector {
+	return []prometheus.Collector{c.getTotal, c.hitTotal, c.size}
 }
 
-func (c *memoryCache) Store(k []byte, storedTime, expireTime time.Time, v []byte, setNX bool) {
+func (c *MemoryCache) Store(k []byte, storedTime, expireTime time.Time, v []byte, setNX bool) {
 	ks := string(k)
-	vCopy := copyBuf(v)
+	vCopy := pool.CopyBuf(v)
 	e := newCacheEntry()
 	e.l.Lock()
 	e.storedTime = storedTime
@@ -78,10 +72,9 @@ func (c *memoryCache) Store(k []byte, storedTime, expireTime time.Time, v []byte
 	}
 }
 
-func (c *memoryCache) Get(k []byte) (resp *dnsmsg.Msg, storedTime, expireTime time.Time) {
-	c.backend.Stats()
+func (c *MemoryCache) Get(k []byte) (v pool.Buffer, storedTime, expireTime time.Time) {
 	c.getTotal.Inc()
-	e, ok := c.backend.Get(bytes2StrUnsafe(k))
+	e, ok := c.backend.Get(utils.Bytes2StrUnsafe(k))
 	if ok { // key hit
 		if e.l.TryRLock() {
 			if e.v == nil || e.k != string(k) { // entry has been released or reused
@@ -89,18 +82,12 @@ func (c *memoryCache) Get(k []byte) (resp *dnsmsg.Msg, storedTime, expireTime ti
 				return nil, time.Time{}, time.Time{}
 			}
 
-			resp, err := unpackCacheMsg(e.v)
+			v = pool.CopyBuf(e.v)
 			storedTime = e.storedTime
 			expireTime = e.expireTime
 			e.l.RUnlock()
-
-			if err != nil { // Broken data, internal error
-				c.backend.Delete(bytes2StrUnsafe(k))
-				c.logger.Error().Err(err).Msg("failed to unpack cached resp")
-				return nil, time.Time{}, time.Time{}
-			}
 			c.hitTotal.Inc()
-			return resp, storedTime, expireTime
+			return v, storedTime, expireTime
 		}
 		return nil, time.Time{}, time.Time{} // entry is being released
 	}
@@ -108,7 +95,7 @@ func (c *memoryCache) Get(k []byte) (resp *dnsmsg.Msg, storedTime, expireTime ti
 }
 
 // Always returns nil.
-func (c *memoryCache) Close() error {
+func (c *MemoryCache) Close() error {
 	c.backend.Close()
 	return nil
 }

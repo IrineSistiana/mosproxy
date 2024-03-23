@@ -11,6 +11,7 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/internal/utils"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
 )
@@ -140,9 +141,9 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 
 func readClientAddrFromXFFBytes(b []byte) (netip.Addr, error) {
 	if i := bytes.IndexRune(b, ','); i > 0 {
-		return netip.ParseAddr(bytes2StrUnsafe(b[:i]))
+		return netip.ParseAddr(utils.Bytes2StrUnsafe(b[:i]))
 	}
-	return netip.ParseAddr(bytes2StrUnsafe(b))
+	return netip.ParseAddr(utils.Bytes2StrUnsafe(b))
 }
 
 func (h *fasthttpHandler) readReqMsg(ctx *fasthttp.RequestCtx) *dnsmsg.Msg {

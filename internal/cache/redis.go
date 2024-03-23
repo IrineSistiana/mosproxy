@@ -1,4 +1,4 @@
-package router
+package cache
 
 import (
 	"context"
@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/prometheus/client_golang/prometheus"
@@ -17,7 +16,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-type redisCache struct {
+type RedisCache struct {
 	client rueidis.Client
 	logger *zerolog.Logger
 
@@ -34,6 +33,7 @@ type redisCache struct {
 	setTotal        prometheus.Counter
 	setLatency      prometheus.Histogram
 	setDroppedTotal prometheus.Counter
+	pingLatency     prometheus.Histogram
 }
 
 type redisSetOp struct {
@@ -43,7 +43,7 @@ type redisSetOp struct {
 	nx    bool
 }
 
-func newRedisCache(u string, logger *zerolog.Logger) (*redisCache, error) {
+func NewRedisCache(u string, logger *zerolog.Logger) (*RedisCache, error) {
 	if logger == nil {
 		logger = mlog.Nop()
 	}
@@ -56,7 +56,7 @@ func newRedisCache(u string, logger *zerolog.Logger) (*redisCache, error) {
 		return nil, err
 	}
 
-	c := &redisCache{
+	c := &RedisCache{
 		client:      client,
 		logger:      logger,
 		setOpChan:   make(chan redisSetOp, 128),
@@ -64,43 +64,47 @@ func newRedisCache(u string, logger *zerolog.Logger) (*redisCache, error) {
 	}
 
 	c.getTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "cache_redis_get_total",
-		Help: "The total number of get ops",
+		Name: "get_total",
+		Help: "The total number of GET cmd",
 	})
 	c.getLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "cache_redis_get_latency_millisecond",
-		Help:    "The get op latency in millisecond",
-		Buckets: []float64{1, 5, 10, 20, 50, 100},
+		Name:    "get_latency_millisecond",
+		Help:    "The GET cmd latency in millisecond",
+		Buckets: []float64{1, 5, 10, 20},
 	})
 	c.hitTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "cache_redis_hit_total",
-		Help: "The total number of get ops that returned a value (hit the cache)",
+		Name: "hit_total",
+		Help: "The total number of GET cmd that returned a value (hit the cache)",
 	})
 	c.setTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "cache_redis_set_total",
-		Help: "The total number of set ops",
+		Name: "set_total",
+		Help: "The total number of SET cmd",
 	})
 	c.setLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "cache_redis_set_latency_millisecond",
-		Help:    "The get set latency in millisecond",
-		Buckets: []float64{1, 5, 10, 20, 50, 100},
+		Name:    "set_latency_millisecond",
+		Help:    "The SET cmd latency in millisecond",
+		Buckets: []float64{1, 5, 10, 20},
 	})
 	c.setDroppedTotal = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "cache_redis_set_dropped_total",
-		Help: "The total number of set ops that are dropped because the redis server is too slow",
+		Name: "set_dropped_total",
+		Help: "The total number of SET cmd that are dropped because the redis server is too slow",
 	})
-
+	c.pingLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    "ping_latency_millisecond",
+		Help:    "The PING cmd latency in millisecond",
+		Buckets: []float64{1, 5, 10, 20},
+	})
 	go c.setLoop()
 	go c.pingLoop()
 	return c, nil
 }
 
-func (c *redisCache) RegisterMetricsTo(r prometheus.Registerer) error {
-	return regMetrics(r, c.getTotal, c.getLatency, c.hitTotal, c.setTotal, c.setLatency, c.setDroppedTotal)
+func (c *RedisCache) Collectors() []prometheus.Collector {
+	return []prometheus.Collector{c.getTotal, c.getLatency, c.hitTotal, c.setTotal, c.setLatency, c.setDroppedTotal, c.pingLatency}
 }
 
 // Always returns nil.
-func (c *redisCache) Close() error {
+func (c *RedisCache) Close() error {
 	c.closeOnce.Do(func() {
 		c.client.Close()
 		close(c.closeNotify)
@@ -108,7 +112,7 @@ func (c *redisCache) Close() error {
 	return nil
 }
 
-func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) pool.Buffer {
+func (c *RedisCache) buildValue(storedTime, expireTime time.Time, v []byte) pool.Buffer {
 	b := pool.GetBuf(16 + len(v))
 	binary.BigEndian.PutUint64(b, uint64(storedTime.Unix()))
 	binary.BigEndian.PutUint64(b[8:], uint64(expireTime.Unix()))
@@ -117,47 +121,44 @@ func (c *redisCache) buildValue(storedTime, expireTime time.Time, v []byte) pool
 }
 
 // Get dose not return error.
-// All errors (of broking/invalid stored data, connection lost) will be logged.
-func (c *redisCache) Get(ctx context.Context, k []byte) (storedTime, expireTime time.Time, resp *dnsmsg.Msg, v []byte) {
+// All errors (of broking/invalid stored data, connection lost, etc.) will be logged.
+func (c *RedisCache) Get(ctx context.Context, k []byte) (storedTime, expireTime time.Time, v []byte) {
 	if !c.connected.Load() {
 		return
 	}
 
 	start := time.Now()
-	cmd := c.client.B().Get().Key(rueidis.BinaryString(k)).Build()
-	res := c.client.Do(ctx, cmd)
+	res := c.client.Do(ctx, c.client.B().Get().Key(rueidis.BinaryString(k)).Build())
 	b, err := res.AsBytes()
 	if err != nil {
 		if errors.Is(err, rueidis.Nil) { // miss
 			c.getTotal.Inc()
 			c.getLatency.Observe(float64(time.Since(start).Milliseconds()))
 		} else {
-			// This is a redis io error.
+			// This is a redis io/type error.
 			c.logger.Error().Err(err).Msg("get cmd failed")
 		}
-		return time.Time{}, time.Time{}, nil, nil
+		return time.Time{}, time.Time{}, nil
 	}
 
 	// hit
 	if len(b) < 16 {
 		c.logger.Error().Msg("invalid cache data, too short")
-		return time.Time{}, time.Time{}, nil, nil
+		// TODO: Delete this invalid key here?
+		return time.Time{}, time.Time{}, nil
 	}
-	storedTime = time.Unix(int64(binary.BigEndian.Uint64(b[:8])), 0)
-	expireTime = time.Unix(int64(binary.BigEndian.Uint64(b[8:16])), 0)
-	resp, err = unpackCacheMsg(b[16:])
-	if err != nil {
-		c.logger.Error().Err(err).Msg("invalid cache data, failed to unpack")
-		return time.Time{}, time.Time{}, nil, nil
-	}
-	v = b[16:]
 	c.getTotal.Inc()
 	c.hitTotal.Inc()
 	c.getLatency.Observe(float64(time.Since(start).Milliseconds()))
+
+	storedTime = time.Unix(int64(binary.BigEndian.Uint64(b[:8])), 0)
+	expireTime = time.Unix(int64(binary.BigEndian.Uint64(b[8:16])), 0)
+	v = b[16:]
 	return
 }
 
-func (c *redisCache) AsyncStore(k []byte, storedTime, expireTime time.Time, v []byte, setNX bool) {
+// Store v in to redis asynchronously.
+func (c *RedisCache) AsyncStore(k []byte, storedTime, expireTime time.Time, v []byte, setNX bool) {
 	if !c.connected.Load() {
 		return
 	}
@@ -167,7 +168,7 @@ func (c *redisCache) AsyncStore(k []byte, storedTime, expireTime time.Time, v []
 		return
 	}
 
-	key := copyBuf(k)
+	key := pool.CopyBuf(k)
 	value := c.buildValue(storedTime, expireTime, v)
 	select {
 	case c.setOpChan <- redisSetOp{k: key, v: value, ttlMs: ttlMs, nx: setNX}:
@@ -178,7 +179,7 @@ func (c *redisCache) AsyncStore(k []byte, storedTime, expireTime time.Time, v []
 	}
 }
 
-func (c *redisCache) pingLoop() {
+func (c *RedisCache) pingLoop() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -198,6 +199,7 @@ func (c *redisCache) pingLoop() {
 					Dur("elapse", elapse).
 					Msg("redis server ping lost")
 			} else {
+				c.pingLatency.Observe(float64(elapse.Milliseconds()))
 				if prevConnected := c.connected.Swap(true); !prevConnected {
 					c.logger.Info().Dur("latency", elapse).
 						Msg("redis server connected")
@@ -210,7 +212,7 @@ func (c *redisCache) pingLoop() {
 	}
 }
 
-func (c *redisCache) setLoop() {
+func (c *RedisCache) setLoop() {
 	for {
 		select {
 		case <-c.closeNotify:

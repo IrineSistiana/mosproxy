@@ -13,6 +13,7 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/internal/utils"
 	"github.com/rs/zerolog"
 	"golang.org/x/net/http2"
 )
@@ -223,7 +224,7 @@ func (h *httpHandler) readReqMsg(w http.ResponseWriter, req *http.Request) *dnsm
 		}
 		buf := pool.GetBuf(msgSize)
 		defer pool.ReleaseBuf(buf)
-		_, err := base64.RawURLEncoding.Decode(buf, str2BytesUnsafe(s))
+		_, err := base64.RawURLEncoding.Decode(buf, utils.Str2BytesUnsafe(s))
 		if err != nil {
 			h.logger.Warn().
 				Object("request", (*httpReqLoggerObj)(req)).

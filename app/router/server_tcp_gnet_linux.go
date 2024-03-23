@@ -3,9 +3,7 @@
 package router
 
 import (
-	"bufio"
 	"encoding/binary"
-	"errors"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -59,7 +57,6 @@ func (r *router) startGnetServer(cfg *ServerConfig) error {
 			gnet.WithSocketSendBuffer(socketOpts.SO_SNDBUF),
 			gnet.WithReusePort(socketOpts.SO_REUSEPORT),
 			gnet.WithLogger(&gnetLogger{l: *e.logger}),
-			gnet.WithReadBufferCap(128*1024), // Note: minimum is 65535+2 (maximum tcp payload).
 		)
 		r.fatal("gnet engine exited", err)
 	}()
@@ -69,10 +66,10 @@ func (r *router) startGnetServer(cfg *ServerConfig) error {
 
 type gnetEngine struct {
 	r      *router
-	logger *zerolog.Logger
+	logger *zerolog.Logger // not nil
 
-	idleTimeout   time.Duration
-	maxConcurrent int32
+	idleTimeout   time.Duration // valid
+	maxConcurrent int32         // valid
 }
 
 type connCtx struct {
@@ -82,6 +79,12 @@ type connCtx struct {
 
 	// counter
 	concurrentRequests atomic.Int32
+
+	idleTimer *time.Timer // from time.After
+
+	readN      int
+	buffer     pool.Buffer // buffer for partial read msg, maybe nil
+	readingHdr bool        // length of the msg waiting to read
 }
 
 // OnBoot fires when the engine is ready for accepting connections.
@@ -109,9 +112,9 @@ func (e *gnetEngine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 	cc := &connCtx{
 		remoteAddr: netAddr2NetipAddr(c.RemoteAddr()),
 		localAddr:  netAddr2NetipAddr(c.LocalAddr()),
+		idleTimer:  time.AfterFunc(e.idleTimeout, func() { c.Close() }),
 	}
 	c.SetContext(cc)
-	c.SetReadDeadline(time.Now().Add(e.idleTimeout)) // TODO: Bug: gnet dose not impl this method.
 	return nil, gnet.None
 }
 
@@ -120,12 +123,7 @@ func (e *gnetEngine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 func (e *gnetEngine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	debugLogServerConnClosed(c, e.logger, err)
 	cc := c.Context().(*connCtx)
-
-	e.logger.Debug(). // TODO: Remove this.
-				Stringer("remote", cc.remoteAddr).
-				Stringer("local", cc.localAddr).
-				Err(err).
-				Msg("conn closed")
+	cc.idleTimer.Stop()
 	return gnet.None
 }
 
@@ -137,91 +135,122 @@ func (e *gnetEngine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 // to read data into your own []byte, then pass the new []byte to the new goroutine.
 func (e *gnetEngine) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	cc := c.Context().(*connCtx)
+	cc.idleTimer.Reset(e.idleTimeout)
 
-	// Read all msgs in the buffer.
-	for {
-		// Check read buffer, is there a fully msg?
-		hdr, err := c.Peek(2)
-		if err != nil {
-			if errors.Is(err, bufio.ErrBufferFull) {
-				panic("gnet recv buffer is too small")
+read:
+	var (
+		m   *dnsmsg.Msg
+		err error
+	)
+	if cc.buffer != nil { // TODO: Add test for partial read.
+		if cc.readingHdr {
+			hdrRemains := len(cc.buffer) - cc.readN
+			b, _ := c.Next(hdrRemains)
+			cc.readN += copy(cc.buffer[cc.readN:], b)
+			if cc.readN < 2 {
+				return gnet.None
 			}
-			break // partial hdr
+			msgLen := binary.BigEndian.Uint16(cc.buffer)
+			pool.ReleaseBuf(cc.buffer)
+			cc.buffer = pool.GetBuf(int(msgLen))
+			cc.readN = 0
+			cc.readingHdr = false
 		}
 
-		l := binary.BigEndian.Uint16(hdr)
-		hdrBody, err := c.Peek(2 + int(l))
+		bodyRemains := len(cc.buffer) - cc.readN
+		b, _ := c.Next(bodyRemains)
+		cc.readN += copy(cc.buffer[cc.readN:], b)
+		if cc.readN < len(cc.buffer) {
+			return gnet.None
+		}
+		m, err = dnsmsg.UnpackMsg(cc.buffer)
+		pool.ReleaseBuf(cc.buffer)
+		cc.buffer = nil
+	} else {
+		// read hdr
+		hdr, _ := c.Next(2)
+		if len(hdr) < 2 {
+			cc.buffer = pool.GetBuf(2)
+			cc.readN = copy(cc.buffer, hdr)
+			cc.readingHdr = true
+			return gnet.None // partial hdr
+		}
+		l := int(binary.BigEndian.Uint16(hdr))
+
+		// read body
+		body, _ := c.Next(l)
+		if len(body) < l {
+			cc.buffer = pool.GetBuf(l)
+			cc.readN = copy(cc.buffer, body)
+			cc.readingHdr = false
+			return gnet.None // partial body
+		}
+		m, err = dnsmsg.UnpackMsg(body)
+	}
+
+	if err != nil {
+		e.logger.Warn().
+			Stringer("remote", cc.remoteAddr).
+			Stringer("local", cc.localAddr).
+			Err(err).
+			Msg("invalid msg")
+		return gnet.Close
+	}
+
+	if cc.concurrentRequests.Load() > e.maxConcurrent {
+		// Too many concurrent requests.
+		// TODO: Return a REFUSE instead of closing the connection?
+		e.logger.Warn().
+			Stringer("remote", cc.remoteAddr).
+			Stringer("local", cc.localAddr).
+			Msg("too many concurrent requests")
+		dnsmsg.ReleaseMsg(m)
+		return gnet.Close
+	}
+
+	go func() {
+		rc := getRequestContext()
+		defer releaseRequestContext(rc)
+		rc.RemoteAddr = cc.remoteAddr
+		rc.LocalAddr = cc.localAddr
+
+		e.r.handleServerReq(m, rc)
+		dnsmsg.ReleaseMsg(m)
+
+		buf, err := packRespTCP(rc.Response.Msg, true)
 		if err != nil {
-			if errors.Is(err, bufio.ErrBufferFull) {
-				panic("gnet recv buffer is too small")
-			}
-			break // partial body
-		}
-
-		// full body
-
-		if cc.concurrentRequests.Load() > e.maxConcurrent {
-			// Too many concurrent requests.
-			// TODO: Return a REFUSE instead of closing the connection?
-			e.logger.Warn().
-				Stringer("remote", cc.remoteAddr).
-				Stringer("local", cc.localAddr).
-				Msg("too many concurrent requests")
-			return gnet.Close
-		}
-
-		m, err := dnsmsg.UnpackMsg(hdrBody[2:])
-		c.Discard(2 + int(l))
-		c.SetReadDeadline(time.Now().Add(e.idleTimeout))
-		if err != nil {
-			e.logger.Warn().
-				Stringer("remote", cc.remoteAddr).
-				Stringer("local", cc.localAddr).
+			e.logger.Error().
 				Err(err).
-				Msg("invalid msg")
-			return gnet.Close
+				Msg(logPackRespErr)
+			return
 		}
 
-		go func() {
-			rc := getRequestContext()
-			defer releaseRequestContext(rc)
-			rc.RemoteAddr = cc.remoteAddr
-			rc.LocalAddr = cc.localAddr
-
-			e.r.handleServerReq(m, rc)
-			dnsmsg.ReleaseMsg(m)
-
-			buf, err := packRespTCP(rc.Response.Msg, true)
-			if err != nil {
-				e.logger.Error().
-					Err(err).
-					Msg(logPackRespErr)
-				return
+		err = c.AsyncWrite(buf, func(c gnet.Conn, err error) error {
+			pool.ReleaseBuf(buf)
+			if err == nil {
+				err = c.Flush()
 			}
-
-			err = c.AsyncWrite(buf, func(c gnet.Conn, err error) error {
-				pool.ReleaseBuf(buf)
-				if err == nil {
-					err = c.Flush()
-				}
-				cc.concurrentRequests.Add(-1)
-				if err != nil {
-					e.logger.Warn().
-						Stringer("remote", cc.remoteAddr).
-						Stringer("local", cc.localAddr).
-						Err(err).
-						Msg("failed to write resp")
-				}
-				return nil
-			})
+			cc.concurrentRequests.Add(-1)
 			if err != nil {
 				e.logger.Warn().
 					Stringer("remote", cc.remoteAddr).
 					Stringer("local", cc.localAddr).
 					Err(err).
-					Msg("failed to async write resp")
+					Msg("failed to write resp")
 			}
-		}()
+			return nil
+		})
+		if err != nil {
+			e.logger.Warn().
+				Stringer("remote", cc.remoteAddr).
+				Stringer("local", cc.localAddr).
+				Err(err).
+				Msg("failed to async write resp")
+		}
+	}()
+
+	if c.InboundBuffered() > 0 {
+		goto read
 	}
 	return gnet.None
 }

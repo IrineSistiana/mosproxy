@@ -95,12 +95,19 @@ type router struct {
 	logger     *zerolog.Logger
 	metricsReg *prometheus.Registry
 
-	cache      *cache // not nil, noop if no backend is configured
+	cache    *cacheCtl    // not nil, noop if no backend is configured
+	prefetch *prefetchCtl // not nil
+
 	upstreams  map[string]*upstreamWrapper
 	domainSets map[string]*domainmatcher.MixMatcher
 	rules      []*rule
 
 	fatalErr chan fatalErr
+
+	// metrics
+	queryTotal         prometheus.Counter
+	queryCacheHitTotal prometheus.Counter
+	prefetchTotal      prometheus.Counter
 }
 
 type fatalErr struct {
@@ -116,12 +123,35 @@ func run(ctx context.Context, cfg *Config) {
 		cancel:     cancel,
 		logger:     logger,
 		metricsReg: newMetricsReg(),
+		prefetch:   newPrefetchCtl(),
 		upstreams:  make(map[string]*upstreamWrapper),
 		domainSets: make(map[string]*domainmatcher.MixMatcher),
 		fatalErr:   make(chan fatalErr, 1),
+
+		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "query_total",
+			Help: "The total number of client queries",
+		}),
+		queryCacheHitTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "query_cache_hit_total",
+			Help: "The total number of client queries that hit the cache",
+		}),
+		prefetchTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "prefetch_total",
+			Help: "The total number of prefetched queries",
+		}),
 	}
 	r.opt.logQueries = cfg.Log.Queries
 	r.opt.ecsEnabled = cfg.ECS.Enabled
+
+	err := regMetrics(r.metricsReg,
+		r.queryTotal,
+		r.queryCacheHitTotal,
+		r.prefetchTotal,
+	)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to reg prometheus metrics")
+	}
 
 	// start metrics endpoint
 	if addr := cfg.Metrics.Addr; len(addr) > 0 {
@@ -210,6 +240,7 @@ var (
 // rc will always have a non-nil response msg.
 // Does not take the ownership of the m and rc.
 func (r *router) handleServerReq(m *dnsmsg.Msg, rc *RequestContext) {
+	r.queryTotal.Inc()
 	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second*6, errRequestTimeout)
 	defer func() {
 		cancel()
@@ -349,16 +380,17 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))
 		return
 	}
-	if resp != nil && r.cache.NeedPrefetch(storedTime, expireTime) {
-		r.cache.AsyncSingleFlightPrefetch(q, rc.RemoteAddr, upstream)
-	}
 	if resp != nil { // cache hit
+		if needPrefetch(storedTime, expireTime) {
+			r.asyncSingleFlightPrefetch(q, rc.RemoteAddr.Addr(), upstream)
+		}
 		rc.Response.Msg = resp
 		rc.Response.Cached = true
+		r.queryCacheHitTotal.Inc()
 		return
 	}
 
-	resp, err := r.forward(ctx, upstream, q, rc.RemoteAddr)
+	resp, err := r.forward(ctx, upstream, q, rc.RemoteAddr.Addr())
 	if err != nil {
 		r.logger.Warn().
 			Str("upstream", upstream.tag).
@@ -373,13 +405,41 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 	r.cache.Store(q, rc.RemoteAddr.Addr(), resp)
 }
 
+func (r *router) asyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstreamWrapper) {
+	key := r.cache.keyForPrefetch(q, remoteAddr)
+	if ok := r.prefetch.reserve(key); !ok {
+		return
+	}
+	qCopy := q.Copy()
+	go func() {
+		r.doPrefetch(qCopy, remoteAddr, u)
+		dnsmsg.ReleaseQuestion(qCopy)
+		r.prefetch.done(key)
+	}()
+}
+
+func (r *router) doPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstreamWrapper) {
+	r.logger.Debug().Object("query", (*qLogObj)(q)).Str("upstream", u.tag).Msg("prefetching cache")
+
+	ctx, cancel := context.WithTimeout(r.ctx, prefetchTimeout)
+	defer cancel()
+	resp, err := r.forward(ctx, u, q, remoteAddr)
+	if err != nil {
+		r.logger.Warn().Object("query", (*qLogObj)(q)).Str("upstream", u.tag).Err(err).
+			Msg("failed to prefetch")
+		return
+	}
+	r.prefetchTotal.Inc()
+	r.cache.Store(q, remoteAddr, resp)
+}
+
 // Forward query to upstream and return its response.
 // It will remove the EDNS0 Options from response.
 func (r *router) forward(
 	ctx context.Context,
 	upstream *upstreamWrapper,
 	q *dnsmsg.Question,
-	remoteAddr netip.AddrPort,
+	remoteAddr netip.Addr,
 ) (*dnsmsg.Msg, error) {
 	reqWire, err := r.packReq(q, remoteAddr)
 	if err != nil {
@@ -402,7 +462,7 @@ func makeEmptyResp(q *dnsmsg.Question, rc *RequestContext, rcode uint16) {
 	rc.Response.Msg = resp
 }
 
-func (r *router) packReq(q *dnsmsg.Question, remoteAddr netip.AddrPort) (pool.Buffer, error) {
+func (r *router) packReq(q *dnsmsg.Question, remoteAddr netip.Addr) (pool.Buffer, error) {
 	m := dnsmsg.NewMsg()
 	defer dnsmsg.ReleaseMsg(m)
 
@@ -411,7 +471,7 @@ func (r *router) packReq(q *dnsmsg.Question, remoteAddr netip.AddrPort) (pool.Bu
 
 	opt := newEDNS0(udpSize)
 	if r.opt.ecsEnabled && remoteAddr.IsValid() {
-		opt.Data = makeEdns0ClientSubnetReqOpt(remoteAddr.Addr())
+		opt.Data = makeEdns0ClientSubnetReqOpt(remoteAddr)
 	}
 	m.Additionals = append(m.Additionals, opt)
 
