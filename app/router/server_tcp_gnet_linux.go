@@ -85,6 +85,14 @@ type connCtx struct {
 	readN      int
 	buffer     pool.Buffer // buffer for partial read msg, maybe nil
 	readingHdr bool        // length of the msg waiting to read
+
+	err error // first error that occur
+}
+
+func (cc *connCtx) saveFirstErr(err error) {
+	if cc.err == nil {
+		cc.err = err
+	}
 }
 
 // OnBoot fires when the engine is ready for accepting connections.
@@ -115,15 +123,26 @@ func (e *gnetEngine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		idleTimer:  time.AfterFunc(e.idleTimeout, func() { c.Close() }),
 	}
 	c.SetContext(cc)
+
+	if err := e.r.limiterAllowN(cc.remoteAddr.Addr(), costTCPConn); err != nil {
+		// TODO: Log or create a metrics entry for refused queries.
+		cc.saveFirstErr(err)
+		return nil, gnet.Close
+	}
 	return nil, gnet.None
 }
 
 // OnClose fires when a connection has been closed.
 // The parameter err is the last known connection error.
 func (e *gnetEngine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
-	debugLogServerConnClosed(c, e.logger, err)
 	cc := c.Context().(*connCtx)
 	cc.idleTimer.Stop()
+
+	closeErr := err
+	if cc.err != nil { // log cc.err which is more useful (e.g. invalid msg...)
+		closeErr = cc.err
+	}
+	debugLogServerConnClosed(c, e.logger, closeErr)
 	return gnet.None
 }
 
@@ -188,66 +207,59 @@ read:
 		m, err = dnsmsg.UnpackMsg(body)
 	}
 
-	if err != nil {
+	if err != nil { // invalid msg
 		e.logger.Warn().
 			Stringer("remote", cc.remoteAddr).
 			Stringer("local", cc.localAddr).
 			Err(err).
 			Msg("invalid msg")
+		cc.saveFirstErr(err)
 		return gnet.Close
 	}
 
-	if cc.concurrentRequests.Load() > e.maxConcurrent {
-		// Too many concurrent requests.
-		// TODO: Return a REFUSE instead of closing the connection?
-		e.logger.Warn().
-			Stringer("remote", cc.remoteAddr).
-			Stringer("local", cc.localAddr).
-			Msg("too many concurrent requests")
+	ccr := cc.concurrentRequests.Add(1)
+	if ccr > e.maxConcurrent { // Too many concurrent requests.
+		resp := mustHaveRespB(m, nil, dnsmsg.RCodeRefused, true, 0)
+		c.Write(resp)
+		cc.concurrentRequests.Add(-1)
 		dnsmsg.ReleaseMsg(m)
-		return gnet.Close
-	}
+		pool.ReleaseBuf(resp)
+		// TODO: Log or create a metrics entry for refused queries.
+	} else {
+		go func() {
+			rc := getRequestContext()
+			defer releaseRequestContext(rc)
+			rc.RemoteAddr = cc.remoteAddr
+			rc.LocalAddr = cc.localAddr
 
-	go func() {
-		rc := getRequestContext()
-		defer releaseRequestContext(rc)
-		rc.RemoteAddr = cc.remoteAddr
-		rc.LocalAddr = cc.localAddr
+			e.r.handleServerReq(m, rc)
+			dnsmsg.ReleaseMsg(m)
 
-		e.r.handleServerReq(m, rc)
-		dnsmsg.ReleaseMsg(m)
-
-		buf, err := packRespTCP(rc.Response.Msg, true)
-		if err != nil {
-			e.logger.Error().
-				Err(err).
-				Msg(logPackRespErr)
-			return
-		}
-
-		err = c.AsyncWrite(buf, func(c gnet.Conn, err error) error {
-			pool.ReleaseBuf(buf)
-			if err == nil {
-				err = c.Flush()
-			}
-			cc.concurrentRequests.Add(-1)
+			buf := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, true, 0)
+			err := c.AsyncWrite(buf, func(c gnet.Conn, err error) error {
+				pool.ReleaseBuf(buf)
+				if err == nil {
+					err = c.Flush()
+				}
+				cc.concurrentRequests.Add(-1)
+				if err != nil {
+					e.logger.Warn().
+						Stringer("remote", cc.remoteAddr).
+						Stringer("local", cc.localAddr).
+						Err(err).
+						Msg("failed to write resp")
+				}
+				return nil
+			})
 			if err != nil {
 				e.logger.Warn().
 					Stringer("remote", cc.remoteAddr).
 					Stringer("local", cc.localAddr).
 					Err(err).
-					Msg("failed to write resp")
+					Msg("failed to async write resp")
 			}
-			return nil
-		})
-		if err != nil {
-			e.logger.Warn().
-				Stringer("remote", cc.remoteAddr).
-				Stringer("local", cc.localAddr).
-				Err(err).
-				Msg("failed to async write resp")
-		}
-	}()
+		}()
+	}
 
 	if c.InboundBuffered() > 0 {
 		goto read

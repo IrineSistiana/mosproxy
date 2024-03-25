@@ -22,6 +22,7 @@ type Config struct {
 	Cache   CacheConfig   `yaml:"cache"`
 	ECS     ECSConfig     `yaml:"ecs"`
 	Metrics MetricsConfig `yaml:"metrics"`
+	Limiter LimiterConfig `yaml:"limiter"`
 }
 
 type ServerConfig struct {
@@ -116,6 +117,18 @@ type ECSConfig struct {
 
 type MetricsConfig struct {
 	Addr string `yaml:"addr"`
+}
+
+type LimiterConfig struct {
+	GlobalLimit int                 `yaml:"global_limit"`
+	Client      ClientLimiterConfig `yaml:"client"`
+}
+
+type ClientLimiterConfig struct {
+	Limit  int `yaml:"limit"`
+	Burst  int `yaml:"burst"`
+	V4Mask int `yaml:"v4_mask"`
+	V6Mask int `yaml:"v6_mask"`
 }
 
 func genConfigTemplate(o string) {

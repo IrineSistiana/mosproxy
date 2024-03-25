@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
@@ -41,15 +42,16 @@ func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) error {
 	}
 	s := &tcpServer{
 		r:             r,
+		logger:        r.subLoggerForServer("server_tcp", cfg.Tag),
 		l:             l,
 		tlsConfig:     tlsConfig,
 		idleTimeout:   idleTimeout,
 		maxConcurrent: maxConcurrent,
-		logger:        r.subLoggerForServer("server_tcp", cfg.Tag),
 	}
 	s.logger.Info().
 		Str("network", l.Addr().Network()).
 		Stringer("addr", l.Addr()).
+		Bool("tls", useTls).
 		Msg("tcp server started")
 	go func() {
 		defer l.Close()
@@ -59,13 +61,13 @@ func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) error {
 }
 
 type tcpServer struct {
-	r *router
+	r      *router
+	logger *zerolog.Logger
 
 	l             net.Listener
 	tlsConfig     *tls.Config   // nil if tls is disabled
 	idleTimeout   time.Duration // valid
 	maxConcurrent int32         // valid
-	logger        *zerolog.Logger
 }
 
 func (s *tcpServer) run() {
@@ -76,16 +78,28 @@ func (s *tcpServer) run() {
 			r.fatal("tcp server exited", err)
 			return
 		}
-		go func() {
-			defer c.Close()
-			s.handleConn(c)
-		}()
+		debugLogServerConnAccepted(c, s.logger)
+
+		var cost int
+		if s.tlsConfig != nil {
+			cost = costTLSConn
+		} else {
+			cost = costTCPConn
+		}
+		if err := r.limiterAllowN(netAddr2NetipAddr(c.RemoteAddr()).Addr(), cost); err != nil {
+			// TODO: Log or create a metrics entry for refused queries.
+			c.Close()
+			debugLogServerConnClosed(c, s.logger, err)
+		} else {
+			go func() {
+				s.handleConn(c)
+				c.Close()
+			}()
+		}
 	}
 }
 
 func (s *tcpServer) handleConn(c net.Conn) {
-	debugLogServerConnAccepted(c, s.logger)
-
 	// TLS handshake
 	if s.tlsConfig != nil {
 		tlsConn := tls.Server(c, s.tlsConfig)
@@ -105,9 +119,11 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		c = tlsConn
 	}
 
-	concurrent := make(chan struct{}, s.maxConcurrent)
+	var concurrent atomic.Int32
 	br := pool.NewBR1K(c)
 	defer pool.ReleaseBR1K(br)
+	remoteAddr := netAddr2NetipAddr(c.RemoteAddr())
+	localAddr := netAddr2NetipAddr(c.LocalAddr())
 	for {
 		c.SetReadDeadline(time.Now().Add(s.idleTimeout))
 		m, n, err := dnsutils.ReadMsgFromTCP(br)
@@ -124,32 +140,32 @@ func (s *tcpServer) handleConn(c net.Conn) {
 			return
 		}
 
-		concurrent <- struct{}{}
-		go func() {
-			defer func() { <-concurrent }()
-			s.handleReq(c, m)
-			dnsmsg.ReleaseMsg(m)
-		}()
+		cc := concurrent.Add(1)
+		if cc > s.maxConcurrent ||
+			s.r.limiterAllowN(netAddr2NetipAddr(c.RemoteAddr()).Addr(), costTCPQuery) != nil {
+			resp := mustHaveRespB(m, nil, dnsmsg.RCodeRefused, true, 0)
+			c.Write(resp)
+			pool.ReleaseBuf(resp)
+			concurrent.Add(-1)
+			//TODO: log or add an entry for refused queries.
+		} else {
+			rc := getRequestContext()
+			rc.RemoteAddr = remoteAddr
+			rc.LocalAddr = localAddr
+			go func() {
+				s.handleReq(c, m, rc)
+				dnsmsg.ReleaseMsg(m)
+				releaseRequestContext(rc)
+				concurrent.Add(-1)
+			}()
+		}
 	}
 }
 
-func (s *tcpServer) handleReq(c net.Conn, m *dnsmsg.Msg) {
-	rc := getRequestContext()
-	rc.RemoteAddr = netAddr2NetipAddr(c.RemoteAddr())
-	rc.LocalAddr = netAddr2NetipAddr(c.LocalAddr())
-	defer releaseRequestContext(rc)
-
+func (s *tcpServer) handleReq(c net.Conn, m *dnsmsg.Msg, rc *RequestContext) {
 	s.r.handleServerReq(m, rc)
-
-	buf, err := packRespTCP(rc.Response.Msg, true)
-	if err != nil {
-		s.logger.Error().
-			Err(err).
-			Msg(logPackRespErr)
-		return
-	}
-
-	_, err = c.Write(buf)
+	buf := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, true, 0)
+	_, err := c.Write(buf)
 	pool.ReleaseBuf(buf)
 	if err != nil {
 		s.logger.Warn().

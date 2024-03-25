@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -94,6 +95,7 @@ type router struct {
 	cancel     context.CancelCauseFunc
 	logger     *zerolog.Logger
 	metricsReg *prometheus.Registry
+	limiter    *resourceLimiter
 
 	cache    *cacheCtl    // not nil, noop if no backend is configured
 	prefetch *prefetchCtl // not nil
@@ -123,6 +125,7 @@ func run(ctx context.Context, cfg *Config) {
 		cancel:     cancel,
 		logger:     logger,
 		metricsReg: newMetricsReg(),
+		limiter:    initResourceLimiter(cfg.Limiter),
 		prefetch:   newPrefetchCtl(),
 		upstreams:  make(map[string]*upstreamWrapper),
 		domainSets: make(map[string]*domainmatcher.MixMatcher),
@@ -283,11 +286,61 @@ func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
 	resp.OpCode = m.OpCode
 	resp.Response = true
 	resp.RecursionDesired = m.RecursionDesired
+	resp.RecursionAvailable = true
 	resp.RCode = rcode
 	for _, q := range m.Questions {
 		resp.Questions = append(resp.Questions, q.Copy())
+		break // only return one question. Avoid malicious queries.
 	}
 	return resp
+}
+
+// If resp is not nil, pack resp. Else, pack an empty resp with errRcode
+// If tcp is true, size is ignored.
+func mustHaveRespB(query, resp *dnsmsg.Msg, errRcode dnsmsg.RCode, tcp bool, size int) pool.Buffer {
+	var b pool.Buffer
+	var err error
+
+	if resp != nil {
+		if tcp {
+			b, err = packRespTCP(resp, true)
+		} else {
+			b, err = packResp(resp, true, size)
+		}
+		if err == nil {
+			return b
+		}
+		errRcode = dnsmsg.RCodeServerFailure
+		mlog.L().Error().Err(err).Msg("internal err: failed to pack dns msg")
+	}
+
+	// Failed to pack provided resp.
+	// Try to pack an empty resp.
+	resp = makeEmptyRespM(query, errRcode)
+	defer dnsmsg.ReleaseMsg(resp)
+	if tcp {
+		b, err = packRespTCP(resp, true)
+	} else {
+		b, err = packResp(resp, true, size)
+	}
+	if err == nil {
+		return b
+	}
+
+	// Failed to pack empty resp, invalid question.
+	// Now only pack header.
+	var body []byte
+	if tcp {
+		b = pool.GetBuf(2 + 12)
+		body = b[2:]
+	} else {
+		b = pool.GetBuf(12)
+		body = b
+	}
+	id, bits := resp.Header.Pack()
+	binary.BigEndian.PutUint16(body[0:], id)
+	binary.BigEndian.PutUint16(body[2:], bits)
+	return b
 }
 
 func (r *router) handleReqMsg(ctx context.Context, m *dnsmsg.Msg, rc *RequestContext) {
@@ -387,9 +440,12 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 		rc.Response.Msg = resp
 		rc.Response.Cached = true
 		r.queryCacheHitTotal.Inc()
+		r.limiterAllowN(rc.RemoteAddr.Addr(), costFromCache)
 		return
 	}
 
+	// TODO: Use different cost based on upstream protocol? 
+	r.limiterAllowN(rc.RemoteAddr.Addr(), costFromUpstream) 
 	resp, err := r.forward(ctx, upstream, q, rc.RemoteAddr.Addr())
 	if err != nil {
 		r.logger.Warn().
@@ -505,4 +561,12 @@ func (r *router) subLoggerForUpstream(tag string) *zerolog.Logger {
 	}
 	l := ctx.Logger()
 	return &l
+}
+
+// Helper func. If addr is invalid, return nil.
+func (r *router) limiterAllowN(addr netip.Addr, n int) error {
+	if !addr.IsValid() {
+		return nil
+	}
+	return r.limiter.AllowN(addr, n)
 }

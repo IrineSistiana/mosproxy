@@ -24,11 +24,6 @@ func (o *qLogObj) MarshalZerologObject(e *zerolog.Event) {
 	e.Uint16("type", uint16(q.Type))
 }
 
-const (
-	logPackRespErr = "failed to pack resp"
-	logPackReqErr  = "failed to pack req"
-)
-
 type logConn interface {
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr

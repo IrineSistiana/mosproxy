@@ -124,15 +124,7 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 
 	h.r.handleServerReq(m, rc)
 
-	msgBody, err := packResp(rc.Response.Msg, true, 65535)
-	if err != nil {
-		h.logger.Error().
-			Object("request", (*fasthttpReqLoggerObj)(ctx)).
-			Err(err).
-			Msg(logPackRespErr)
-		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-		return
-	}
+	msgBody := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, false, 65535)
 	defer pool.ReleaseBuf(msgBody)
 
 	ctx.Response.Header.Add("Content-Type", "application/dns-message")

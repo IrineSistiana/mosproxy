@@ -64,6 +64,14 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) error {
 	h.logger = r.subLoggerForServer("server_http", cfg.Tag)
 	hs.ErrorLog = log.New(mlog.WriteToLogger(*h.logger, "redirected http log", "msg"), "", 0)
 
+	var cost int
+	if useTls {
+		cost = costTLSConn
+	} else {
+		cost = costTCPConn
+	}
+	l = newListener(l, h.logger, r.limiter, cost)
+
 	h.logger.Info().
 		Str("network", l.Addr().Network()).
 		Stringer("addr", l.Addr()).
@@ -102,6 +110,7 @@ func (req *httpReqLoggerObj) MarshalZerologObject(e *zerolog.Event) {
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+
 	// check path
 	if len(h.path) > 0 && h.path != req.URL.Path {
 		h.logger.Warn().
@@ -132,6 +141,12 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		remoteAddr, _ = netip.ParseAddrPort(req.RemoteAddr)
 	}
 
+	if err := h.r.limiterAllowN(remoteAddr.Addr(), costHTTPQuery); err != nil {
+		// TODO: Log or create a metrics entry for refused queries.
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
 	m := h.readReqMsg(w, req)
 	if m == nil {
 		return
@@ -145,19 +160,11 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	h.r.handleServerReq(m, rc)
 
-	buf, err := packResp(rc.Response.Msg, true, 65535)
-	if err != nil {
-		h.logger.Error().
-			Object("request", (*httpReqLoggerObj)(req)).
-			Err(err).
-			Msg(logPackRespErr)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	defer pool.ReleaseBuf(buf)
+	msgBody := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, false, 65535)
+	defer pool.ReleaseBuf(msgBody)
 
 	w.Header().Set("Content-Type", "application/dns-message")
-	if _, err := w.Write(buf); err != nil {
+	if _, err := w.Write(msgBody); err != nil {
 		h.logger.Error().
 			Object("request", (*httpReqLoggerObj)(req)).
 			Err(err).

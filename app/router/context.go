@@ -79,4 +79,5 @@ func (rc *RequestContext) MarshalZerologObject(e *zerolog.Event) {
 	if !rc.start.IsZero() {
 		e.Dur("elapsed", time.Since(rc.start))
 	}
+	e.Uint32("qid", rc.uid)
 }

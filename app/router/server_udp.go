@@ -7,6 +7,7 @@ import (
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/internal/udpcmsg"
 	"github.com/rs/zerolog"
 )
 
@@ -27,13 +28,13 @@ func (r *router) startUdpServer(cfg *ServerConfig) (err error) {
 		logger: r.subLoggerForServer("server_udp", cfg.Tag),
 	}
 
-	if cfg.Udp.MultiRoutes && c.LocalAddr().(*net.UDPAddr).IP.IsUnspecified() {
-		var err error
-		s.oobSize, s.dstReader, s.srcWriter, err = initOobHandler(c)
+	if cfg.Udp.MultiRoutes && udpcmsg.Ok() && c.LocalAddr().(*net.UDPAddr).IP.IsUnspecified() {
+		_, err := udpcmsg.SetOpt(c)
 		if err != nil {
 			pc.Close()
-			return fmt.Errorf("failed to init oob handler, %w", err)
+			return fmt.Errorf("failed to set socket option, %w", err)
 		}
+		s.readOob = true
 	}
 
 	s.logger.Info().
@@ -47,13 +48,10 @@ func (r *router) startUdpServer(cfg *ServerConfig) (err error) {
 }
 
 type udpServer struct {
-	r      *router
-	c      *net.UDPConn
-	logger *zerolog.Logger
-
-	oobSize   int
-	dstReader func(oob []byte) (net.IP, error)
-	srcWriter func(ip net.IP) []byte
+	r       *router
+	c       *net.UDPConn
+	logger  *zerolog.Logger
+	readOob bool
 }
 
 func (s *udpServer) run() {
@@ -61,21 +59,20 @@ func (s *udpServer) run() {
 	c := s.c
 	listenerAddr := c.LocalAddr().(*net.UDPAddr).AddrPort()
 
-	rbp := pool.GetBuf(65535)
-	defer pool.ReleaseBuf(rbp)
-	rb := rbp
+	rb := pool.GetBuf(4096)
+	defer pool.ReleaseBuf(rb)
 
-	var oob []byte // maybe nil
-	if s.oobSize > 0 {
-		oobp := pool.GetBuf(s.oobSize)
-		defer pool.ReleaseBuf(oobp)
-		oob = oobp
+	var oob []byte // nil if s.readOob == false
+	if s.readOob {
+		oob = pool.GetBuf(512)
+		defer pool.ReleaseBuf(oob)
 	}
 
 	for {
+		localAddr := listenerAddr
 		n, oobn, _, remoteAddr, err := c.ReadMsgUDPAddrPort(rb, oob)
 		if err != nil {
-			if n == 0 {
+			if n <= 0 {
 				// Err with zero read. Most likely because c was closed.
 				r.fatal("udp server exited", err)
 				return
@@ -87,15 +84,10 @@ func (s *udpServer) run() {
 				Msg("temporary read err")
 			continue
 		}
-		payload := rb[:n]
 
-		var (
-			sessionOob   []byte     // maybe nil
-			oobLocalAddr netip.Addr // maybe invalid
-		)
-		localAddr := listenerAddr
-		if oobn > 0 {
-			ip, err := s.dstReader(oob[:oobn])
+		var oobLocalAddr netip.Addr // only valid if readOob
+		if s.readOob {
+			ip, err := udpcmsg.ParseLocalAddr(oob[:oobn])
 			if err != nil {
 				s.logger.Error().
 					Stringer("remote", remoteAddr).
@@ -103,17 +95,24 @@ func (s *udpServer) run() {
 					Msg("failed to get remote dst address from socket oob")
 				continue
 			}
-			oobLocalAddr, _ = netip.AddrFromSlice(ip)
-			sessionOob = s.srcWriter(ip)
-			localAddr = netip.AddrPortFrom(oobLocalAddr, listenerAddr.Port())
+			oobLocalAddr = ip
+			localAddr = netip.AddrPortFrom(ip, listenerAddr.Port())
 		}
 
-		m, err := dnsmsg.UnpackMsg(payload)
+		m, err := dnsmsg.UnpackMsg(rb[:n])
 		if err != nil {
-			s.logger.Error().
+			s.logger.Warn().
 				Stringer("remote", remoteAddr).
 				Err(err).
 				Msg("invalid query msg")
+			continue
+		}
+
+		if err := r.limiterAllowN(remoteAddr.Addr(), costUDPQuery); err != nil {
+			resp := mustHaveRespB(m, nil, dnsmsg.RCodeRefused, false, 0)
+			s.writeResp(resp, remoteAddr, oobLocalAddr)
+			pool.ReleaseBuf(resp)
+			// TODO: Log or create a metrics entry for refused queries.
 			continue
 		}
 
@@ -123,12 +122,12 @@ func (s *udpServer) run() {
 		go func() {
 			defer dnsmsg.ReleaseMsg(m)
 			defer releaseRequestContext(rc)
-			s.handleReq(remoteAddr, sessionOob, m, rc)
+			s.handleReq(m, rc, oobLocalAddr)
 		}()
 	}
 }
 
-func (s *udpServer) handleReq(remoteAddr netip.AddrPort, oob []byte, m *dnsmsg.Msg, rc *RequestContext) {
+func (s *udpServer) handleReq(m *dnsmsg.Msg, rc *RequestContext, oobAddr netip.Addr) {
 	s.r.handleServerReq(m, rc)
 
 	// Determine the client udp size. Try to find edns0.
@@ -143,16 +142,21 @@ func (s *udpServer) handleReq(remoteAddr netip.AddrPort, oob []byte, m *dnsmsg.M
 		clientUdpSize = 512
 	}
 
-	b, err := packResp(rc.Response.Msg, true, clientUdpSize)
-	if err != nil {
-		s.logger.Error().
-			Err(err).
-			Msg(logPackRespErr)
-		return
+	b := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, false, clientUdpSize)
+	s.writeResp(b, rc.RemoteAddr, oobAddr)
+	pool.ReleaseBuf(b)
+}
+
+func (s *udpServer) writeResp(b []byte, remote netip.AddrPort, oobAddr netip.Addr) {
+	var oob []byte
+	if s.readOob {
+		oob = pool.GetBuf(udpcmsg.CmsgSize(oobAddr))
+		defer pool.ReleaseBuf(oob)
+		oob = udpcmsg.CmsgPktInfo(oob, oobAddr)
 	}
-	if _, _, err := s.c.WriteMsgUDPAddrPort(b, oob, remoteAddr); err != nil {
+	if _, _, err := s.c.WriteMsgUDPAddrPort(b, oob, remote); err != nil {
 		s.logger.Warn().
-			Stringer("remote", remoteAddr).
+			Stringer("remote", remote).
 			Err(err).
 			Msg("failed to write response")
 	}

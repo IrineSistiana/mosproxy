@@ -65,7 +65,7 @@ type Header struct {
 	RCode              RCode
 }
 
-func (m *Header) pack() (id uint16, bits uint16) {
+func (m *Header) Pack() (id uint16, bits uint16) {
 	id = m.ID
 	bits = uint16(m.OpCode)<<11 | uint16(m.RCode)
 	if m.RecursionAvailable {
@@ -258,7 +258,7 @@ func (m *Msg) Pack(b []byte, compression bool, size int) (int, error) {
 	}
 
 	var h header
-	h.id, h.bits = m.Header.pack()
+	h.id, h.bits = m.Header.Pack()
 	h.questions = uint16(len(m.Questions))
 	h.answers = uint16(len(m.Answers))
 	h.authorities = uint16(len(m.Authorities))

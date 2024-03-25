@@ -95,13 +95,18 @@ func (s *quicServer) run() {
 			r.fatal("quic server exited", err)
 			return
 		}
+		debugLogServerConnAccepted(c, s.logger)
 
-		go func() {
-			defer c.CloseWithError(0, "")
-			debugLogServerConnAccepted(c, s.logger)
-			err := s.handleConn(c)
+		if err := r.limiterAllowN(netAddr2NetipAddr(c.LocalAddr()).Addr(), costQuicConn); err != nil {
 			debugLogServerConnClosed(c, s.logger, err)
-		}()
+			c.CloseWithError(0, "service unavailable, overloaded")
+		} else {
+			go func() {
+				err := s.handleConn(c)
+				debugLogServerConnClosed(c, s.logger, err)
+				c.CloseWithError(0, "")
+			}()
+		}
 	}
 }
 
@@ -114,6 +119,15 @@ func (s *quicServer) handleConn(c quic.Connection) error {
 		cancelAccept()
 		if err != nil {
 			return err
+		}
+
+		if err := s.r.limiterAllowN(remoteAddr.Addr(), costQUICQuery); err != nil {
+			// TODO: Send dns REFUSE instead of close the quic stream
+			// without any info?
+			// TODO: Log or create a metrics entry for refused queries.
+			stream.Close()
+			stream.CancelRead(0)
+			continue
 		}
 
 		// Handle stream.
@@ -150,13 +164,7 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 
 	r.handleServerReq(m, rc)
 
-	respBuf, err := packRespTCP(rc.Response.Msg, true)
-	if err != nil {
-		s.logger.Error().
-			Err(err).
-			Msg(logPackRespErr)
-		return
-	}
+	respBuf := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, true, 0)
 	defer pool.ReleaseBuf(respBuf)
 	if _, err := stream.Write(respBuf); err != nil {
 		s.logger.Warn().

@@ -182,7 +182,7 @@ func (c *cacheCtl) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg
 
 	v, err := packCacheMsg(resp)
 	if err != nil {
-		c.logger.Error().Err(err).Msg(logPackRespErr)
+		c.logger.Error().Err(err).Msg("failed to pack resp")
 		return
 	}
 	defer pool.ReleaseBuf(v)
