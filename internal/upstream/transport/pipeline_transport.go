@@ -97,6 +97,7 @@ func (t *PipelineTransport) ExchangeContext(ctx context.Context, m []byte) (*dns
 		}
 
 		resp, err := conn.exchange(ctx, m)
+		t.releaseConn(conn)
 		if err != nil {
 			errs = append(errs, err)
 			if !newConn && retry < 5 && !ctxIsDone(ctx) {
@@ -119,6 +120,10 @@ func (t *PipelineTransport) getConn(ctx context.Context) (_ *pipelineConn, newCo
 		return nil, false, err
 	}
 	return c.(*pipelineConn), newConn, nil
+}
+
+func (t *PipelineTransport) releaseConn(c *pipelineConn) {
+	t.pool.Release(c)
 }
 
 // Close closes PipelineTransport and all its connections.
