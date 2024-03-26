@@ -16,7 +16,7 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-func (r *router) startFastHttpServer(cfg *ServerConfig) error {
+func (r *router) startFastHttpServer(cfg *ServerConfig) (*fasthttp.Server, error) {
 	const defaultIdleTimeout = time.Second * 30
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
@@ -25,7 +25,7 @@ func (r *router) startFastHttpServer(cfg *ServerConfig) error {
 
 	l, err := r.listen(cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	h := &fasthttpHandler{
@@ -53,9 +53,11 @@ func (r *router) startFastHttpServer(cfg *ServerConfig) error {
 	go func() {
 		defer l.Close()
 		err := s.Serve(l)
-		r.fatal("fasthttp server exited", err)
+		if err != nil {
+			r.fatal("fasthttp server exited", err)
+		}
 	}()
-	return nil
+	return s, nil
 }
 
 type fasthttpHandler struct {

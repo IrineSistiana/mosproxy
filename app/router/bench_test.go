@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -191,8 +192,7 @@ var initBenchServerOnce = sync.OnceFunc(func() {
 	}
 	cfg := &Config{
 		Servers: []ServerConfig{
-			{Protocol: "udp", Listen: udpAddr, Socket: SocketConfig{SO_RCVBUF: 1024 * 1024, SO_SNDBUF: 1024 * 1024}},
-
+			{Protocol: "udp", Listen: udpAddr, Udp: UdpConfig{Threads: runtime.GOMAXPROCS(-1)}, Socket: SocketConfig{SO_RCVBUF: 1024 * 1024, SO_SNDBUF: 1024 * 1024}},
 			{Protocol: "tcp", Listen: tcpAddr, Tcp: TcpConfig{MaxConcurrentQueries: math.MaxInt32}},
 			{Protocol: "tcp", Listen: tcpUnixAddr, Tcp: TcpConfig{MaxConcurrentQueries: math.MaxInt32}},
 
@@ -305,9 +305,9 @@ func loopBench(b *testing.B, opts benchmarkOpts) {
 	if hide, _ := strconv.ParseBool(os.Getenv("MOSPROXY_BENCH_HIDE_LATENCY_REPORT")); !hide {
 		fmt.Printf("%s\n", lw.report())
 	} else {
-		b.ReportMetric(float64(lw.query(0.5)), "ms(latencyTP50)")
-		b.ReportMetric(float64(lw.query(0.9)), "ms(latencyTP90)")
-		b.ReportMetric(float64(lw.query(0.99)), "ms(latencyTP99)")
+		b.ReportMetric(float64(lw.query(0.5)), "ms(ltp50)")
+		b.ReportMetric(float64(lw.query(0.9)), "ms(ltp90)")
+		b.ReportMetric(float64(lw.query(0.99)), "ms(ltp99)")
 	}
 }
 

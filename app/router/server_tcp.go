@@ -3,7 +3,9 @@ package router
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,19 +19,19 @@ const (
 	defaultMaxConcurrentRequestPreTCPConn = 100
 )
 
-func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) error {
+func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) (*tcpServer, error) {
 	var tlsConfig *tls.Config
 	if useTls {
 		var err error
 		tlsConfig, err = makeTlsConfig(&cfg.Tls, true)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	l, err := r.listen(cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
@@ -40,6 +42,7 @@ func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) error {
 	if maxConcurrent <= 0 {
 		maxConcurrent = defaultMaxConcurrentRequestPreTCPConn
 	}
+
 	s := &tcpServer{
 		r:             r,
 		logger:        r.subLoggerForServer("server_tcp", cfg.Tag),
@@ -55,9 +58,12 @@ func (r *router) startTcpServer(cfg *ServerConfig, useTls bool) error {
 		Msg("tcp server started")
 	go func() {
 		defer l.Close()
-		s.run()
+		err := s.run()
+		if !errors.Is(err, errServerClosed) {
+			s.r.fatal("tcp server exited", err)
+		}
 	}()
-	return nil
+	return s, nil
 }
 
 type tcpServer struct {
@@ -68,15 +74,20 @@ type tcpServer struct {
 	tlsConfig     *tls.Config   // nil if tls is disabled
 	idleTimeout   time.Duration // valid
 	maxConcurrent int32         // valid
+
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
-func (s *tcpServer) run() {
+func (s *tcpServer) run() error {
 	r := s.r
 	for {
 		c, err := s.l.Accept()
 		if err != nil {
-			r.fatal("tcp server exited", err)
-			return
+			if s.closed.Load() {
+				return errServerClosed
+			}
+			return err
 		}
 		debugLogServerConnAccepted(c, s.logger)
 
@@ -175,4 +186,13 @@ func (s *tcpServer) handleReq(c net.Conn, m *dnsmsg.Msg, rc *RequestContext) {
 			Msg("failed to write response")
 		c.Close()
 	}
+}
+
+// Close the listener.
+func (s *tcpServer) Close() error {
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.l.Close()
+	})
+	return nil
 }

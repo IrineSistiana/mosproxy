@@ -10,6 +10,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var ctlOk = true
+
 func controlSocket(opt SocketConfig) controlFunc {
 	return func(network, _ string, c syscall.RawConn) error {
 		var (

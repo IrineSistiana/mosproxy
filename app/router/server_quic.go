@@ -2,9 +2,12 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
@@ -20,7 +23,7 @@ const (
 	quicStreamReadTimeout  = time.Second
 )
 
-func (r *router) startQuicServer(cfg *ServerConfig) error {
+func (r *router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
 		idleTimeout = defaultQuicIdleTimeout
@@ -28,7 +31,7 @@ func (r *router) startQuicServer(cfg *ServerConfig) error {
 
 	tlsConfig, err := makeTlsConfig(&cfg.Tls, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tlsConfig.NextProtos = []string{"doq"}
 
@@ -46,7 +49,7 @@ func (r *router) startQuicServer(cfg *ServerConfig) error {
 
 	uc, err := net.ListenPacket("udp", cfg.Listen)
 	if err != nil {
-		return fmt.Errorf("failed to listen socket, %w", err)
+		return nil, fmt.Errorf("failed to listen socket, %w", err)
 	}
 
 	qt := &quic.Transport{
@@ -61,7 +64,7 @@ func (r *router) startQuicServer(cfg *ServerConfig) error {
 	l, err := qt.Listen(tlsConfig, quicConfig)
 	if err != nil {
 		qt.Close()
-		return fmt.Errorf("failed to listen quic, %w", err)
+		return nil, fmt.Errorf("failed to listen quic, %w", err)
 	}
 
 	s := &quicServer{
@@ -75,9 +78,12 @@ func (r *router) startQuicServer(cfg *ServerConfig) error {
 		Msg("quic server started")
 	go func() {
 		defer l.Close()
-		s.run()
+		err := s.run()
+		if !errors.Is(err, errServerClosed) {
+			r.fatal("quic server exited", err)
+		}
 	}()
-	return nil
+	return s, nil
 }
 
 type quicServer struct {
@@ -85,15 +91,20 @@ type quicServer struct {
 	l           *quic.Listener
 	idleTimeout time.Duration
 	logger      *zerolog.Logger
+
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
-func (s *quicServer) run() {
+func (s *quicServer) run() error {
 	r := s.r
 	for {
 		c, err := s.l.Accept(context.Background())
 		if err != nil {
-			r.fatal("quic server exited", err)
-			return
+			if s.closed.Load() {
+				return errServerClosed
+			}
+			return err
 		}
 		debugLogServerConnAccepted(c, s.logger)
 
@@ -173,4 +184,12 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 			Err(err).
 			Msg("failed to write response")
 	}
+}
+
+func (s *quicServer) Close() error {
+	s.closeOnce.Do(func() {
+		s.closed.Store(true)
+		s.l.Close()
+	})
+	return nil
 }

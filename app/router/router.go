@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/app"
@@ -24,6 +25,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
 )
 
@@ -65,7 +67,31 @@ func newRouterCmd() *cobra.Command {
 				logger.Fatal().Err(err).Msg("failed to decode yaml struct")
 			}
 			logger.Info().Str("file", cfgPath).Msg("config file loaded")
-			run(cmd.Context(), cfg)
+
+			r, err := run(cmd.Context(), cfg)
+			if err != nil {
+				logger.Fatal().Err(err).Msg("failed to start router")
+			}
+
+			exitSigChan := make(chan os.Signal, 1)
+			signal.Notify(exitSigChan, append([]os.Signal{os.Interrupt}, exitSig...)...)
+
+			select {
+			case sig := <-exitSigChan:
+				err = fmt.Errorf("signal %s", sig)
+				goto shutdown
+			case <-r.ctx.Done():
+				err = context.Cause(r.ctx)
+				goto shutdown
+			case fatalErr := <-r.fatalErr:
+				logger.Fatal().Err(fatalErr.err).Msg(fatalErr.msg)
+			}
+
+		shutdown:
+			logger.Info().AnErr("cause", err).Msg("router exiting")
+			r.close(err)
+			logger.Info().Msg("router exited, context closed")
+			os.Exit(0)
 		},
 	}
 	c.Flags().StringVarP(&cfgPath, "config", "c", "config.json", "path of the config file")
@@ -96,20 +122,23 @@ type router struct {
 	logger     *zerolog.Logger
 	metricsReg *prometheus.Registry
 	limiter    *resourceLimiter
-
-	cache    *cacheCtl    // not nil, noop if no backend is configured
-	prefetch *prefetchCtl // not nil
-
-	upstreams  map[string]*upstreamWrapper
-	domainSets map[string]*domainmatcher.MixMatcher
-	rules      []*rule
-
-	fatalErr chan fatalErr
+	fatalErr   chan fatalErr
+	errGroup   *errgroup.Group
+	prefetch   *prefetchCtl
 
 	// metrics
 	queryTotal         prometheus.Counter
 	queryCacheHitTotal prometheus.Counter
 	prefetchTotal      prometheus.Counter
+
+	closeOnce sync.Once
+
+	// init later
+	cache         *cacheCtl // not nil, noop if no backend is configured
+	upstreams     map[string]*upstreamWrapper
+	domainSets    map[string]*domainmatcher.MixMatcher
+	rules         []*rule
+	serverClosers []func()
 }
 
 type fatalErr struct {
@@ -117,19 +146,21 @@ type fatalErr struct {
 	err error
 }
 
-func run(ctx context.Context, cfg *Config) {
+func run(ctx context.Context, cfg *Config) (_ *router, err error) {
 	logger := mlog.L()
-	routerCtx, cancel := context.WithCancelCause(ctx)
+	eg, ctx := errgroup.WithContext(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	r := &router{
-		ctx:        routerCtx,
+		ctx:        ctx,
 		cancel:     cancel,
 		logger:     logger,
 		metricsReg: newMetricsReg(),
 		limiter:    initResourceLimiter(cfg.Limiter),
+		fatalErr:   make(chan fatalErr, 1),
+		errGroup:   eg,
 		prefetch:   newPrefetchCtl(),
 		upstreams:  make(map[string]*upstreamWrapper),
 		domainSets: make(map[string]*domainmatcher.MixMatcher),
-		fatalErr:   make(chan fatalErr, 1),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "query_total",
@@ -147,25 +178,42 @@ func run(ctx context.Context, cfg *Config) {
 	r.opt.logQueries = cfg.Log.Queries
 	r.opt.ecsEnabled = cfg.ECS.Enabled
 
-	err := regMetrics(r.metricsReg,
+	// close r if failed to init
+	defer func() {
+		if err != nil {
+			r.close(err)
+		}
+	}()
+
+	err = regMetrics(r.metricsReg,
 		r.queryTotal,
 		r.queryCacheHitTotal,
 		r.prefetchTotal,
 	)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to reg prometheus metrics")
+		err = fmt.Errorf("failed to reg prometheus metrics, %w", err)
+		return
 	}
 
 	// start metrics endpoint
 	if addr := cfg.Metrics.Addr; len(addr) > 0 {
 		l, err := net.Listen("tcp", addr)
 		if err != nil {
-			logger.Fatal().Err(err).Msg("failed to start prometheus metrics endpoint server")
+			err = fmt.Errorf("failed to start prometheus metrics endpoint server, %w", err)
+			return nil, err
 		}
+
 		logger.Info().Stringer("addr", l.Addr()).Msg("metrics endpoint server started")
+
+		s := http.Server{
+			Handler: promhttp.HandlerFor(r.metricsReg, promhttp.HandlerOpts{}),
+		}
+		r.serverClosers = append(r.serverClosers, func() { s.Close() })
 		go func() {
-			err := http.Serve(l, promhttp.HandlerFor(r.metricsReg, promhttp.HandlerOpts{}))
-			r.fatal("metrics endpoint exited", err)
+			err := s.Serve(l)
+			if !errors.Is(err, http.ErrServerClosed) {
+				r.fatal("metrics endpoint exited", err)
+			}
 		}()
 	}
 
@@ -173,7 +221,8 @@ func run(ctx context.Context, cfg *Config) {
 	for i, upstreamCfg := range cfg.Upstreams {
 		err := r.initUpstream(&upstreamCfg)
 		if err != nil {
-			logger.Fatal().Int("index", i).Err(err).Msg("failed to init upstream")
+			err = fmt.Errorf("failed to init upstream #%d, %w", i, err)
+			return nil, err
 		}
 	}
 
@@ -181,7 +230,8 @@ func run(ctx context.Context, cfg *Config) {
 	for i, domainSet := range cfg.DomainSets {
 		err := r.loadDomainSet(&domainSet)
 		if err != nil {
-			logger.Fatal().Int("index", i).Err(err).Msg("failed to init domain set")
+			err = fmt.Errorf("failed to init domain set #%d, %w", i, err)
+			return nil, err
 		}
 	}
 
@@ -189,7 +239,8 @@ func run(ctx context.Context, cfg *Config) {
 	for i, ruleCfg := range cfg.Rules {
 		ru, err := r.loadRule(&ruleCfg)
 		if err != nil {
-			logger.Fatal().Int("index", i).Err(err).Msg("failed to load rule")
+			err = fmt.Errorf("failed to load rule #%d, %w", i, err)
+			return nil, err
 		}
 		r.rules = append(r.rules, ru)
 	}
@@ -197,15 +248,18 @@ func run(ctx context.Context, cfg *Config) {
 	// init cache
 	cache, err := r.initCache(&cfg.Cache)
 	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to init cache")
+		err = fmt.Errorf("failed to init cache, %w", err)
+		return
 	}
 	r.cache = cache
 
 	// start servers
 	for i, serverCfg := range cfg.Servers {
-		err := r.startServer(&serverCfg)
+		closer, err := r.startServer(&serverCfg)
+		r.serverClosers = append(r.serverClosers, closer)
 		if err != nil {
-			logger.Fatal().Int("index", i).Err(err).Msg("failed to start server")
+			err = fmt.Errorf("failed to start server #%d, %w", i, err)
+			return nil, err
 		}
 	}
 
@@ -213,26 +267,33 @@ func run(ctx context.Context, cfg *Config) {
 	debug.FreeOSMemory()
 	logger.Info().Msg("router is up and running")
 
-	// TODO: Graceful shutdown?
-	exitSigChan := make(chan os.Signal, 1)
-	signal.Notify(exitSigChan, append([]os.Signal{os.Interrupt}, exitSig...)...)
-	select {
-	case sig := <-exitSigChan:
-		logger.Info().Stringer("signal", sig).Msg("router exiting on signal")
-		os.Exit(0)
-	case <-ctx.Done():
-		err := context.Cause(ctx)
-		logger.Info().AnErr("cause", err).Msg("router exiting, context closed")
-		os.Exit(0)
-	case fatalErr := <-r.fatalErr:
-		logger.Fatal().Err(fatalErr.err).Msg(fatalErr.msg)
-	}
+	return r, nil
 }
 
 func (r *router) fatal(msg string, err error) {
 	select {
 	case r.fatalErr <- fatalErr{msg: msg, err: err}:
 	default:
+	}
+}
+
+func (r *router) close(err error) {
+	r.closeOnce.Do(func() {
+		r.closeImpl(err)
+	})
+}
+
+func (r *router) closeImpl(err error) {
+	r.cancel(err)
+	r.limiter.Close()
+	for _, u := range r.upstreams {
+		u.u.Close()
+	}
+	if r.cache != nil {
+		r.cache.Close()
+	}
+	for _, f := range r.serverClosers {
+		f()
 	}
 }
 
@@ -444,8 +505,8 @@ func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestC
 		return
 	}
 
-	// TODO: Use different cost based on upstream protocol? 
-	r.limiterAllowN(rc.RemoteAddr.Addr(), costFromUpstream) 
+	// TODO: Use different cost based on upstream protocol?
+	r.limiterAllowN(rc.RemoteAddr.Addr(), costFromUpstream)
 	resp, err := r.forward(ctx, upstream, q, rc.RemoteAddr.Addr())
 	if err != nil {
 		r.logger.Warn().

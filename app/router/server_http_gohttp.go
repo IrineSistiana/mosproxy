@@ -2,6 +2,7 @@ package router
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,7 +19,7 @@ import (
 	"golang.org/x/net/http2"
 )
 
-func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) error {
+func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, error) {
 	const defaultIdleTimeout = time.Second * 30
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
@@ -44,13 +45,13 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) error {
 		MaxUploadBufferPerConnection: 65535, // http2 minimum
 		MaxUploadBufferPerStream:     65535, // http2 minimum
 	}); err != nil {
-		return fmt.Errorf("failed to setup http2 server, %w", err)
+		return nil, fmt.Errorf("failed to setup http2 server, %w", err)
 	}
 
 	if useTls {
 		tlsConfig, err := makeTlsConfig(&cfg.Tls, true)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h2")
 		hs.TLSConfig = tlsConfig
@@ -58,7 +59,7 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) error {
 
 	l, err := r.listen(cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	h.localAddr = netAddr2NetipAddr(l.Addr()) // maybe nil
 	h.logger = r.subLoggerForServer("server_http", cfg.Tag)
@@ -84,9 +85,11 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) error {
 		} else {
 			err = hs.Serve(l)
 		}
-		r.fatal("http server exited", err)
+		if !errors.Is(err, http.ErrServerClosed) {
+			r.fatal("http server exited", err)
+		}
 	}()
-	return nil
+	return hs, nil
 }
 
 type httpHandler struct {
@@ -110,7 +113,6 @@ func (req *httpReqLoggerObj) MarshalZerologObject(e *zerolog.Event) {
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-
 	// check path
 	if len(h.path) > 0 && h.path != req.URL.Path {
 		h.logger.Warn().

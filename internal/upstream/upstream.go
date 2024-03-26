@@ -323,7 +323,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		}
 
 		t := &quic.Transport{
-			Conn:              uc,
+			Conn: uc,
 		}
 		srk, _, err := utils.InitQUICSrkFromIfaceMac()
 		if err != nil {

@@ -40,6 +40,7 @@ type ServerConfig struct {
 
 type UdpConfig struct {
 	MultiRoutes bool `yaml:"multi_routes"`
+	Threads     int  `yaml:"threads"`
 }
 
 type TcpConfig struct {

@@ -31,10 +31,11 @@ type pipelineConn struct {
 	ctx         context.Context
 	cancelCause context.CancelCauseFunc
 
-	m       sync.RWMutex
-	closed  bool
-	nextQid int
-	queue   map[uint32]chan *dnsmsg.Msg // uint32 for faster map
+	m        sync.RWMutex
+	closed   bool
+	nextQid  int
+	reserved int
+	queue    map[uint32]chan *dnsmsg.Msg // uint32 for faster map
 }
 
 func newPipelineConn(c net.Conn, t *PipelineTransport) *pipelineConn {
@@ -60,7 +61,7 @@ func (c *pipelineConn) exchange(ctx context.Context, m []byte) (*dnsmsg.Msg, err
 	respChan := make(chan *dnsmsg.Msg, 1)
 	qid, err := c.addQueueC(respChan)
 	if err != nil {
-		return nil, err
+		return nil, err // TODO: pool may return connection that is eof
 	}
 	defer c.deleteQueueC(qid)
 
@@ -178,8 +179,16 @@ func (c *pipelineConn) Status() (s connpool.ConnStatus) {
 	defer c.m.RUnlock()
 
 	s.Closed = c.closed
-	s.Available = c.nextQid <= 65535
+	s.Available = c.nextQid+c.reserved <= 65535
 	return s
+}
+
+func (c *pipelineConn) Reserve() {
+	c.m.Lock()
+	defer c.m.Unlock()
+	if c.nextQid+c.reserved < 65535 {
+		c.reserved++
+	}
 }
 
 // closeWithErr closes this pipelineConn. The error will be sent
@@ -214,12 +223,16 @@ func (c *pipelineConn) addQueueC(respChan chan *dnsmsg.Msg) (uint16, error) {
 	c.m.Lock()
 	defer c.m.Unlock()
 
+	if c.reserved > 0 {
+		c.reserved--
+	}
 	if c.nextQid > 65535 {
 		return 0, errPipelineConnEoL
 	}
 	qid := uint16(c.nextQid)
 	c.nextQid++
 	c.queue[uint32(qid)] = respChan
+
 	return qid, nil
 }
 

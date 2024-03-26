@@ -8,7 +8,12 @@ import (
 	"sync"
 
 	"github.com/IrineSistiana/bytespool"
+	"github.com/IrineSistiana/gopool"
 )
+
+func Go(fn func()) {
+	gopool.Go(fn)
+}
 
 type Buffer []byte
 

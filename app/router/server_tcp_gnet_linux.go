@@ -3,10 +3,12 @@
 package router
 
 import (
+	"context"
 	"encoding/binary"
 	"net/netip"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,7 +18,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func (r *router) startGnetServer(cfg *ServerConfig) error {
+func (r *router) startGnetServer(cfg *ServerConfig) (*gnetServer, error) {
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
 		idleTimeout = defaultTCPIdleTimeout
@@ -33,23 +35,22 @@ func (r *router) startGnetServer(cfg *ServerConfig) error {
 		proto = "tcp"
 	}
 	addr := proto + "://" + cfg.Listen
-	e := &gnetEngine{
+	e := &gnetServer{
 		logger:        r.subLoggerForServer("server_gnet", cfg.Tag),
 		r:             r,
+		engineReady:   make(chan struct{}),
 		idleTimeout:   idleTimeout,
 		maxConcurrent: maxConcurrent,
 	}
 
 	socketOpts := cfg.Socket // TODO: Impl all options.
+
+	engineErr := make(chan error, 1)
 	go func() {
 		cpuNum := runtime.NumCPU()
 		if cpuNum > 4 {
 			cpuNum = 4
 		}
-		e.logger.Info().
-			Str("addr", addr).
-			Int("threads", cpuNum).
-			Msg("gnet engine is starting")
 
 		err := gnet.Run(e, addr,
 			gnet.WithNumEventLoop(cpuNum),
@@ -58,18 +59,35 @@ func (r *router) startGnetServer(cfg *ServerConfig) error {
 			gnet.WithReusePort(socketOpts.SO_REUSEPORT),
 			gnet.WithLogger(&gnetLogger{l: *e.logger}),
 		)
-		r.fatal("gnet engine exited", err)
+		engineErr <- err
+		if !e.closed.Load() {
+			r.fatal("gnet engine exited", err)
+		}
 	}()
 
-	return nil
+	select {
+	case err := <-engineErr:
+		return nil, err
+	case <-e.engineReady:
+		e.logger.Info().
+			Str("addr", addr).
+			Msg("gnet engine started")
+		return e, nil
+	}
 }
 
-type gnetEngine struct {
+type gnetServer struct {
 	r      *router
 	logger *zerolog.Logger // not nil
 
+	engineReady chan struct{}
+	engine      gnet.Engine
+
 	idleTimeout   time.Duration // valid
 	maxConcurrent int32         // valid
+
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 type connCtx struct {
@@ -97,14 +115,15 @@ func (cc *connCtx) saveFirstErr(err error) {
 
 // OnBoot fires when the engine is ready for accepting connections.
 // The parameter engine has information and various utilities.
-func (e *gnetEngine) OnBoot(eng gnet.Engine) (action gnet.Action) {
-	e.logger.Info().Msg("engine started")
+func (e *gnetServer) OnBoot(eng gnet.Engine) (action gnet.Action) {
+	e.engine = eng
+	close(e.engineReady)
 	return gnet.None
 }
 
 // OnShutdown fires when the engine is being shut down, it is called right after
 // all event-loops and connections are closed.
-func (e *gnetEngine) OnShutdown(eng gnet.Engine) {
+func (e *gnetServer) OnShutdown(eng gnet.Engine) {
 	e.logger.Info().Msg("engine stopped")
 }
 
@@ -113,7 +132,7 @@ func (e *gnetEngine) OnShutdown(eng gnet.Engine) {
 // The Conn c has information about the connection such as its local and remote addresses.
 // The parameter out is the return value which is going to be sent back to the peer.
 // Sending large amounts of data back to the peer in OnOpen is usually not recommended.
-func (e *gnetEngine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
+func (e *gnetServer) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 	debugLogServerConnAccepted(c, e.logger)
 
 	// TODO: Reuse cc?
@@ -134,7 +153,7 @@ func (e *gnetEngine) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 
 // OnClose fires when a connection has been closed.
 // The parameter err is the last known connection error.
-func (e *gnetEngine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+func (e *gnetServer) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	cc := c.Context().(*connCtx)
 	cc.idleTimer.Stop()
 
@@ -152,7 +171,7 @@ func (e *gnetEngine) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 // as this []byte will be reused within event-loop after OnTraffic() returns.
 // If you have to use this []byte in a new goroutine, you should either make a copy of it or call Conn.Read([]byte)
 // to read data into your own []byte, then pass the new []byte to the new goroutine.
-func (e *gnetEngine) OnTraffic(c gnet.Conn) (action gnet.Action) {
+func (e *gnetServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	cc := c.Context().(*connCtx)
 	cc.idleTimer.Reset(e.idleTimeout)
 
@@ -269,8 +288,16 @@ read:
 
 // OnTick fires immediately after the engine starts and will fire again
 // following the duration specified by the delay return value.
-func (e *gnetEngine) OnTick() (delay time.Duration, action gnet.Action) {
+func (e *gnetServer) OnTick() (delay time.Duration, action gnet.Action) {
 	return
+}
+
+func (e *gnetServer) Close() error {
+	e.closeOnce.Do(func() {
+		e.closed.Store(true)
+		e.engine.Stop(context.Background())
+	})
+	return nil
 }
 
 type gnetLogger struct {
@@ -278,21 +305,21 @@ type gnetLogger struct {
 }
 
 func (l *gnetLogger) Debugf(format string, args ...interface{}) {
-	l.l.Debug().Msgf(format, args...)
+	l.l.Debug().Str("redirect_from", "gnet").Msgf(format, args...)
 }
 
 func (l *gnetLogger) Infof(format string, args ...interface{}) {
-	l.l.Info().Msgf(format, args...)
+	l.l.Info().Str("redirect_from", "gnet").Msgf(format, args...)
 }
 
 func (l *gnetLogger) Warnf(format string, args ...interface{}) {
-	l.l.Warn().Msgf(format, args...)
+	l.l.Warn().Str("redirect_from", "gnet").Msgf(format, args...)
 }
 
 func (l *gnetLogger) Errorf(format string, args ...interface{}) {
-	l.l.Error().Msgf(format, args...)
+	l.l.Error().Str("redirect_from", "gnet").Msgf(format, args...)
 }
 
 func (l *gnetLogger) Fatalf(format string, args ...interface{}) {
-	l.l.Fatal().Msgf(format, args...)
+	l.l.Fatal().Str("redirect_from", "gnet").Msgf(format, args...)
 }

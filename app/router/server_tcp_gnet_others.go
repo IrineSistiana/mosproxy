@@ -8,6 +8,12 @@ import (
 
 var errGnetNotSupported = errors.New("gnet backend tcp server only support linux system")
 
-func (r *router) startGnetServer(cfg *ServerConfig) error {
-	return errGnetNotSupported
+type gnetEngine struct{}
+
+func (gnetEngine) Close() error {
+	panic("not impl")
+}
+
+func (r *router) startGnetServer(cfg *ServerConfig) (*gnetEngine, error) {
+	return nil, errGnetNotSupported
 }

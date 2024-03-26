@@ -1,28 +1,65 @@
 package router
 
 import (
+	"errors"
 	"fmt"
 )
 
-func (r *router) startServer(cfg *ServerConfig) error {
+var (
+	errServerClosed = errors.New("server closed")
+)
+
+func (r *router) startServer(cfg *ServerConfig) (func(), error) {
 	switch cfg.Protocol {
 	case "", "udp":
-		return r.startUdpServer(cfg)
+		s, err := r.startUdpServer(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Close() }, nil
 	case "tcp":
-		return r.startTcpServer(cfg, false)
+		s, err := r.startTcpServer(cfg, false)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Close() }, nil
 	case "gnet":
-		return r.startGnetServer(cfg)
+		s, err := r.startGnetServer(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Close() }, nil
 	case "tls":
-		return r.startTcpServer(cfg, true)
+		s, err := r.startTcpServer(cfg, true)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Close() }, nil
 	case "http":
-		return r.startHttpServer(cfg, false)
+		s, err := r.startHttpServer(cfg, false)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Close() }, nil
 	case "fasthttp":
-		return r.startFastHttpServer(cfg)
+		s, err := r.startFastHttpServer(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Shutdown() }, nil
 	case "https":
-		return r.startHttpServer(cfg, true)
+		s, err := r.startHttpServer(cfg, true)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Close() }, nil
 	case "quic":
-		return r.startQuicServer(cfg)
+		s, err := r.startQuicServer(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Close() }, nil
 	default:
-		return fmt.Errorf("invalid server protocol [%s]", cfg.Protocol)
+		return nil, fmt.Errorf("invalid server protocol [%s]", cfg.Protocol)
 	}
 }
