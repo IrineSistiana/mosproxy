@@ -3,11 +3,14 @@ package router
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"io"
 	"log"
+	"net"
 	"net/netip"
 	"time"
 
+	"github.com/IrineSistiana/gopool"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
@@ -16,7 +19,7 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-func (r *router) startFastHttpServer(cfg *ServerConfig) (*fasthttp.Server, error) {
+func (r *Router) startFastHttpServer(cfg *ServerConfig) (*fastHttpServer, error) {
 	const defaultIdleTimeout = time.Second * 30
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
@@ -28,40 +31,117 @@ func (r *router) startFastHttpServer(cfg *ServerConfig) (*fasthttp.Server, error
 		return nil, err
 	}
 
+	logger := r.subLoggerForServer("server_fasthttp", cfg.Tag)
 	h := &fasthttpHandler{
 		r:                r,
 		clientAddrHeader: cfg.Http.ClientAddrHeader,
-		logger:           r.subLoggerForServer("server_fasthttp", cfg.Tag),
+		logger:           logger,
 	}
 	h.logger.Info().
 		Str("network", l.Addr().Network()).
 		Stringer("addr", l.Addr()).
 		Msg("fasthttp server started")
-	s := &fasthttp.Server{
-		Handler:                      h.HandleFastHTTP,
-		ReadTimeout:                  time.Second * 5,
-		WriteTimeout:                 time.Second * 5,
-		IdleTimeout:                  idleTimeout,
-		MaxRequestBodySize:           65535,
+
+	fs := &fasthttp.Server{
+		Handler:      h.HandleFastHTTP,
+		ReadTimeout:  time.Second * 5,
+		WriteTimeout: time.Second * 5,
+		IdleTimeout:  idleTimeout,
+
+		// TODO: Configurable buffer size?
+		ReadBufferSize:     512,
+		WriteBufferSize:    512,
+		MaxRequestBodySize: 512,
+
 		DisablePreParseMultipartForm: true,
 		NoDefaultServerHeader:        true,
 		NoDefaultDate:                true,
-		StreamRequestBody:            true,
-		Logger:                       log.New(mlog.WriteToLogger(*h.logger, "redirected fasthttp log", "msg"), "", 0),
+		StreamRequestBody:            false,
+		Logger:                       log.New(mlog.WriteToLogger(logger, "redirected fasthttp log", "msg"), "", 0),
 	}
 
+	s := newFastHttpServer(fs, l, logger)
 	go func() {
 		defer l.Close()
-		err := s.Serve(l)
+		err := s.serve()
 		if err != nil {
-			r.fatal("fasthttp server exited", err)
+			if !errors.Is(err, errServerClosed) {
+				r.fatal("fasthttp server exited", err)
+			}
 		}
 	}()
 	return s, nil
 }
 
+type fastHttpServer struct {
+	s      *fasthttp.Server
+	l      net.Listener
+	logger *zerolog.Logger
+
+	ct *connTracker[net.Conn]
+}
+
+func newFastHttpServer(s *fasthttp.Server, l net.Listener, logger *zerolog.Logger) *fastHttpServer {
+	return &fastHttpServer{
+		s:      s,
+		l:      l,
+		logger: logger,
+		ct:     newConnTracker(func(c net.Conn) { c.Close() }, func() { l.Close() }),
+	}
+}
+
+func (s *fastHttpServer) serve() error {
+	workerPool := gopool.NewPool[fasthttpJobArgs]()
+	defer workerPool.Close()
+
+	for {
+		c, err := s.l.Accept()
+		if err != nil {
+			if s.ct.Closed() {
+				return errServerClosed
+			}
+			return err
+		}
+
+		if !s.ct.Add(c) {
+			c.Close()
+			continue
+		}
+		workerPool.GoJob(gopool.Job[fasthttpJobArgs]{
+			Args: fasthttpJobArgs{
+				s: s,
+				c: c,
+			},
+			Fn: doFasthttpJob,
+		})
+	}
+}
+
+type fasthttpJobArgs struct {
+	s *fastHttpServer
+	c net.Conn
+}
+
+func doFasthttpJob(a fasthttpJobArgs) {
+	s, c := a.s, a.c
+
+	defer s.ct.Del(c)
+	err := s.s.ServeConn(c)
+	if err != nil {
+		s.logger.Warn().Err(err).
+			Stringer("local", c.LocalAddr()).
+			Stringer("remote", c.RemoteAddr()).
+			Msg("failed to serve conn")
+	}
+}
+
+func (s *fastHttpServer) Close() error {
+	s.ct.Close()
+	return nil
+}
+
 type fasthttpHandler struct {
-	r                *router
+	r                *Router
 	path             string
 	clientAddrHeader string
 	logger           *zerolog.Logger
@@ -119,14 +199,9 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	rc := getRequestContext()
-	rc.RemoteAddr = remoteAddr
-	rc.LocalAddr = localAddr
-	defer releaseRequestContext(rc)
-
-	h.r.handleServerReq(m, rc)
-
-	msgBody := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, false, 65535)
+	resp, _ := h.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr})
+	defer dnsmsg.ReleaseMsg(resp)
+	msgBody := mustHaveRespB(resp, false, 65535)
 	defer pool.ReleaseBuf(msgBody)
 
 	ctx.Response.Header.Add("Content-Type", "application/dns-message")

@@ -37,6 +37,7 @@ type resourceLimiter struct {
 }
 
 // Return errGlobalRateLimit, errClientRateLimit, or nil.
+// If addr is invalid, only global limit will apply.
 func (l *resourceLimiter) AllowN(addr netip.Addr, n int) error {
 	now := time.Now()
 	if l.global != nil {
@@ -44,7 +45,7 @@ func (l *resourceLimiter) AllowN(addr netip.Addr, n int) error {
 			return errGlobalResLimit
 		}
 	}
-	if l.cl != nil {
+	if l.cl != nil && addr.IsValid() {
 		if !l.cl.AllowN(addr, now, n) {
 			return errClientResLimit
 		}

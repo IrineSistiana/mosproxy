@@ -11,7 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-func (r *router) initUpstream(cfg *UpstreamConfig) error {
+func (r *Router) initUpstream(cfg *UpstreamConfig) error {
 	if len(cfg.Tag) == 0 {
 		return errors.New("missing tag")
 	}

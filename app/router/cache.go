@@ -29,7 +29,7 @@ const (
 	prefetchTimeout    = time.Second * 6
 )
 
-func (r *router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
+func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 	c := new(cacheCtl)
 	c.logger = r.subLogger("cache")
 	c.maximumTtl = time.Duration(cfg.MaximumTTL) * time.Second
@@ -216,57 +216,56 @@ func (c *cacheCtl) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg
 	}
 }
 
+func (c *cacheCtl) Key(q *dnsmsg.Question, remoteAddr netip.Addr) (k pool.Buffer, ipMark string) {
+	ipMark = c.ipMark(remoteAddr)
+	return cacheKey(q, ipMark), ipMark
+}
+
 // If cache hit, Get will return a resp (not shared). It is the caller's
 // responsibility to release the reap. TTLs of the reap are properly subtracted.
-func (c *cacheCtl) Get(ctx context.Context, q *dnsmsg.Question, rc *RequestContext) (_ *dnsmsg.Msg, storedTime, expireTime time.Time) {
-	ipMark := c.ipMark(rc.RemoteAddr.Addr())
-	rc.Response.IpMark = ipMark
+// Non-blocking func.
+func (c *cacheCtl) GetMemoryCache(key []byte) (_ *dnsmsg.Msg, storedTime, expireTime time.Time) {
+	if c.memory == nil {
+		return
+	}
+	v, storedTime, expireTime := c.memory.Get(key)
+	if v != nil {
+		m, err := unpackCacheMsg(v)
+		pool.ReleaseBuf(v)
+		if err != nil {
+			c.logger.Err(err).Msg("invalid cache data in memory")
+			// TODO: Remove the invalid data here?
+			return nil, time.Time{}, time.Time{}
+		}
+		dnsutils.SubtractTTL(m, uint32(time.Since(storedTime).Seconds()))
+		return m, storedTime, expireTime
+	}
+	return nil, time.Time{}, time.Time{}
+}
 
-	if c.memory == nil && c.redis == nil {
+// If cache hit, Get will return a resp (not shared). It is the caller's
+// responsibility to release the reap. TTLs of the reap are properly subtracted.
+// It will also save a copy to memory cache if it is enabled.
+// Blocking func.
+func (c *cacheCtl) GetRedisCache(ctx context.Context, key []byte) (_ *dnsmsg.Msg, storedTime, expireTime time.Time) {
+	if c.redis == nil {
 		return
 	}
 
-	key := cacheKey(q, ipMark)
-	defer pool.ReleaseBuf(key)
-
-	// memory cache
-	if c.memory != nil {
-		var v pool.Buffer
-		v, storedTime, expireTime = c.memory.Get(key)
-		if v != nil {
-			m, err := unpackCacheMsg(v)
-			pool.ReleaseBuf(v)
-			if err != nil {
-				c.logger.Err(err).Msg("invalid cache data in memory")
-				// TODO: Remove the invalid data here?
-				goto redis
-			}
-			dnsutils.SubtractTTL(m, uint32(time.Since(storedTime).Seconds()))
-			return m, storedTime, expireTime
+	storedTime, expireTime, v := c.redis.Get(ctx, key)
+	if v != nil { // hit
+		m, err := unpackCacheMsg(v)
+		if err != nil {
+			c.logger.Err(err).Msg("invalid cache data in redis")
+			// TODO: Remove the invalid data here?
+			return nil, time.Time{}, time.Time{}
 		}
-	}
-
-redis:
-	// memory cache missed, try redis
-	if c.redis != nil {
-		var v []byte
-		storedTime, expireTime, v = c.redis.Get(ctx, key)
-		if v != nil { // hit
-			m, err := unpackCacheMsg(v)
-			if err != nil {
-				c.logger.Err(err).Msg("invalid cache data in redis")
-				// TODO: Remove the invalid data here?
-				goto end
-			}
-			if c.memory != nil { // put v into memory cache
-				c.memory.Store(key, storedTime, expireTime, v, true)
-			}
-			dnsutils.SubtractTTL(m, uint32(time.Since(storedTime).Seconds()))
-			return m, storedTime, expireTime
+		if c.memory != nil { // put v into memory cache
+			c.memory.Store(key, storedTime, expireTime, v, true)
 		}
+		dnsutils.SubtractTTL(m, uint32(time.Since(storedTime).Seconds()))
+		return m, storedTime, expireTime
 	}
-
-end:
 	return nil, time.Time{}, time.Time{}
 }
 

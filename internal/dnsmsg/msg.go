@@ -283,7 +283,7 @@ func (m *Msg) Pack(b []byte, compression bool, size int) (int, error) {
 	}
 
 	var compressionMap map[string]uint16
-	if compression {
+	if compression && len(m.Questions)+len(m.Answers)+len(m.Authorities)+len(m.Additionals) > 1 {
 		compressionMap = newCompressionMap()
 		defer releaseCompressionMap(compressionMap)
 	}

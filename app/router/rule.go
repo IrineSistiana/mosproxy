@@ -13,7 +13,7 @@ type rule struct {
 	upstream *upstreamWrapper // maybe nil
 }
 
-func (r *router) loadRule(cfg *RuleConfig) (*rule, error) {
+func (r *Router) loadRule(cfg *RuleConfig) (*rule, error) {
 	ru := new(rule)
 	if len(cfg.Domain) > 0 {
 		m := r.domainSets[cfg.Domain]

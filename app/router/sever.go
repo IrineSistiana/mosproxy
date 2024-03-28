@@ -3,13 +3,15 @@ package router
 import (
 	"errors"
 	"fmt"
+
+	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 )
 
 var (
 	errServerClosed = errors.New("server closed")
 )
 
-func (r *router) startServer(cfg *ServerConfig) (func(), error) {
+func (r *Router) startServer(cfg *ServerConfig) (closeFn func(), err error) {
 	switch cfg.Protocol {
 	case "", "udp":
 		s, err := r.startUdpServer(cfg)
@@ -46,7 +48,7 @@ func (r *router) startServer(cfg *ServerConfig) (func(), error) {
 		if err != nil {
 			return nil, err
 		}
-		return func() { s.Shutdown() }, nil
+		return func() { s.Close() }, nil
 	case "https":
 		s, err := r.startHttpServer(cfg, true)
 		if err != nil {
@@ -62,4 +64,9 @@ func (r *router) startServer(cfg *ServerConfig) (func(), error) {
 	default:
 		return nil, fmt.Errorf("invalid server protocol [%s]", cfg.Protocol)
 	}
+}
+
+type RespWriter interface {
+	// Must be called once.
+	WriteResp(m *dnsmsg.Msg)
 }

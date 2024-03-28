@@ -207,15 +207,14 @@ var initBenchServerOnce = sync.OnceFunc(func() {
 
 			{Protocol: "quic", Listen: quicAddr, Tls: tlsOpts, Quic: QuicConfig{MaxStreams: math.MaxInt}},
 
-			{Protocol: "gnet", Listen: gnetAddr, Tcp: TcpConfig{}},
+			{Protocol: "gnet", Listen: gnetAddr, Tcp: TcpConfig{Threads: 4}},
 		},
 	}
-	go func() {
-		mlog.SetLvl(zerolog.Disabled) // disable log
-		run(context.Background(), cfg)
-	}()
-	// TODO: Use chan to sync
-	time.Sleep(time.Millisecond * 100) // wait server
+	mlog.SetLvl(zerolog.Disabled) // disable log
+	_, err := Run(context.Background(), cfg)
+	if err != nil {
+		panic(fmt.Sprintf("failed to start server, %s", err))
+	}
 })
 
 type benchmarkOpts struct {

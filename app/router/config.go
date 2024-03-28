@@ -45,6 +45,7 @@ type UdpConfig struct {
 
 type TcpConfig struct {
 	MaxConcurrentQueries int32 `yaml:"max_concurrent_queries"`
+	Threads              int   `yaml:"threads"`
 }
 
 type TlsConfig struct {

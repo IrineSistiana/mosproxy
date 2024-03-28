@@ -8,7 +8,7 @@ import (
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
 )
 
-func (r *router) loadDomainSet(cfg *DomainSetConfig) error {
+func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
 	if len(cfg.Tag) == 0 {
 		return errors.New("missing tag")
 	}

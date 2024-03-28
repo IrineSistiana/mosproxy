@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/binary"
 	"net/netip"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +17,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func (r *router) startGnetServer(cfg *ServerConfig) (*gnetServer, error) {
+func (r *Router) startGnetServer(cfg *ServerConfig) (*gnetServer, error) {
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
 		idleTimeout = defaultTCPIdleTimeout
@@ -47,13 +46,13 @@ func (r *router) startGnetServer(cfg *ServerConfig) (*gnetServer, error) {
 
 	engineErr := make(chan error, 1)
 	go func() {
-		cpuNum := runtime.NumCPU()
-		if cpuNum > 4 {
-			cpuNum = 4
+		threads := 1
+		if t := cfg.Tcp.Threads; t > 1 {
+			threads = t
 		}
-
+		threads = min(threads)
 		err := gnet.Run(e, addr,
-			gnet.WithNumEventLoop(cpuNum),
+			gnet.WithNumEventLoop(threads),
 			gnet.WithSocketRecvBuffer(socketOpts.SO_RCVBUF),
 			gnet.WithSocketSendBuffer(socketOpts.SO_SNDBUF),
 			gnet.WithReusePort(socketOpts.SO_REUSEPORT),
@@ -77,7 +76,7 @@ func (r *router) startGnetServer(cfg *ServerConfig) (*gnetServer, error) {
 }
 
 type gnetServer struct {
-	r      *router
+	r      *Router
 	logger *zerolog.Logger // not nil
 
 	engineReady chan struct{}
@@ -92,6 +91,7 @@ type gnetServer struct {
 
 type connCtx struct {
 	// info, static, may be invalid, e.g. unix socket
+	c          gnet.Conn
 	remoteAddr netip.AddrPort
 	localAddr  netip.AddrPort
 
@@ -137,6 +137,7 @@ func (e *gnetServer) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 
 	// TODO: Reuse cc?
 	cc := &connCtx{
+		c:          c,
 		remoteAddr: netAddr2NetipAddr(c.RemoteAddr()),
 		localAddr:  netAddr2NetipAddr(c.LocalAddr()),
 		idleTimer:  time.AfterFunc(e.idleTimeout, func() { c.Close() }),
@@ -156,6 +157,10 @@ func (e *gnetServer) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 func (e *gnetServer) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	cc := c.Context().(*connCtx)
 	cc.idleTimer.Stop()
+	if cc.buffer != nil {
+		pool.ReleaseBuf(cc.buffer)
+		cc.buffer = nil
+	}
 
 	closeErr := err
 	if cc.err != nil { // log cc.err which is more useful (e.g. invalid msg...)
@@ -238,47 +243,26 @@ read:
 
 	ccr := cc.concurrentRequests.Add(1)
 	if ccr > e.maxConcurrent { // Too many concurrent requests.
-		resp := mustHaveRespB(m, nil, dnsmsg.RCodeRefused, true, 0)
+		resp := mustHaveEmptyRespForQueryB(m, dnsmsg.RCodeRefused, true, 0)
 		c.Write(resp)
-		cc.concurrentRequests.Add(-1)
-		dnsmsg.ReleaseMsg(m)
 		pool.ReleaseBuf(resp)
+		cc.concurrentRequests.Add(-1)
 		// TODO: Log or create a metrics entry for refused queries.
 	} else {
-		go func() {
-			rc := getRequestContext()
-			defer releaseRequestContext(rc)
-			rc.RemoteAddr = cc.remoteAddr
-			rc.LocalAddr = cc.localAddr
-
-			e.r.handleServerReq(m, rc)
-			dnsmsg.ReleaseMsg(m)
-
-			buf := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, true, 0)
-			err := c.AsyncWrite(buf, func(c gnet.Conn, err error) error {
-				pool.ReleaseBuf(buf)
-				if err == nil {
-					err = c.Flush()
-				}
-				cc.concurrentRequests.Add(-1)
-				if err != nil {
-					e.logger.Warn().
-						Stringer("remote", cc.remoteAddr).
-						Stringer("local", cc.localAddr).
-						Err(err).
-						Msg("failed to write resp")
-				}
-				return nil
-			})
-			if err != nil {
-				e.logger.Warn().
-					Stringer("remote", cc.remoteAddr).
-					Stringer("local", cc.localAddr).
-					Err(err).
-					Msg("failed to async write resp")
-			}
-		}()
+		respMsg, _ := e.r.handleQueryMsg(
+			m,
+			QueryMeta{RemoteAddr: cc.remoteAddr, LocalAddr: cc.localAddr},
+			cc,
+		)
+		if respMsg != nil {
+			respBytes := mustHaveRespB(respMsg, true, 0)
+			c.Write(respBytes)
+			pool.ReleaseBuf(respBytes)
+			cc.concurrentRequests.Add(-1)
+		}
+		// else, resp will be write asynchronously.
 	}
+	dnsmsg.ReleaseMsg(m)
 
 	if c.InboundBuffered() > 0 {
 		goto read
@@ -298,6 +282,18 @@ func (e *gnetServer) Close() error {
 		e.engine.Stop(context.Background())
 	})
 	return nil
+}
+
+func (cc *connCtx) WriteResp(m *dnsmsg.Msg) {
+	b := mustHaveRespB(m, true, 0)
+	cc.c.AsyncWrite(b, func(c gnet.Conn, err error) error {
+		cc.concurrentRequests.Add(-1)
+		pool.ReleaseBuf(b)
+		if err == nil {
+			c.Flush()
+		}
+		return nil
+	})
 }
 
 type gnetLogger struct {

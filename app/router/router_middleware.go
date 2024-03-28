@@ -6,22 +6,32 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 )
 
-// Middleware MUST NOT keep m and rc. They will be reused.
+// Middleware MUST NOT keep m. They will be reused.
 // The workflow of incoming requests is
-// Client -> MiddlewarePreProcessors -> Router's rules (including cache, etc...) --> MiddlewarePostProcessors -> Client
-//								\------(MiddlewareHandler has response)---------/
-type MiddlewareHandler func(ctx context.Context, m *dnsmsg.Msg, rc *RequestContext)
-
+//
+//	Client -> Rules -----------> Cache ---------> MiddlewarePreProcessors -> Upstream -> MiddlewarePostProcessors -\
+//		    <-/ (if blocked)   <-/ (if hit)         <-/ (if hijacked)                                             <-/
+//
+// Middlewares will only be loaded when router is starting.
+// DO NOT modify them after router is started.
 var (
 	// MiddlewarePreProcessors are for pre-processing requests.
-	// They will run before the router's rules.
-	// MiddlewarePreProcessors can also hijack requests. If a MiddlewareHandler returns a non-nil response. The 
-	// subsequent MiddlewareHandlers and router's rules will not run.
-	MiddlewarePreProcessors []MiddlewareHandler
+	// They will run before requests forwarding to upstream.
+	// MiddlewarePreProcessors can also hijack requests. If a MiddlewarePreProcessor returns a non-nil response.
+	// The subsequent MiddlewarePreProcessors will not run and the request will not be forwarded.
+	// If it returns error, the request will fail immediately.
+	MiddlewarePreProcessors []MiddlewarePreProcessor
 
 	// MiddlewarePostProcessors are for post-processing responses.
-	// They will run after the router's rules.
-	// MiddlewareHandler MUST NOT set the response to nil.
-	MiddlewarePostProcessors []MiddlewareHandler
+	// They will run after receiving response from upstream (or MiddlewarePreProcessor, if hijacked).
+	// If it returns error, the request will fail immediately.
+	MiddlewarePostProcessors []MiddlewarePostProcessor
 )
 
+type MiddlewarePreProcessor interface {
+	Preprocessing(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error)
+}
+
+type MiddlewarePostProcessor interface {
+	Postprocessing(ctx context.Context, m *dnsmsg.Msg, resp *dnsmsg.Msg) error
+}

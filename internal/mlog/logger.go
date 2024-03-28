@@ -33,7 +33,7 @@ func initLogger() zerolog.Logger {
 	l := zerolog.New(w).With().Timestamp().Logger()
 
 	// Redirect std log
-	redirectWriter := WriteToLogger(l, "redirected std log", "data")
+	redirectWriter := WriteToLogger(&l, "redirected std log", "data")
 	log.SetFlags(0) // disable time/date
 	log.SetPrefix("")
 	log.SetOutput(redirectWriter)
@@ -51,7 +51,7 @@ func L() *zerolog.Logger {
 	return &l
 }
 
-func WriteToLogger(to zerolog.Logger, msg string, key string) io.Writer {
+func WriteToLogger(to *zerolog.Logger, msg string, key string) io.Writer {
 	return &logCatcher{
 		logger: to.With().CallerWithSkipFrameCount(1).Logger(),
 		msg:    msg,

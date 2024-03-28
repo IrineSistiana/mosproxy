@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/IrineSistiana/gopool"
 	"github.com/IrineSistiana/mosproxy/app"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
@@ -25,12 +26,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	udpSize = 1200
+	udpSize      = 1200
+	queryTimeout = time.Second * 6
 )
 
 func init() {
@@ -68,7 +69,7 @@ func newRouterCmd() *cobra.Command {
 			}
 			logger.Info().Str("file", cfgPath).Msg("config file loaded")
 
-			r, err := run(cmd.Context(), cfg)
+			r, err := Run(cmd.Context(), cfg)
 			if err != nil {
 				logger.Fatal().Err(err).Msg("failed to start router")
 			}
@@ -89,12 +90,12 @@ func newRouterCmd() *cobra.Command {
 
 		shutdown:
 			logger.Info().AnErr("cause", err).Msg("router exiting")
-			r.close(err)
+			r.Close(err)
 			logger.Info().Msg("router exited, context closed")
 			os.Exit(0)
 		},
 	}
-	c.Flags().StringVarP(&cfgPath, "config", "c", "config.json", "path of the config file")
+	c.Flags().StringVarP(&cfgPath, "config", "c", "config.yaml", "path of the config file")
 
 	genConfigCmd := &cobra.Command{
 		Use:   "gen-config",
@@ -108,13 +109,8 @@ func newRouterCmd() *cobra.Command {
 	return c
 }
 
-type opt struct {
-	logQueries bool
-	ecsEnabled bool
-}
-
-type router struct {
-	opt opt
+type Router struct {
+	opt *Config
 
 	// not nil
 	ctx        context.Context
@@ -123,8 +119,8 @@ type router struct {
 	metricsReg *prometheus.Registry
 	limiter    *resourceLimiter
 	fatalErr   chan fatalErr
-	errGroup   *errgroup.Group
 	prefetch   *prefetchCtl
+	bJobPool   *gopool.Pool[blockingJobArgs] // pool for blocking jobs
 
 	// metrics
 	queryTotal         prometheus.Counter
@@ -146,19 +142,20 @@ type fatalErr struct {
 	err error
 }
 
-func run(ctx context.Context, cfg *Config) (_ *router, err error) {
+func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 	logger := mlog.L()
-	eg, ctx := errgroup.WithContext(ctx)
 	ctx, cancel := context.WithCancelCause(ctx)
-	r := &router{
+	r := &Router{
+		opt:        cfg,
 		ctx:        ctx,
 		cancel:     cancel,
 		logger:     logger,
 		metricsReg: newMetricsReg(),
 		limiter:    initResourceLimiter(cfg.Limiter),
 		fatalErr:   make(chan fatalErr, 1),
-		errGroup:   eg,
 		prefetch:   newPrefetchCtl(),
+		bJobPool:   gopool.NewPool[blockingJobArgs](),
+
 		upstreams:  make(map[string]*upstreamWrapper),
 		domainSets: make(map[string]*domainmatcher.MixMatcher),
 
@@ -175,13 +172,11 @@ func run(ctx context.Context, cfg *Config) (_ *router, err error) {
 			Help: "The total number of prefetched queries",
 		}),
 	}
-	r.opt.logQueries = cfg.Log.Queries
-	r.opt.ecsEnabled = cfg.ECS.Enabled
 
 	// close r if failed to init
 	defer func() {
 		if err != nil {
-			r.close(err)
+			r.Close(err)
 		}
 	}()
 
@@ -270,20 +265,22 @@ func run(ctx context.Context, cfg *Config) (_ *router, err error) {
 	return r, nil
 }
 
-func (r *router) fatal(msg string, err error) {
+func (r *Router) fatal(msg string, err error) {
 	select {
 	case r.fatalErr <- fatalErr{msg: msg, err: err}:
 	default:
 	}
 }
 
-func (r *router) close(err error) {
+func (r *Router) Close(err error) {
 	r.closeOnce.Do(func() {
 		r.closeImpl(err)
 	})
 }
 
-func (r *router) closeImpl(err error) {
+// Will only be called when router failed to init (in the same goroutine)
+// or after router is started (from other goroutines).
+func (r *Router) closeImpl(err error) {
 	r.cancel(err)
 	r.limiter.Close()
 	for _, u := range r.upstreams {
@@ -297,88 +294,30 @@ func (r *router) closeImpl(err error) {
 	}
 }
 
-var (
-	errRequestTimeout = errors.New("request timeout")
-)
-
-// rc will always have a non-nil response msg.
-// Does not take the ownership of the m and rc.
-func (r *router) handleServerReq(m *dnsmsg.Msg, rc *RequestContext) {
-	r.queryTotal.Inc()
-	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second*6, errRequestTimeout)
-	defer func() {
-		cancel()
-		if rc.Response.Msg == nil { // Make sure always returns a resp
-			rc.Response.Msg = makeEmptyRespM(m, dnsmsg.RCodeServerFailure)
-		}
-	}()
-
-	for _, f := range MiddlewarePreProcessors {
-		f(ctx, m, rc)
-		if ctxDone(ctx) {
-			return
-		}
-		if rc.Response.Msg != nil {
-			goto postMiddlewares // skip router's rules
-		}
-	}
-
-	r.handleReqMsg(ctx, m, rc)
-	if ctxDone(ctx) {
-		return
-	}
-
-postMiddlewares:
-	for i, f := range MiddlewarePostProcessors {
-		f(ctx, m, rc)
-		if ctxDone(ctx) {
-			return
-		}
-		if rc.Response.Msg == nil {
-			r.logger.Error().Int("index", i).Msg("misbehaved post middleware, nil response")
-			break
-		}
-	}
-}
-
 func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
 	resp := dnsmsg.NewMsg()
-	resp.ID = m.ID
-	resp.OpCode = m.OpCode
-	resp.Response = true
-	resp.RecursionDesired = m.RecursionDesired
-	resp.RecursionAvailable = true
 	resp.RCode = rcode
 	for _, q := range m.Questions {
 		resp.Questions = append(resp.Questions, q.Copy())
 		break // only return one question. Avoid malicious queries.
 	}
+	postProcessResp(getQueryInfo(m), resp)
 	return resp
 }
 
-// If resp is not nil, pack resp. Else, pack an empty resp with errRcode
+func mustHaveEmptyRespForQueryB(q *dnsmsg.Msg, rcode dnsmsg.RCode, tcp bool, size int) pool.Buffer {
+	resp := makeEmptyRespM(q, rcode)
+	b := mustHaveRespB(resp, tcp, size)
+	dnsmsg.ReleaseMsg(resp)
+	return b
+}
+
+// If resp must not be nil.
 // If tcp is true, size is ignored.
-func mustHaveRespB(query, resp *dnsmsg.Msg, errRcode dnsmsg.RCode, tcp bool, size int) pool.Buffer {
+func mustHaveRespB(resp *dnsmsg.Msg, tcp bool, size int) pool.Buffer {
 	var b pool.Buffer
 	var err error
 
-	if resp != nil {
-		if tcp {
-			b, err = packRespTCP(resp, true)
-		} else {
-			b, err = packResp(resp, true, size)
-		}
-		if err == nil {
-			return b
-		}
-		errRcode = dnsmsg.RCodeServerFailure
-		mlog.L().Error().Err(err).Msg("internal err: failed to pack dns msg")
-	}
-
-	// Failed to pack provided resp.
-	// Try to pack an empty resp.
-	resp = makeEmptyRespM(query, errRcode)
-	defer dnsmsg.ReleaseMsg(resp)
 	if tcp {
 		b, err = packRespTCP(resp, true)
 	} else {
@@ -388,8 +327,10 @@ func mustHaveRespB(query, resp *dnsmsg.Msg, errRcode dnsmsg.RCode, tcp bool, siz
 		return b
 	}
 
-	// Failed to pack empty resp, invalid question.
-	// Now only pack header.
+	mlog.L().Error().Err(err).Msg("internal err: failed to pack dns msg")
+
+	// Failed to pack resp.
+	// Try only pack header.
 	var body []byte
 	if tcp {
 		b = pool.GetBuf(2 + 12)
@@ -398,131 +339,16 @@ func mustHaveRespB(query, resp *dnsmsg.Msg, errRcode dnsmsg.RCode, tcp bool, siz
 		b = pool.GetBuf(12)
 		body = b
 	}
-	id, bits := resp.Header.Pack()
+
+	hdr := resp.Header
+	hdr.RCode = dnsmsg.RCodeServerFailure
+	id, bits := hdr.Pack()
 	binary.BigEndian.PutUint16(body[0:], id)
 	binary.BigEndian.PutUint16(body[2:], bits)
 	return b
 }
 
-func (r *router) handleReqMsg(ctx context.Context, m *dnsmsg.Msg, rc *RequestContext) {
-	hdr := m.Header
-	notImpl := hdr.Response ||
-		!hdr.RecursionDesired ||
-		hdr.OpCode != dnsmsg.OpCode(0) ||
-		len(m.Questions) != 1
-
-	if notImpl {
-		e := r.logger.Debug()
-		if e != nil {
-			e.Stringer("remote", rc.RemoteAddr).Stringer("local", rc.LocalAddr).Msg("not impl query")
-		}
-		rc.Response.Msg = makeEmptyRespM(m, dnsmsg.RCodeNotImplemented)
-	} else {
-		q := m.Questions[0].Copy()
-		defer dnsmsg.ReleaseQuestion(q)
-
-		dnsmsg.ToLowerName(q.Name)
-		r.handleReq(ctx, q, rc)
-
-		clientSupportEDNS0 := false
-		for _, rr := range m.Additionals {
-			if rr.Hdr().Type == dnsmsg.TypeOPT {
-				clientSupportEDNS0 = true
-				break
-			}
-		}
-
-		if clientSupportEDNS0 {
-			addOrReplaceOpt(rc.Response.Msg, udpSize)
-		} else {
-			// remove opt from resp
-			rr := dnsmsg.PopEDNS0(rc.Response.Msg)
-			if rr != nil {
-				dnsmsg.ReleaseResource(rr)
-			}
-		}
-
-		if r.opt.logQueries {
-			r.logger.Log().Object("query", (*qLogObj)(q)).Object("meta", rc).Msg("query log")
-		}
-	}
-
-	rc.Response.Msg.Header.ID = m.Header.ID
-	rc.Response.Msg.Header.Response = true
-	rc.Response.Msg.Header.OpCode = m.Header.OpCode
-	rc.Response.Msg.Header.RecursionAvailable = true
-	rc.Response.Msg.Header.RecursionDesired = m.Header.RecursionDesired
-}
-
-// always returns a resp
-func (r *router) handleReq(ctx context.Context, q *dnsmsg.Question, rc *RequestContext) {
-	// Match rules
-	var matchedRule *rule
-	for i, rule := range r.rules {
-		if rule.matcher != nil {
-			matched := rule.matcher.Match(q.Name)
-			if rule.reverse {
-				matched = !matched
-			}
-			if !matched {
-				continue
-			}
-		}
-		rc.Response.RuleIdx = i
-		matchedRule = rule
-		break
-	}
-
-	if matchedRule == nil {
-		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeRefused))
-		return
-	}
-	if rejectRCode := matchedRule.reject; rejectRCode > 0 {
-		makeEmptyResp(q, rc, rejectRCode)
-		return
-	}
-	if matchedRule.upstream == nil {
-		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeRefused))
-		return
-	}
-
-	upstream := matchedRule.upstream
-
-	// lookup cache
-	resp, storedTime, expireTime := r.cache.Get(ctx, q, rc)
-	if ctxDone(ctx) {
-		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))
-		return
-	}
-	if resp != nil { // cache hit
-		if needPrefetch(storedTime, expireTime) {
-			r.asyncSingleFlightPrefetch(q, rc.RemoteAddr.Addr(), upstream)
-		}
-		rc.Response.Msg = resp
-		rc.Response.Cached = true
-		r.queryCacheHitTotal.Inc()
-		r.limiterAllowN(rc.RemoteAddr.Addr(), costFromCache)
-		return
-	}
-
-	// TODO: Use different cost based on upstream protocol?
-	r.limiterAllowN(rc.RemoteAddr.Addr(), costFromUpstream)
-	resp, err := r.forward(ctx, upstream, q, rc.RemoteAddr.Addr())
-	if err != nil {
-		r.logger.Warn().
-			Str("upstream", upstream.tag).
-			Err(err).
-			Msg("failed to forward query")
-		makeEmptyResp(q, rc, uint16(dnsmsg.RCodeServerFailure))
-		return
-	}
-	rc.Response.Msg = resp
-
-	// save upstream resp to cache
-	r.cache.Store(q, rc.RemoteAddr.Addr(), resp)
-}
-
-func (r *router) asyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstreamWrapper) {
+func (r *Router) asyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstreamWrapper) {
 	key := r.cache.keyForPrefetch(q, remoteAddr)
 	if ok := r.prefetch.reserve(key); !ok {
 		return
@@ -535,7 +361,7 @@ func (r *router) asyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr netip.
 	}()
 }
 
-func (r *router) doPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstreamWrapper) {
+func (r *Router) doPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstreamWrapper) {
 	r.logger.Debug().Object("query", (*qLogObj)(q)).Str("upstream", u.tag).Msg("prefetching cache")
 
 	ctx, cancel := context.WithTimeout(r.ctx, prefetchTimeout)
@@ -552,61 +378,74 @@ func (r *router) doPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstre
 
 // Forward query to upstream and return its response.
 // It will remove the EDNS0 Options from response.
-func (r *router) forward(
+func (r *Router) forward(
 	ctx context.Context,
 	upstream *upstreamWrapper,
 	q *dnsmsg.Question,
 	remoteAddr netip.Addr,
 ) (*dnsmsg.Msg, error) {
-	reqWire, err := r.packReq(q, remoteAddr)
+	queryMsg := r.makeQueryMsg(q, remoteAddr)
+	defer dnsmsg.ReleaseMsg(queryMsg)
+
+	for i, m := range MiddlewarePreProcessors {
+		resp, err := m.Preprocessing(ctx, queryMsg)
+		if err != nil {
+			return nil, fmt.Errorf("preprocessor #%d err: %w", i, err)
+		}
+		if resp != nil {
+			return resp, nil
+		}
+	}
+
+	queryWire, err := packResp(queryMsg, false, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack req, %w", err)
 	}
-	defer pool.ReleaseBuf(reqWire)
+	defer pool.ReleaseBuf(queryWire)
 
-	resp, err := upstream.Exchange(ctx, reqWire)
+	resp, err := upstream.Exchange(ctx, queryWire)
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange, %w", err)
 	}
+
+	for i, m := range MiddlewarePostProcessors {
+		err := m.Postprocessing(ctx, queryMsg, resp)
+		if err != nil {
+			dnsmsg.ReleaseMsg(resp)
+			return nil, fmt.Errorf("postprocessor #%d err: %w", i, err)
+		}
+	}
+
 	dnsmsg.RemoveEDNS0(resp)
 	return resp, nil
 }
 
-func makeEmptyResp(q *dnsmsg.Question, rc *RequestContext, rcode uint16) {
+func makeEmptyRespMQ(q *dnsmsg.Question, rcode uint16) *dnsmsg.Msg {
 	resp := dnsmsg.NewMsg()
 	resp.Header.RCode = dnsmsg.RCode(rcode)
 	resp.Questions = append(resp.Questions, q.Copy())
-	rc.Response.Msg = resp
+	return resp
 }
 
-func (r *router) packReq(q *dnsmsg.Question, remoteAddr netip.Addr) (pool.Buffer, error) {
+func (r *Router) makeQueryMsg(q *dnsmsg.Question, remoteAddr netip.Addr) *dnsmsg.Msg {
 	m := dnsmsg.NewMsg()
-	defer dnsmsg.ReleaseMsg(m)
-
 	m.Header.RecursionDesired = true
 	m.Questions = append(m.Questions, q.Copy())
 
 	opt := newEDNS0(udpSize)
-	if r.opt.ecsEnabled && remoteAddr.IsValid() {
+	if r.opt.ECS.Enabled && remoteAddr.IsValid() {
 		opt.Data = makeEdns0ClientSubnetReqOpt(remoteAddr)
 	}
 	m.Additionals = append(m.Additionals, opt)
-
-	b := pool.GetBuf(m.Len())
-	_, err := m.Pack(b, false, 0)
-	if err != nil {
-		pool.ReleaseBuf(b)
-		return nil, err
-	}
-	return b, nil
+	return m
 }
 
-func (r *router) subLogger(modName string) *zerolog.Logger {
+func (r *Router) subLogger(modName string) *zerolog.Logger {
 	l := r.logger.With().Str("module", modName).Logger()
 	return &l
 }
 
-func (r *router) subLoggerForServer(modName string, tag string) *zerolog.Logger {
+func (r *Router) subLoggerForServer(modName string, tag string) *zerolog.Logger {
 	ctx := r.logger.With().Str("module", modName)
 	if len(tag) > 0 {
 		ctx = ctx.Str("server_tag", tag)
@@ -615,7 +454,7 @@ func (r *router) subLoggerForServer(modName string, tag string) *zerolog.Logger 
 	return &l
 }
 
-func (r *router) subLoggerForUpstream(tag string) *zerolog.Logger {
+func (r *Router) subLoggerForUpstream(tag string) *zerolog.Logger {
 	ctx := r.logger.With().Str("module", "upstream")
 	if len(tag) > 0 {
 		ctx = ctx.Str("upstream_tag", tag)
@@ -624,10 +463,7 @@ func (r *router) subLoggerForUpstream(tag string) *zerolog.Logger {
 	return &l
 }
 
-// Helper func. If addr is invalid, return nil.
-func (r *router) limiterAllowN(addr netip.Addr, n int) error {
-	if !addr.IsValid() {
-		return nil
-	}
+// Helper func.
+func (r *Router) limiterAllowN(addr netip.Addr, n int) error {
 	return r.limiter.AllowN(addr, n)
 }

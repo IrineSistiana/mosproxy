@@ -19,7 +19,7 @@ import (
 	"golang.org/x/net/http2"
 )
 
-func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, error) {
+func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, error) {
 	const defaultIdleTimeout = time.Second * 30
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
@@ -63,7 +63,7 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 	}
 	h.localAddr = netAddr2NetipAddr(l.Addr()) // maybe nil
 	h.logger = r.subLoggerForServer("server_http", cfg.Tag)
-	hs.ErrorLog = log.New(mlog.WriteToLogger(*h.logger, "redirected http log", "msg"), "", 0)
+	hs.ErrorLog = log.New(mlog.WriteToLogger(h.logger, "redirected http log", "msg"), "", 0)
 
 	var cost int
 	if useTls {
@@ -93,7 +93,7 @@ func (r *router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 }
 
 type httpHandler struct {
-	r                *router
+	r                *Router
 	localAddr        netip.AddrPort // maybe invalid, e.g. server is on unix socket
 	path             string
 	clientAddrHeader string
@@ -155,14 +155,9 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	rc := getRequestContext()
-	rc.RemoteAddr = remoteAddr
-	rc.LocalAddr = h.localAddr
-	defer releaseRequestContext(rc)
-
-	h.r.handleServerReq(m, rc)
-
-	msgBody := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, false, 65535)
+	resp, _ := h.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: h.localAddr})
+	defer dnsmsg.ReleaseMsg(resp)
+	msgBody := mustHaveRespB(resp, false, 65535)
 	defer pool.ReleaseBuf(msgBody)
 
 	w.Header().Set("Content-Type", "application/dns-message")

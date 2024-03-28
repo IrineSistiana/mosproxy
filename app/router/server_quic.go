@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
@@ -23,7 +21,7 @@ const (
 	quicStreamReadTimeout  = time.Second
 )
 
-func (r *router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
+func (r *Router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
 		idleTimeout = defaultQuicIdleTimeout
@@ -72,6 +70,7 @@ func (r *router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 		l:           l,
 		idleTimeout: idleTimeout,
 		logger:      r.subLoggerForServer("server_quic", cfg.Tag),
+		ct:          newConnTracker(closeQuicConnServerClosing, func() { l.Close() }),
 	}
 	s.logger.Info().
 		Stringer("addr", l.Addr()).
@@ -86,14 +85,17 @@ func (r *router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 	return s, nil
 }
 
+func closeQuicConnServerClosing(c quic.Connection) {
+	c.CloseWithError(0, "server is closing")
+}
+
 type quicServer struct {
-	r           *router
+	r           *Router
 	l           *quic.Listener
 	idleTimeout time.Duration
 	logger      *zerolog.Logger
 
-	closeOnce sync.Once
-	closed    atomic.Bool
+	ct *connTracker[quic.Connection]
 }
 
 func (s *quicServer) run() error {
@@ -101,7 +103,7 @@ func (s *quicServer) run() error {
 	for {
 		c, err := s.l.Accept(context.Background())
 		if err != nil {
-			if s.closed.Load() {
+			if s.ct.Closed() {
 				return errServerClosed
 			}
 			return err
@@ -112,7 +114,12 @@ func (s *quicServer) run() error {
 			debugLogServerConnClosed(c, s.logger, err)
 			c.CloseWithError(0, "service unavailable, overloaded")
 		} else {
+			if !s.ct.Add(c) {
+				closeQuicConnServerClosing(c)
+				continue
+			}
 			go func() {
+				defer s.ct.Del(c)
 				err := s.handleConn(c)
 				debugLogServerConnClosed(c, s.logger, err)
 				c.CloseWithError(0, "")
@@ -154,8 +161,6 @@ func (s *quicServer) handleConn(c quic.Connection) error {
 }
 
 func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteAddr, localAddr netip.AddrPort) {
-	r := s.r
-
 	stream.SetReadDeadline(time.Now().Add(quicStreamReadTimeout))
 	m, _, err := dnsutils.ReadMsgFromTCP(stream)
 	if err != nil {
@@ -168,16 +173,12 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	rc := getRequestContext()
-	rc.RemoteAddr = remoteAddr
-	rc.LocalAddr = localAddr
-	defer releaseRequestContext(rc)
-
-	r.handleServerReq(m, rc)
-
-	respBuf := mustHaveRespB(m, rc.Response.Msg, dnsmsg.RCodeRefused, true, 0)
+	resp, _ := s.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr})
+	defer dnsmsg.ReleaseMsg(resp)
+	respBuf := mustHaveRespB(resp, true, 0)
 	defer pool.ReleaseBuf(respBuf)
-	if _, err := stream.Write(respBuf); err != nil {
+
+	if _, err = stream.Write(respBuf); err != nil {
 		s.logger.Warn().
 			Stringer("local", c.LocalAddr()).
 			Stringer("remote", c.RemoteAddr()).
@@ -187,9 +188,6 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 }
 
 func (s *quicServer) Close() error {
-	s.closeOnce.Do(func() {
-		s.closed.Store(true)
-		s.l.Close()
-	})
+	s.ct.Close()
 	return nil
 }
