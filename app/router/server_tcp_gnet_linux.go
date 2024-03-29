@@ -249,7 +249,7 @@ read:
 		cc.concurrentRequests.Add(-1)
 		// TODO: Log or create a metrics entry for refused queries.
 	} else {
-		respMsg, _ := e.r.handleQueryMsg(
+		respMsg := e.r.handleQueryMsg(
 			m,
 			QueryMeta{RemoteAddr: cc.remoteAddr, LocalAddr: cc.localAddr},
 			cc,

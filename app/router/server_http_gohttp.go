@@ -155,7 +155,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	resp, _ := h.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: h.localAddr})
+	resp := h.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: h.localAddr})
 	defer dnsmsg.ReleaseMsg(resp)
 	msgBody := mustHaveRespB(resp, false, 65535)
 	defer pool.ReleaseBuf(msgBody)

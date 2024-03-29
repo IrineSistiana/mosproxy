@@ -173,7 +173,7 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	resp, _ := s.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr})
+	resp := s.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr})
 	defer dnsmsg.ReleaseMsg(resp)
 	respBuf := mustHaveRespB(resp, true, 0)
 	defer pool.ReleaseBuf(respBuf)

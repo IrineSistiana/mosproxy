@@ -236,7 +236,7 @@ func (s *udpServer) handleMsg(b, oob []byte, remoteAddr, listenerAddr netip.Addr
 		return resp, oobLocalAddr
 	}
 
-	respMsg, _ := s.r.handleQueryMsg(
+	respMsg := s.r.handleQueryMsg(
 		m,
 		QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr},
 		s.newUdpRespWriter(remoteAddr, oobLocalAddr, s.udpSize(m)),

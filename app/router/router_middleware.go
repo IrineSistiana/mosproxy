@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 )
@@ -9,29 +10,53 @@ import (
 // Middleware MUST NOT keep m. They will be reused.
 // The workflow of incoming requests is
 //
-//	Client -> Rules -----------> Cache ---------> MiddlewarePreProcessors -> Upstream -> MiddlewarePostProcessors -\
-//		    <-/ (if blocked)   <-/ (if hit)         <-/ (if hijacked)                                             <-/
+//	Client --> PreHandling ------> Rules ----------> Cache ---------> Preprocessing -> Upstream -> Postprocessing -\
+//		      <-/ (if has resp)  <-/ (if blocked)   <-/ (if hit)      <-/ (if has resp)                          <-/
 //
-// Middlewares will only be loaded when router is starting.
-// DO NOT modify them after router is started.
-var (
-	// MiddlewarePreProcessors are for pre-processing requests.
-	// They will run before requests forwarding to upstream.
-	// MiddlewarePreProcessors can also hijack requests. If a MiddlewarePreProcessor returns a non-nil response.
-	// The subsequent MiddlewarePreProcessors will not run and the request will not be forwarded.
-	// If it returns error, the request will fail immediately.
-	MiddlewarePreProcessors []MiddlewarePreProcessor
 
-	// MiddlewarePostProcessors are for post-processing responses.
-	// They will run after receiving response from upstream (or MiddlewarePreProcessor, if hijacked).
-	// If it returns error, the request will fail immediately.
-	MiddlewarePostProcessors []MiddlewarePostProcessor
-)
+type Middleware interface {
+	// Handle query msg right after receiving.
+	// Note: This func should be fast and MUST NOT contain block operations. It will
+	// be called directly in the main network thread in UDP/Gnet server.
+	PreHandling(m *dnsmsg.Msg, qMeta QueryMeta) (resp *dnsmsg.Msg, err error)
 
-type MiddlewarePreProcessor interface {
-	Preprocessing(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error)
+	// Handle query msg before sending to upstream.
+	PreForwarding(ctx context.Context, m *dnsmsg.Msg, qMeta QueryMeta, qInfo QueryInfo) (resp *dnsmsg.Msg, err error)
+
+	// Handle query and response after received from upstream.
+	PostForwarding(ctx context.Context, q *dnsmsg.Question, qMeta QueryMeta, qInfo QueryInfo, resp *dnsmsg.Msg) error
 }
 
-type MiddlewarePostProcessor interface {
-	Postprocessing(ctx context.Context, m *dnsmsg.Msg, resp *dnsmsg.Msg) error
+func SetMiddleware(m Middleware) {
+	if m == nil {
+		middlewareP.Store(&nop)
+	}
+	p := &m
+	middlewareP.Store(p)
+}
+
+func middlewareImpl() Middleware {
+	p := middlewareP.Load()
+	if p == nil {
+		return nop
+	}
+	return *p
+}
+
+var middlewareP atomic.Pointer[Middleware]
+
+var nop Middleware = nopMiddleWare{}
+
+type nopMiddleWare struct{}
+
+func (nopMiddleWare) PreHandling(m *dnsmsg.Msg, qMeta QueryMeta) (*dnsmsg.Msg, error) {
+	return nil, nil
+}
+
+func (nopMiddleWare) PreForwarding(ctx context.Context, m *dnsmsg.Msg, qMeta QueryMeta, qInfo QueryInfo) (*dnsmsg.Msg, error) {
+	return nil, nil
+}
+
+func (nopMiddleWare) PostForwarding(ctx context.Context, q *dnsmsg.Question, qMeta QueryMeta, qInfo QueryInfo, resp *dnsmsg.Msg) error {
+	return nil
 }

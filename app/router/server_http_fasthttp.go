@@ -199,7 +199,7 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	resp, _ := h.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr})
+	resp := h.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr})
 	defer dnsmsg.ReleaseMsg(resp)
 	msgBody := mustHaveRespB(resp, false, 65535)
 	defer pool.ReleaseBuf(msgBody)

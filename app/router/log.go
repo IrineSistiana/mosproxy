@@ -48,30 +48,30 @@ func debugLogServerConnClosed(c logConn, logger *zerolog.Logger, cause error) {
 }
 
 // log query info without lvl
-func (r *Router) logQueryResp(q *dnsmsg.Question, qm QueryMeta, qInfo queryInfo, resp *dnsmsg.Msg, rm RespMeta) {
+func (r *Router) logQueryResp(q qCtx, resp *dnsmsg.Msg, rm RespMeta) {
 	e := r.logger.Log()
 	if e == nil {
 		return
 	}
-	e.Dict("query", logQuery(q, qm, qInfo))
+	e.Dict("query", logQuery(q))
 	e.Dict("resp", logResp(resp, rm))
 	e.Msg("query log")
 }
 
-func logQuery(q *dnsmsg.Question, qm QueryMeta, qInfo queryInfo) *zerolog.Event {
+func logQuery(q qCtx) *zerolog.Event {
 	e := zerolog.Dict()
-	b, err := dnsmsg.ToReadable(q.Name)
+	b, err := dnsmsg.ToReadable(q.q.Name)
 	if err != nil {
-		e.Bytes("invalid_name", q.Name)
+		e.Bytes("invalid_name", q.q.Name)
 	} else {
 		e.Bytes("name", b)
 		pool.ReleaseBuf(b)
 	}
-	e.Uint16("class", uint16(q.Class))
-	e.Uint16("type", uint16(q.Type))
-	logNetipAddrPort(e, "remote", qm.RemoteAddr)
-	logNetipAddrPort(e, "local", qm.LocalAddr)
-	logNetipPrefix(e, "ecs", qInfo.ecs)
+	e.Uint16("class", uint16(q.q.Class))
+	e.Uint16("type", uint16(q.q.Type))
+	logNetipAddrPort(e, "remote", q.qMeta.RemoteAddr)
+	logNetipAddrPort(e, "local", q.qMeta.LocalAddr)
+	logNetipPrefix(e, "ecs", q.qInfo.ECS)
 	return e
 }
 

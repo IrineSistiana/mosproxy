@@ -348,53 +348,63 @@ func mustHaveRespB(resp *dnsmsg.Msg, tcp bool, size int) pool.Buffer {
 	return b
 }
 
-func (r *Router) asyncSingleFlightPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstreamWrapper) {
-	key := r.cache.keyForPrefetch(q, remoteAddr)
+func (r *Router) asyncSingleFlightPrefetch(q qCtx, remoteAddr netip.Addr, u *upstreamWrapper) {
+	key := r.cache.keyForPrefetch(q.q, remoteAddr)
 	if ok := r.prefetch.reserve(key); !ok {
 		return
 	}
-	qCopy := q.Copy()
+	qCopy := qCtx{q: q.q.Copy(), qMeta: q.qMeta, qInfo: q.qInfo}
 	go func() {
+		defer dnsmsg.ReleaseQuestion(qCopy.q)
 		r.doPrefetch(qCopy, remoteAddr, u)
-		dnsmsg.ReleaseQuestion(qCopy)
 		r.prefetch.done(key)
 	}()
 }
 
-func (r *Router) doPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr, u *upstreamWrapper) {
-	r.logger.Debug().Object("query", (*qLogObj)(q)).Str("upstream", u.tag).Msg("prefetching cache")
+func (r *Router) doPrefetch(q qCtx, remoteAddr netip.Addr, u *upstreamWrapper) {
+	r.logger.Debug().Object("query", (*qLogObj)(q.q)).Str("upstream", u.tag).Msg("prefetching cache")
 
 	ctx, cancel := context.WithTimeout(r.ctx, prefetchTimeout)
 	defer cancel()
-	resp, err := r.forward(ctx, u, q, remoteAddr)
+	resp, err := r.forward(ctx, q, remoteAddr, u)
 	if err != nil {
-		r.logger.Warn().Object("query", (*qLogObj)(q)).Str("upstream", u.tag).Err(err).
+		r.logger.Warn().Object("query", (*qLogObj)(q.q)).Str("upstream", u.tag).Err(err).
 			Msg("failed to prefetch")
 		return
 	}
 	r.prefetchTotal.Inc()
-	r.cache.Store(q, remoteAddr, resp)
+	r.cache.Store(q.q, remoteAddr, resp)
 }
 
 // Forward query to upstream and return its response.
 // It will remove the EDNS0 Options from response.
-func (r *Router) forward(
-	ctx context.Context,
-	upstream *upstreamWrapper,
-	q *dnsmsg.Question,
+func (r *Router) forward(ctx context.Context,
+	q qCtx,
 	remoteAddr netip.Addr,
+	upstream *upstreamWrapper,
 ) (*dnsmsg.Msg, error) {
-	queryMsg := r.makeQueryMsg(q, remoteAddr)
+	resp, err := r._forward(ctx, q, remoteAddr, upstream)
+	if resp != nil {
+		dnsmsg.RemoveEDNS0(resp)
+	}
+	return resp, err
+}
+
+func (r *Router) _forward(
+	ctx context.Context,
+	q qCtx,
+	remoteAddr netip.Addr,
+	upstream *upstreamWrapper,
+) (*dnsmsg.Msg, error) {
+	queryMsg := r.makeQueryMsg(q.q, remoteAddr)
 	defer dnsmsg.ReleaseMsg(queryMsg)
 
-	for i, m := range MiddlewarePreProcessors {
-		resp, err := m.Preprocessing(ctx, queryMsg)
-		if err != nil {
-			return nil, fmt.Errorf("preprocessor #%d err: %w", i, err)
-		}
-		if resp != nil {
-			return resp, nil
-		}
+	resp, err := middlewareImpl().PreForwarding(ctx, queryMsg, q.qMeta, q.qInfo)
+	if err != nil {
+		return nil, err
+	}
+	if resp != nil {
+		return resp, nil
 	}
 
 	queryWire, err := packResp(queryMsg, false, 0)
@@ -403,20 +413,10 @@ func (r *Router) forward(
 	}
 	defer pool.ReleaseBuf(queryWire)
 
-	resp, err := upstream.Exchange(ctx, queryWire)
+	resp, err = upstream.Exchange(ctx, queryWire)
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange, %w", err)
 	}
-
-	for i, m := range MiddlewarePostProcessors {
-		err := m.Postprocessing(ctx, queryMsg, resp)
-		if err != nil {
-			dnsmsg.ReleaseMsg(resp)
-			return nil, fmt.Errorf("postprocessor #%d err: %w", i, err)
-		}
-	}
-
-	dnsmsg.RemoveEDNS0(resp)
 	return resp, nil
 }
 
