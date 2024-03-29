@@ -47,9 +47,8 @@ func (r *Router) handleQueryMsg(q *dnsmsg.Msg, qm QueryMeta, w RespWriter) (*dns
 		qInfo := getQueryInfo(q)
 		resp, meta := r.handleQuery(question, qm, qInfo, w)
 		if resp != nil {
-			postProcessResp(qInfo, resp)
 			if r.opt.Log.Queries {
-				r.logQueryResp(question, qm, resp, meta)
+				r.logQueryResp(question, qm, qInfo, resp, meta)
 			}
 		}
 		return resp, meta
@@ -61,6 +60,7 @@ type queryInfo struct {
 	opCode dnsmsg.OpCode
 	rd     bool
 	edns0  bool
+	ecs    netip.Prefix
 }
 
 func getQueryInfo(m *dnsmsg.Msg) queryInfo {
@@ -68,6 +68,7 @@ func getQueryInfo(m *dnsmsg.Msg) queryInfo {
 		id:     m.ID,
 		opCode: m.OpCode,
 		rd:     m.RecursionDesired,
+		ecs:    findECS(m),
 	}
 	for _, rr := range m.Additionals {
 		if rr.Hdr().Type == dnsmsg.TypeOPT {
@@ -99,20 +100,29 @@ func postProcessResp(qInfo queryInfo, resp *dnsmsg.Msg) {
 }
 
 func (r *Router) handleQuery(q *dnsmsg.Question, qMeta QueryMeta, qInfo queryInfo, w RespWriter) (*dnsmsg.Msg, RespMeta) {
-	resp, upstream, respMeta := r.nonblockingFuncs(q, qMeta.RemoteAddr.Addr())
+	var remoteAddr netip.Addr
+	if usefulECS(qInfo.ecs) {
+		remoteAddr = qInfo.ecs.Addr()
+	} else {
+		remoteAddr = qMeta.RemoteAddr.Addr()
+	}
+
+	resp, upstream, respMeta := r.nonblockingFuncs(q, remoteAddr)
 	if resp != nil {
+		postProcessResp(qInfo, resp)
 		return resp, respMeta
 	}
 
 	if w != nil {
 		args := blockingJobArgs{
-			r:        r,
-			q:        q.Copy(),
-			qInfo:    qInfo,
-			qMeta:    qMeta,
-			respMeta: respMeta,
-			upstream: upstream,
-			w:        w,
+			r:          r,
+			q:          q.Copy(),
+			qInfo:      qInfo,
+			qMeta:      qMeta,
+			remoteAddr: remoteAddr,
+			respMeta:   respMeta,
+			upstream:   upstream,
+			w:          w,
 		}
 		r.bJobPool.GoJob(gopool.Job[blockingJobArgs]{
 			Args: args,
@@ -125,26 +135,39 @@ func (r *Router) handleQuery(q *dnsmsg.Question, qMeta QueryMeta, qInfo queryInf
 }
 
 type blockingJobArgs struct {
-	r        *Router
-	q        *dnsmsg.Question
-	qInfo    queryInfo
-	qMeta    QueryMeta
-	respMeta RespMeta
-	upstream *upstreamWrapper
-	w        RespWriter
+	r          *Router
+	q          *dnsmsg.Question
+	qInfo      queryInfo
+	qMeta      QueryMeta
+	remoteAddr netip.Addr
+	respMeta   RespMeta
+	upstream   *upstreamWrapper
+	w          RespWriter
 }
 
 func doBlockingJob(a blockingJobArgs) {
 	defer dnsmsg.ReleaseQuestion(a.q)
-	resp, meta := a.r.blockingFuncs(a.q, a.qMeta.RemoteAddr.Addr(), a.respMeta, a.upstream)
+	resp, meta := a.r.blockingFuncs(a.q, a.remoteAddr, a.respMeta, a.upstream)
 	defer dnsmsg.ReleaseMsg(resp)
 	postProcessResp(a.qInfo, resp)
 
 	if a.r.opt.Log.Queries {
-		a.r.logQueryResp(a.q, a.qMeta, resp, meta)
+		a.r.logQueryResp(a.q, a.qMeta, a.qInfo, resp, meta)
 	}
 
 	a.w.WriteResp(resp)
+}
+
+func usefulECS(p netip.Prefix) bool {
+	if !p.IsValid() {
+		return false
+	}
+	addr := p.Addr().Unmap()
+	bits := p.Bits()
+	if addr.Is4() {
+		return bits >= 24
+	}
+	return bits >= 48 // v6
 }
 
 // return (resp, nil, meta)

@@ -48,17 +48,17 @@ func debugLogServerConnClosed(c logConn, logger *zerolog.Logger, cause error) {
 }
 
 // log query info without lvl
-func (r *Router) logQueryResp(q *dnsmsg.Question, qm QueryMeta, resp *dnsmsg.Msg, rm RespMeta) {
+func (r *Router) logQueryResp(q *dnsmsg.Question, qm QueryMeta, qInfo queryInfo, resp *dnsmsg.Msg, rm RespMeta) {
 	e := r.logger.Log()
 	if e == nil {
 		return
 	}
-	e.Dict("query", logQuery(q, qm))
+	e.Dict("query", logQuery(q, qm, qInfo))
 	e.Dict("resp", logResp(resp, rm))
 	e.Msg("query log")
 }
 
-func logQuery(q *dnsmsg.Question, qm QueryMeta) *zerolog.Event {
+func logQuery(q *dnsmsg.Question, qm QueryMeta, qInfo queryInfo) *zerolog.Event {
 	e := zerolog.Dict()
 	b, err := dnsmsg.ToReadable(q.Name)
 	if err != nil {
@@ -71,6 +71,7 @@ func logQuery(q *dnsmsg.Question, qm QueryMeta) *zerolog.Event {
 	e.Uint16("type", uint16(q.Type))
 	logNetipAddrPort(e, "remote", qm.RemoteAddr)
 	logNetipAddrPort(e, "local", qm.LocalAddr)
+	logNetipPrefix(e, "ecs", qInfo.ecs)
 	return e
 }
 
@@ -82,6 +83,17 @@ func logNetipAddrPort(e *zerolog.Event, key string, addr netip.AddrPort) {
 	buf := pool.GetBuf(64) // ipv6: maximum 39 bytes string + 2 for "[]" + 6 ":xxxxx" port.
 	defer pool.ReleaseBuf(buf)
 	b := addr.AppendTo(buf[:0])
+	e.Bytes(key, b)
+}
+
+// If p is invalid, do nothing.
+func logNetipPrefix(e *zerolog.Event, key string, p netip.Prefix) {
+	if !p.IsValid() {
+		return
+	}
+	buf := pool.GetBuf(64) // ipv6: maximum 39 bytes string + 2 for "[]" + 4 "/xxx" bits.
+	defer pool.ReleaseBuf(buf)
+	b := p.AppendTo(buf[:0])
 	e.Bytes(key, b)
 }
 
