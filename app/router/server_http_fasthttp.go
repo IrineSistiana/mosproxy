@@ -238,12 +238,12 @@ func (h *fasthttpHandler) readReqMsg(ctx *fasthttp.RequestCtx) *dnsmsg.Msg {
 		}
 
 		msgSize := base64.RawURLEncoding.DecodedLen(len(base64Dns))
-		if msgSize > 65535 {
+		if msgSize > maxHttpGetPayload {
 			h.logger.Warn().
 				Object("request", (*fasthttpReqLoggerObj)(ctx)).
 				Int("len", msgSize).
 				Msg("query msg too long")
-			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			ctx.SetStatusCode(fasthttp.StatusRequestURITooLong)
 			return nil
 		}
 		buf := pool.GetBuf(msgSize)
