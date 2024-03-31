@@ -57,8 +57,9 @@ func (r *Router) handleQueryMsg(q *dnsmsg.Msg, qMeta QueryMeta, w RespWriter) *d
 		defer dnsmsg.ReleaseQuestion(qc.q)
 		dnsmsg.ToLowerName(qc.q.Name)
 
-		resp, meta := r.handleQuery(qc, w)
+		resp, meta := r.handleQuestion(qc, w)
 		if resp != nil {
+			postProcessResp(qc.qInfo, resp)
 			if r.opt.Log.Queries {
 				r.logQueryResp(qc, resp, meta)
 			}
@@ -103,7 +104,7 @@ func postProcessResp(qInfo QueryInfo, resp *dnsmsg.Msg) {
 	}
 }
 
-func (r *Router) handleQuery(q qCtx, w RespWriter) (*dnsmsg.Msg, RespMeta) {
+func (r *Router) handleQuestion(q qCtx, w RespWriter) (*dnsmsg.Msg, RespMeta) {
 	var remoteAddr netip.Addr
 	if usefulECS(q.qInfo.ECS) {
 		remoteAddr = q.qInfo.ECS.Addr()
@@ -113,7 +114,6 @@ func (r *Router) handleQuery(q qCtx, w RespWriter) (*dnsmsg.Msg, RespMeta) {
 
 	resp, upstream, respMeta := r.nonblockingFuncs(q, remoteAddr)
 	if resp != nil {
-		postProcessResp(q.qInfo, resp)
 		return resp, respMeta
 	}
 
