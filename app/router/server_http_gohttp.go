@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/netip"
@@ -177,7 +176,7 @@ func readClientAddrFromXFF(s string) (netip.Addr, error) {
 	return netip.ParseAddr(s)
 }
 
-var bufPool = pool.NewBytesBufPool(4096)
+var bufPool512 = pool.NewBytesBufPool(512)
 
 func getDnsKey(query string) string {
 	for len(query) > 0 {
@@ -218,12 +217,12 @@ func (h *httpHandler) readReqMsg(w http.ResponseWriter, req *http.Request) *dnsm
 		}
 
 		msgSize := base64.RawURLEncoding.DecodedLen(len(s))
-		if msgSize > 65535 {
+		if msgSize > maxHttpGetPayload {
 			h.logger.Warn().
 				Object("request", (*httpReqLoggerObj)(req)).
 				Int("len", msgSize).
 				Msg("query msg too long")
-			w.WriteHeader(http.StatusBadRequest)
+			w.WriteHeader(http.StatusRequestURITooLong)
 			return nil
 		}
 		buf := pool.GetBuf(msgSize)
@@ -250,10 +249,18 @@ func (h *httpHandler) readReqMsg(w http.ResponseWriter, req *http.Request) *dnsm
 			return nil
 		}
 
-		buf := bufPool.Get()
-		defer bufPool.Release(buf)
-		_, err := buf.ReadFrom(io.LimitReader(req.Body, 65535))
+		buf := bufPool512.Get()
+		defer bufPool512.Release(buf)
+		_, err := buf.ReadFrom(http.MaxBytesReader(w, req.Body, maxHttpPostPayload))
 		if err != nil {
+			_, payloadLimit := err.(*http.MaxBytesError)
+			if payloadLimit {
+				h.logger.Warn().
+					Object("request", (*httpReqLoggerObj)(req)).
+					Msg("post payload is too large")
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return nil
+			}
 			h.logger.Warn().
 				Object("request", (*httpReqLoggerObj)(req)).
 				Err(err).
