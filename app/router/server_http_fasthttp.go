@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -270,19 +269,7 @@ func (h *fasthttpHandler) readReqMsg(ctx *fasthttp.RequestCtx) *dnsmsg.Msg {
 			ctx.SetStatusCode(fasthttp.StatusBadRequest)
 			return nil
 		}
-
-		buf := bufPool.Get()
-		defer bufPool.Release(buf)
-		_, err := buf.ReadFrom(io.LimitReader(ctx.Request.BodyStream(), 65535))
-		if err != nil {
-			h.logger.Warn().
-				Object("request", (*fasthttpReqLoggerObj)(ctx)).
-				Err(err).
-				Msg("failed to read request body")
-			ctx.SetStatusCode(fasthttp.StatusBadRequest)
-			return nil
-		}
-		reqWireMsg = buf.Bytes()
+		reqWireMsg = ctx.Request.Body()
 
 	default:
 		h.logger.Warn().
