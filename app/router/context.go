@@ -22,6 +22,7 @@ type QueryInfo struct {
 }
 
 type qCtx struct {
+	uid   uint32 // Random id for logging. Not the dns msg id.
 	q     *dnsmsg.Question
 	qMeta QueryMeta
 	qInfo QueryInfo

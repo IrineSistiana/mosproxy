@@ -407,6 +407,10 @@ func (r *Router) _forward(
 		return resp, nil
 	}
 
+	if r.opt.Log.TraceMsgs {
+		r.debugLogMsg(q, queryMsg, "sending query to upstream")
+	}
+
 	queryWire, err := packResp(queryMsg, false, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack req, %w", err)
@@ -417,6 +421,11 @@ func (r *Router) _forward(
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange, %w", err)
 	}
+
+	if r.opt.Log.TraceMsgs {
+		r.debugLogMsg(q, resp, "response received from upstream")
+	}
+
 	return resp, nil
 }
 

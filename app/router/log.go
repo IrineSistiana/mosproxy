@@ -6,6 +6,7 @@ import (
 
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
 )
 
@@ -60,6 +61,7 @@ func (r *Router) logQueryResp(q qCtx, resp *dnsmsg.Msg, rm RespMeta) {
 
 func logQuery(q qCtx) *zerolog.Event {
 	e := zerolog.Dict()
+	e.Uint32("quid", q.uid)
 	b, err := dnsmsg.ToReadable(q.q.Name)
 	if err != nil {
 		e.Bytes("invalid_name", q.q.Name)
@@ -110,4 +112,35 @@ func logResp(r *dnsmsg.Msg, rm RespMeta) *zerolog.Event {
 		e.Uint16("rcode", uint16(r.Header.RCode))
 	}
 	return e
+}
+
+func (r *Router) debugLogMsg(q qCtx, m *dnsmsg.Msg, msg string) {
+	e := r.logger.Log()
+	if e == nil {
+		return
+	}
+	e.Dict("query", logQuery(q))
+
+	m2, err := dnsmsg2dns(m)
+	if err != nil {
+		e.Err(err).Msg(msg)
+	} else {
+		e.Any("msg", m2).Msg(msg)
+	}
+}
+
+func dnsmsg2dns(m *dnsmsg.Msg) (*dns.Msg, error) {
+	b := pool.GetBuf(m.Len())
+	_, err := m.Pack(b, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer pool.ReleaseBuf(b)
+
+	m2 := new(dns.Msg)
+	err = m2.Unpack(b)
+	if err != nil {
+		return nil, err
+	}
+	return m2, nil
 }

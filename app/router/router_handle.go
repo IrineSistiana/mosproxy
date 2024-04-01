@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"math/rand/v2"
 	"net/netip"
 
 	"github.com/IrineSistiana/gopool"
@@ -51,17 +52,25 @@ func (r *Router) handleQueryMsg(q *dnsmsg.Msg, qMeta QueryMeta, w RespWriter) *d
 
 	} else {
 		qc := qCtx{
+			uid:   rand.Uint32(),
 			q:     q.Questions[0].Copy(),
 			qMeta: qMeta,
 			qInfo: getQueryInfo(q)}
 		defer dnsmsg.ReleaseQuestion(qc.q)
 		dnsmsg.ToLowerName(qc.q.Name)
 
+		if r.opt.Log.TraceMsgs {
+			r.debugLogMsg(qc, q, "received query from client")
+		}
+
 		resp, meta := r.handleQuestion(qc, w)
 		if resp != nil {
 			postProcessResp(qc.qInfo, resp)
 			if r.opt.Log.Queries {
 				r.logQueryResp(qc, resp, meta)
+			}
+			if r.opt.Log.TraceMsgs {
+				r.debugLogMsg(qc, resp, "sending response to client")
 			}
 		}
 		return resp
@@ -121,6 +130,7 @@ func (r *Router) handleQuestion(q qCtx, w RespWriter) (*dnsmsg.Msg, RespMeta) {
 		args := blockingJobArgs{
 			r: r,
 			q: qCtx{
+				uid:   q.uid,
 				q:     q.q.Copy(),
 				qMeta: q.qMeta,
 				qInfo: q.qInfo,
@@ -157,6 +167,9 @@ func doBlockingJob(a blockingJobArgs) {
 
 	if a.r.opt.Log.Queries {
 		a.r.logQueryResp(a.q, resp, meta)
+	}
+	if a.r.opt.Log.TraceMsgs {
+		a.r.debugLogMsg(a.q, resp, "sending response to client")
 	}
 
 	a.w.WriteResp(resp)
