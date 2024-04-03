@@ -442,7 +442,7 @@ func (r *Router) makeQueryMsg(q *dnsmsg.Question, remoteAddr netip.Addr) *dnsmsg
 	m.Questions = append(m.Questions, q.Copy())
 
 	opt := newEDNS0(udpSize)
-	if r.opt.ECS.Enabled && remoteAddr.IsValid() {
+	if r.opt.ECS.Enabled && remoteAddr.IsValid() && !remoteAddr.IsPrivate() && remoteAddr.IsGlobalUnicast() {
 		opt.Data = makeEdns0ClientSubnetReqOpt(remoteAddr)
 	}
 	m.Additionals = append(m.Additionals, opt)
