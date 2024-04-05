@@ -14,6 +14,6 @@ func (gnetEngine) Close() error {
 	panic("not impl")
 }
 
-func (r *router) startGnetServer(cfg *ServerConfig) (*gnetEngine, error) {
+func (r *Router) startGnetServer(cfg *ServerConfig) (*gnetEngine, error) {
 	return nil, errGnetNotSupported
 }
