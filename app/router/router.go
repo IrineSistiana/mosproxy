@@ -3,27 +3,23 @@ package router
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/gopool"
 	"github.com/IrineSistiana/mosproxy/app"
 	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
-	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/mitchellh/mapstructure"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -132,9 +128,11 @@ type Router struct {
 	// init later
 	cache         *cacheCtl // not nil, noop if no backend is configured
 	upstreams     map[string]*upstreamWrapper
-	domainSets    map[string]*domainmatcher.MixMatcher
+	domainSets    map[string]*domainSet
 	rules         []*rule
 	serverClosers []func()
+
+	reloading atomic.Uint32 // 1 = true
 }
 
 type fatalErr struct {
@@ -157,7 +155,7 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 		bJobPool:   gopool.NewPool[blockingJobArgs](),
 
 		upstreams:  make(map[string]*upstreamWrapper),
-		domainSets: make(map[string]*domainmatcher.MixMatcher),
+		domainSets: make(map[string]*domainSet),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "query_total",
@@ -190,26 +188,10 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 		return
 	}
 
-	// start metrics endpoint
-	if addr := cfg.Metrics.Addr; len(addr) > 0 {
-		l, err := net.Listen("tcp", addr)
-		if err != nil {
-			err = fmt.Errorf("failed to start prometheus metrics endpoint server, %w", err)
-			return nil, err
-		}
-
-		logger.Info().Stringer("addr", l.Addr()).Msg("metrics endpoint server started")
-
-		s := http.Server{
-			Handler: promhttp.HandlerFor(r.metricsReg, promhttp.HandlerOpts{}),
-		}
-		r.serverClosers = append(r.serverClosers, func() { s.Close() })
-		go func() {
-			err := s.Serve(l)
-			if !errors.Is(err, http.ErrServerClosed) {
-				r.fatal("metrics endpoint exited", err)
-			}
-		}()
+	err = r.initApiServer(&cfg.API)
+	if err != nil {
+		err = fmt.Errorf("failed to start api server, %w", err)
+		return
 	}
 
 	// init upstreams

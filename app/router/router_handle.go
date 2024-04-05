@@ -195,8 +195,9 @@ func (r *Router) nonblockingFuncs(q qCtx, remoteAddr netip.Addr) (*dnsmsg.Msg, *
 	// Match rules
 	var matchedRule *rule
 	for i, rule := range r.rules {
-		if rule.matcher != nil {
-			matched := rule.matcher.Match(q.q.Name)
+		matcher := rule.matcher.m.Load()
+		if matcher != nil {
+			matched := matcher.Match(q.q.Name)
 			if rule.reverse {
 				matched = !matched
 			}

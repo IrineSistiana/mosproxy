@@ -34,6 +34,8 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dolthub/maphash v0.1.0 // indirect
 	github.com/gammazero/deque v0.2.1 // indirect
+	github.com/go-chi/chi v1.5.5 // indirect
+	github.com/go-chi/chi/v5 v5.0.12 // indirect
 	github.com/go-task/slim-sprig v0.0.0-20230315185526-52ccab3ef572 // indirect
 	github.com/google/pprof v0.0.0-20240320155624-b11c3daa6f07 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect

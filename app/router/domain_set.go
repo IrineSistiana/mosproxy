@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
 )
@@ -16,20 +17,64 @@ func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
 		return fmt.Errorf("dup tag [%s]", cfg.Tag)
 	}
 
+	ds := newDomainSet(cfg.Files)
+	if err := ds.reload(); err != nil {
+		return fmt.Errorf("failed to read data set, %w", err)
+	}
+	ds.commit()
+	r.domainSets[cfg.Tag] = ds
+	r.logger.Info().Str("tag", cfg.Tag).Strs("files", cfg.Files).Int("len", ds.m.Load().Len()).Msg("domain set loaded")
+	return nil
+}
+
+func loadDomainSets(fs []string) (*domainmatcher.MixMatcher, error) {
 	m := domainmatcher.NewMixMatcher()
-	for _, fp := range cfg.Files {
+	for _, fp := range fs {
 		f, err := os.Open(fp)
 		if err != nil {
-			return fmt.Errorf("failed to open domain file %s, %w", fp, err)
+			return nil, fmt.Errorf("failed to open domain file %s, %w", fp, err)
 		}
 		err = domainmatcher.LoadMixMatcherFromReader(m, f)
 		f.Close()
 		if err != nil {
-			return fmt.Errorf("failed to load data, %w", err)
+			return nil, fmt.Errorf("failed to load data, %w", err)
 		}
-		r.logger.Info().Str("tag", cfg.Tag).Str("file", fp).Msg("domain file loaded")
 	}
-	r.logger.Info().Str("tag", cfg.Tag).Int("rules", m.Len()).Msg("domain set loaded")
-	r.domainSets[cfg.Tag] = m
+	return m, nil
+}
+
+func newDomainSet(fs []string) *domainSet {
+	s := new(domainSet)
+	s.fs = append(s.fs, fs...)
+	return s
+}
+
+type domainSet struct {
+	m atomic.Pointer[domainmatcher.MixMatcher]
+
+	fs      []string
+	stagedM *domainmatcher.MixMatcher
+}
+
+func (s *domainSet) reload() error {
+	m, err := loadDomainSets(s.fs)
+	if err != nil {
+		return err
+	}
+	s.stagedM = m
 	return nil
+}
+
+func (s *domainSet) commit() {
+	if s.stagedM != nil {
+		s.m.Store(s.stagedM)
+		s.stagedM = nil
+	}
+}
+
+func (s *domainSet) discard() {
+	if s.stagedM != nil {
+		s.m.Store(s.stagedM)
+		s.stagedM = nil
+	}
 }

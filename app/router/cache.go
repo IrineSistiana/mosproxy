@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/cache"
@@ -66,6 +67,7 @@ func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 	}
 
 	if len(cfg.IpMarker) > 0 {
+		c.ipMarkerFile = cfg.IpMarker
 		marker, err := loadIpMarkerFromFile(cfg.IpMarker)
 		if err != nil {
 			c.Close()
@@ -76,7 +78,7 @@ func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 			Int("len", marker.IpLen()).
 			Int("marks", marker.MarkLen()).
 			Msg("ip marker file loaded")
-		c.ipMarker = marker
+		c.ipMarker.Store(marker)
 	}
 	return c, nil
 }
@@ -118,10 +120,14 @@ func needPrefetch(storedTime, expireTime time.Time) bool {
 
 type cacheCtl struct {
 	logger     *zerolog.Logger
-	maximumTtl time.Duration      // Always valid. Has default value.
-	ipMarker   *ipMarker          // Maybe nil.
-	memory     *cache.MemoryCache // Maybe nil
-	redis      *cache.RedisCache  // Maybe nil
+	maximumTtl time.Duration            // Always valid. Has default value.
+	ipMarker   atomic.Pointer[ipMarker] // Maybe nil.
+	memory     *cache.MemoryCache       // Maybe nil
+	redis      *cache.RedisCache        // Maybe nil
+
+	// reloader
+	ipMarkerFile   string
+	stagedIpMarker *ipMarker
 }
 
 // Store resp into cache.
@@ -272,10 +278,11 @@ func (c *cacheCtl) GetRedisCache(ctx context.Context, key []byte) (_ *dnsmsg.Msg
 // Lookup the mark of the addr.
 // For convenience, if c.ipMarker==nil || addr is not valid, returns "".
 func (c *cacheCtl) ipMark(addr netip.Addr) string {
-	if c.ipMarker == nil || !addr.IsValid() {
+	marker := c.ipMarker.Load()
+	if marker == nil || !addr.IsValid() {
 		return ""
 	}
-	return c.ipMarker.Mark(addr)
+	return marker.Mark(addr)
 }
 
 // Always returns nil.
@@ -301,6 +308,33 @@ func (c *cacheCtl) keyForPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr) uin
 		h ^= maphash.String(mhSeed, ipMark)
 	}
 	return h
+}
+
+func (c *cacheCtl) reload() error {
+	if f := c.ipMarkerFile; len(f) > 0 {
+		marker, err := loadIpMarkerFromFile(f)
+		if err != nil {
+			return err
+		}
+		c.logger.Info().
+			Str("file", f).
+			Int("len", marker.IpLen()).
+			Int("marks", marker.MarkLen()).
+			Msg("new ip marker file loaded")
+		c.stagedIpMarker = marker
+	}
+	return nil
+}
+
+func (c *cacheCtl) commit() {
+	if c.stagedIpMarker != nil {
+		c.ipMarker.Store(c.stagedIpMarker)
+		c.stagedIpMarker = nil
+	}
+}
+
+func (c *cacheCtl) discard() {
+	c.stagedIpMarker = nil
 }
 
 // Pack m into bytes.
