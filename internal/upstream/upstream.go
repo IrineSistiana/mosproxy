@@ -252,7 +252,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			addonCloser = quicTransport
 			t = &http3.RoundTripper{
 				TLSClientConfig: opt.TLSConfig,
-				QuicConfig:      quicConfig,
+				QUICConfig:      quicConfig,
 				Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
 					ua, err := net.ResolveUDPAddr("udp", dialAddr)
 					if err != nil {
