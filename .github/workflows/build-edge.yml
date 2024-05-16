@@ -38,6 +38,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=dev/${{ github.sha }}
           file: ./Dockerfile.buildx
           push: true
           tags: ${{ steps.meta.outputs.tags }}
