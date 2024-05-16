@@ -20,4 +20,4 @@ RUN apk add --no-cache ca-certificates \
 WORKDIR /etc/mosproxy
 VOLUME /etc/mosproxy
 EXPOSE 53/udp 53/tcp
-CMD /usr/bin/mosproxy route -c config.yaml
+CMD /usr/bin/mosproxy router -c config.yaml
