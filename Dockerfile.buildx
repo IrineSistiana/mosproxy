@@ -1,0 +1,23 @@
+FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
+
+FROM --platform=$BUILDPLATFORM golang:latest AS builder
+ARG TARGETPLATFORM
+ARG CGO_ENABLED=0
+COPY --from=xx / /
+# warp go command. (automatically set GOOS,GOARCH... from TARGETPLATFORM)
+RUN xx-go --wrap 
+
+COPY . /src/
+WORKDIR /src
+RUN go build -ldflags "-s -w -X main.version=$(git describe --tags --long --always)" -trimpath -o mosproxy
+
+FROM --platform=${TARGETPLATFORM} alpine:latest
+COPY --from=builder /src/mosproxy /usr/bin/
+
+RUN apk add --no-cache ca-certificates \
+    && mkdir /etc/mosproxy
+
+WORKDIR /etc/mosproxy
+VOLUME /etc/mosproxy
+EXPOSE 53/udp 53/tcp
+CMD /usr/bin/mosproxy route -c config.yaml
