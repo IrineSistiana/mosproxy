@@ -449,7 +449,9 @@ func (r *RawResource) unpack(msg []byte, off int, hdr ResourceHdr) (int, error) 
 	return off, nil
 }
 
-func unpackResource(msg []byte, off int) (Resource, int, error) {
+// Unpack one rr starting at msg[off:].
+// Return unpacked rr, next offset, error.
+func UnpackResource(msg []byte, off int) (Resource, int, error) {
 	var hdr ResourceHdr
 	off, err := hdr.unpack(msg, off)
 	if err != nil {

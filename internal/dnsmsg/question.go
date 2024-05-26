@@ -43,7 +43,9 @@ func (q *Question) pack(msg []byte, off int, compression map[string]uint16) (int
 	return off, nil
 }
 
-func unpackQuestion(msg []byte, off int) (*Question, int, error) {
+// Unpack one question record starting at msg[off:].
+// Return unpacked question, next offset, error.
+func UnpackQuestion(msg []byte, off int) (*Question, int, error) {
 	name, off, err := unpackName(msg, off)
 	if err != nil {
 		return nil, 0, newSectionErr("name", err)

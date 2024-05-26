@@ -14,7 +14,8 @@ const (
 	headerBitCD = 1 << 4  // checking disabled
 )
 
-type header struct {
+// DNS msg raw header.
+type rawHeader struct {
 	id          uint16
 	bits        uint16
 	questions   uint16
@@ -23,7 +24,7 @@ type header struct {
 	additionals uint16
 }
 
-func (h *header) header() Header {
+func (h *rawHeader) header() Header {
 	return Header{
 		ID:                 h.id,
 		Response:           (h.bits & headerBitQR) != 0,
@@ -38,7 +39,7 @@ func (h *header) header() Header {
 	}
 }
 
-func (h *header) pack(msg []byte) (off int, err error) {
+func (h *rawHeader) pack(msg []byte) (off int, err error) {
 	if len(msg) < 12 {
 		return 0, ErrSmallBuffer
 	}
@@ -48,7 +49,22 @@ func (h *header) pack(msg []byte) (off int, err error) {
 	putUint16(msg[6:8], h.answers)
 	putUint16(msg[8:10], h.authorities)
 	putUint16(msg[10:12], h.additionals)
-	return 8, nil
+	return 12, nil
+}
+
+func (h *rawHeader) unpack(msg []byte, off int) (int, error) {
+	hdr := msg[off:]
+	if len(hdr) < 12 {
+		return 0, ErrSmallBuffer
+	}
+	off += 12
+	h.id = unpackUint16(hdr[0:2])
+	h.bits = unpackUint16(hdr[2:4])
+	h.questions = unpackUint16(hdr[4:6])
+	h.answers = unpackUint16(hdr[6:8])
+	h.authorities = unpackUint16(hdr[8:10])
+	h.additionals = unpackUint16(hdr[10:12])
+	return off, nil
 }
 
 // Header is a representation of a DNS message header.
@@ -92,19 +108,29 @@ func (m *Header) Pack() (id uint16, bits uint16) {
 	return
 }
 
-func (h *header) unpack(msg []byte, off int) (int, error) {
-	hdr := msg[off:]
-	if len(hdr) < 12 {
-		return 0, ErrSmallBuffer
+// HeaderCount is a dns msg header section.
+// Useful when manually unpacking a dns msg.
+type HeaderCount struct {
+	QD uint16
+	AN uint16
+	NS uint16
+	AD uint16
+}
+
+func UnpackHdr(msg []byte, off int) (Header, HeaderCount, int, error) {
+	var rh rawHeader
+	off, err := rh.unpack(msg, off)
+	if err != nil {
+		return Header{}, HeaderCount{}, off, newSectionErr("header", err)
 	}
-	off += 12
-	h.id = unpackUint16(hdr[0:2])
-	h.bits = unpackUint16(hdr[2:4])
-	h.questions = unpackUint16(hdr[4:6])
-	h.answers = unpackUint16(hdr[6:8])
-	h.authorities = unpackUint16(hdr[8:10])
-	h.additionals = unpackUint16(hdr[10:12])
-	return off, nil
+	h := rh.header()
+	hc := HeaderCount{
+		QD: rh.questions,
+		AN: rh.answers,
+		NS: rh.authorities,
+		AD: rh.additionals,
+	}
+	return h, hc, off, nil
 }
 
 type Msg struct {
@@ -173,7 +199,7 @@ func UnpackMsg(msg []byte) (*Msg, error) {
 
 func (m *Msg) Unpack(msg []byte) error {
 	var off int
-	var h header
+	var h rawHeader
 	off, err := h.unpack(msg, off)
 	if err != nil {
 		return newSectionErr("header", err)
@@ -182,7 +208,7 @@ func (m *Msg) Unpack(msg []byte) error {
 
 	for i := 0; i < int(h.questions); i++ {
 		var q *Question
-		q, off, err = unpackQuestion(msg, off)
+		q, off, err = UnpackQuestion(msg, off)
 		if err != nil {
 			return newSectionErr("questions", err)
 		}
@@ -191,7 +217,7 @@ func (m *Msg) Unpack(msg []byte) error {
 
 	for i := 0; i < int(h.answers); i++ {
 		var r Resource
-		r, off, err = unpackResource(msg, off)
+		r, off, err = UnpackResource(msg, off)
 		if err != nil {
 			return newSectionErr("answers", err)
 		}
@@ -200,7 +226,7 @@ func (m *Msg) Unpack(msg []byte) error {
 
 	for i := 0; i < int(h.authorities); i++ {
 		var r Resource
-		r, off, err = unpackResource(msg, off)
+		r, off, err = UnpackResource(msg, off)
 		if err != nil {
 			return newSectionErr("authorities", err)
 		}
@@ -209,7 +235,7 @@ func (m *Msg) Unpack(msg []byte) error {
 
 	for i := 0; i < int(h.additionals); i++ {
 		var r Resource
-		r, off, err = unpackResource(msg, off)
+		r, off, err = UnpackResource(msg, off)
 		if err != nil {
 			return newSectionErr("additionals", err)
 		}
@@ -257,7 +283,7 @@ func (m *Msg) Pack(b []byte, compression bool, size int) (int, error) {
 		return 0, errTooManyAdditionals
 	}
 
-	var h header
+	var h rawHeader
 	h.id, h.bits = m.Header.Pack()
 	h.questions = uint16(len(m.Questions))
 	h.answers = uint16(len(m.Answers))
