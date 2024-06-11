@@ -218,7 +218,7 @@ func (c *cacheCtl) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg
 
 	// store in redis
 	if c.redis != nil {
-		c.redis.AsyncStore(k, storedTime, expireTime, v, negativeResp)
+		c.redis.Store(k, storedTime, expireTime, v, negativeResp)
 	}
 }
 
