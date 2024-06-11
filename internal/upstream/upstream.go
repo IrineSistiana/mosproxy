@@ -336,24 +336,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			if err != nil {
 				return nil, err
 			}
-			// This is a workaround to
-			// 1. recover from strange 0rtt rejected err.
-			// 2. avoid NextConnection might block forever.
-			// TODO: Remove this workaround.
-			var c quic.Connection
-			ec, err := t.DialEarly(ctx, ua, tlsConfig, quicConfig)
-			if err != nil {
-				return nil, err
-			}
-			select {
-			case <-ctx.Done():
-				err := context.Cause(ctx)
-				ec.CloseWithError(0, "")
-				return nil, err
-			case <-ec.HandshakeComplete():
-				c = ec.NextConnection()
-			}
-			return c, nil
+			return t.Dial(ctx, ua, tlsConfig, quicConfig)
 		}
 		return transport.NewQuicTransport(transport.QuicTransportOpts{
 			DialContext: dialQuicConn,
