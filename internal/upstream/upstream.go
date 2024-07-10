@@ -329,7 +329,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		if err != nil {
 			t.StatelessResetKey = (*quic.StatelessResetKey)(&srk)
 		}
-		closeIfFuncErr(t)
+		defer closeIfFuncErr(t)
 
 		dialQuicConn := func(ctx context.Context) (quic.Connection, error) {
 			ua, err := net.ResolveUDPAddr("udp", dialAddr)
