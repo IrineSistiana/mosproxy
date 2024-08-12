@@ -479,7 +479,7 @@ func loadIpMarkerFromFile(fp string) (*ipMarker, error) {
 func cacheKey(q *dnsmsg.Question, mark string) pool.Buffer {
 	b := pool.GetBuf(len(q.Name) + 4 + len(mark))
 	off := copy(b, q.Name)
-	binary.BigEndian.AppendUint16(b[off:], uint16(q.Class))
+	binary.BigEndian.PutUint16(b[off:], uint16(q.Class))
 	off += 2
 	binary.BigEndian.PutUint16(b[off:], uint16(q.Type))
 	off += 2
