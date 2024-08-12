@@ -3,6 +3,7 @@ package dnsmsg
 import (
 	"bytes"
 	"strconv"
+	"sync"
 
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 )
@@ -123,6 +124,19 @@ func appendEscapedLabel(dst []byte, label []byte) []byte {
 		}
 	}
 	return dst
+}
+
+var nameBuilderPool = sync.Pool{
+	New: func() any { return new(NameBuilder) },
+}
+
+func NewNameBuilder() *NameBuilder {
+	return nameBuilderPool.Get().(*NameBuilder)
+}
+
+func ReleaseNameBuilder(b *NameBuilder) {
+	b.Reset()
+	nameBuilderPool.Put(b)
 }
 
 type NameBuilder struct {

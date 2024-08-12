@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
@@ -27,18 +28,26 @@ func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
 	return nil
 }
 
-func loadDomainSets(fs []string) (*domainmatcher.MixMatcher, error) {
-	m := domainmatcher.NewMixMatcher()
+func loadDomainSets(fs []string) (*domainmatcher.Matcher, error) {
+	l := domainmatcher.NewLoader()
 	for _, fp := range fs {
 		f, err := os.Open(fp)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open domain file %s, %w", fp, err)
 		}
-		err = domainmatcher.LoadMixMatcherFromReader(m, f)
+		if filepath.Ext(fp) == "mpct" {
+			err = l.LoadCompiledTree(f)
+		} else {
+			err = l.LoadRulesFromReader(f)
+		}
 		f.Close()
 		if err != nil {
-			return nil, fmt.Errorf("failed to load data, %w", err)
+			return nil, fmt.Errorf("failed to load data from file %s, %w", fp, err)
 		}
+	}
+	m, err := l.Compile()
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile data set, %w", err)
 	}
 	return m, nil
 }
@@ -50,10 +59,10 @@ func newDomainSet(fs []string) *domainSet {
 }
 
 type domainSet struct {
-	m atomic.Pointer[domainmatcher.MixMatcher]
+	m atomic.Pointer[domainmatcher.Matcher]
 
 	fs      []string
-	stagedM *domainmatcher.MixMatcher
+	stagedM *domainmatcher.Matcher
 }
 
 func (s *domainSet) reload() error {
