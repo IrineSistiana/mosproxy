@@ -1,6 +1,6 @@
 module github.com/IrineSistiana/mosproxy
 
-go 1.22.1
+go 1.23
 
 require (
 	github.com/IrineSistiana/bytespool v0.0.0-20240303022030-cfcf97e7141f
