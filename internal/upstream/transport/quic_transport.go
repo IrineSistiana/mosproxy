@@ -2,14 +2,13 @@ package transport
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 )
@@ -76,29 +75,23 @@ func (t *QuicTransport) Close() error {
 	return nil
 }
 
-func (t *QuicTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.Msg, error) {
-	if len(q) < 12 {
-		return nil, ErrPayloadTooSmall
-	}
-	payload, err := copyMsgWithLenHdr(q)
-	if err != nil {
-		return nil, err
-	}
-	defer pool.ReleaseBuf(payload)
-
+func (t *QuicTransport) ExchangeContext(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
 	// 4.2.1.  DNS Message IDs
 	//    When sending queries over a QUIC connection, the DNS Message ID MUST
 	//    be set to 0.  The stream mapping for DoQ allows for unambiguous
 	//    correlation of queries and responses, so the Message ID field is not
 	//    required.
-	orgQid := binary.BigEndian.Uint16(payload[2:])
-	binary.BigEndian.PutUint16(payload[2:], 0)
+	payload, err := packTcpMsg(m, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer pool.ReleaseBuf(payload)
 
 	resp, err := t.exchangePayload(ctx, payload)
 	if err != nil {
 		return nil, err
 	}
-	resp.Header.ID = orgQid
+	resp.ID = m.ID
 	return resp, nil
 }
 

@@ -9,11 +9,10 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/IrineSistiana/gopool"
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/IrineSistiana/mosproxy/internal/utils"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/rs/zerolog"
 	"github.com/valyala/fasthttp"
 )
@@ -32,6 +31,7 @@ func (r *Router) startFastHttpServer(cfg *ServerConfig) (*fastHttpServer, error)
 
 	logger := r.subLoggerForServer("server_fasthttp", cfg.Tag)
 	h := &fasthttpHandler{
+		cfg:              cfg,
 		r:                r,
 		clientAddrHeader: cfg.Http.ClientAddrHeader,
 		logger:           logger,
@@ -90,9 +90,6 @@ func newFastHttpServer(s *fasthttp.Server, l net.Listener, logger *zerolog.Logge
 }
 
 func (s *fastHttpServer) serve() error {
-	workerPool := gopool.NewPool[fasthttpJobArgs]()
-	defer workerPool.Close()
-
 	for {
 		c, err := s.l.Accept()
 		if err != nil {
@@ -106,31 +103,16 @@ func (s *fastHttpServer) serve() error {
 			c.Close()
 			continue
 		}
-		workerPool.GoJob(gopool.Job[fasthttpJobArgs]{
-			Args: fasthttpJobArgs{
-				s: s,
-				c: c,
-			},
-			Fn: doFasthttpJob,
+		pool.Go(func() {
+			defer s.ct.Del(c)
+			err := s.s.ServeConn(c)
+			if err != nil {
+				s.logger.Warn().Err(err).
+					Stringer("local", c.LocalAddr()).
+					Stringer("remote", c.RemoteAddr()).
+					Msg("failed to serve conn")
+			}
 		})
-	}
-}
-
-type fasthttpJobArgs struct {
-	s *fastHttpServer
-	c net.Conn
-}
-
-func doFasthttpJob(a fasthttpJobArgs) {
-	s, c := a.s, a.c
-
-	defer s.ct.Del(c)
-	err := s.s.ServeConn(c)
-	if err != nil {
-		s.logger.Warn().Err(err).
-			Stringer("local", c.LocalAddr()).
-			Stringer("remote", c.RemoteAddr()).
-			Msg("failed to serve conn")
 	}
 }
 
@@ -140,6 +122,7 @@ func (s *fastHttpServer) Close() error {
 }
 
 type fasthttpHandler struct {
+	cfg              *ServerConfig
 	r                *Router
 	path             string
 	clientAddrHeader string
@@ -189,22 +172,39 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 		remoteAddr = netAddr2NetipAddr(addr) // Maybe invalid. e.g. server is on unix socket.
 	}
 
-	// Maybe invalid. e.g. server is on unix socket.
-	localAddr := netAddr2NetipAddr(ctx.LocalAddr())
-
 	m := h.readReqMsg(ctx)
 	if m == nil {
 		return
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	resp := h.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr})
-	defer dnsmsg.ReleaseMsg(resp)
-	msgBody := mustHaveRespB(resp, false, 65535)
-	defer pool.ReleaseBuf(msgBody)
+	q := NewQueryCtx()
+	defer ReleaseQueryCtx(q)
+
+	var respBuf pool.Buffer
+	if ok := q.parseQuery(m); !ok {
+		resp := makeEmptyRespM(m, dnsmsg.RCodeRefused)
+		respBuf = serverFinalRespB(m, resp, true, 0)
+		dnsmsg.ReleaseMsg(resp)
+	} else {
+		q.ServerTag = h.cfg.Tag
+		q.RemoteAddr = remoteAddr
+		if stat := ctx.TLSConnectionState(); stat != nil {
+			q.Protocol = ProtoHTTPS
+			q.ServerName = append(q.ServerName, stat.ServerName...)
+		} else {
+			q.Protocol = ProtoHTTP
+		}
+		q.Host = append(q.Host, ctx.Host()...)
+		q.Path = append(q.Path, ctx.Path()...)
+
+		h.r.handleQuery(q)
+		respBuf = serverFinalRespB(m, q.Resp, false, udpSize)
+	}
 
 	ctx.Response.Header.Add("Content-Type", "application/dns-message")
-	ctx.SetBody(msgBody)
+	ctx.SetBody(respBuf)
+	pool.ReleaseBuf(respBuf)
 }
 
 func readClientAddrFromXFFBytes(b []byte) (netip.Addr, error) {

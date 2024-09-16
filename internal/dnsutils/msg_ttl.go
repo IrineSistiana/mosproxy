@@ -1,7 +1,7 @@
 package dnsutils
 
 import (
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 // GetMinimalTTL returns the minimal ttl of this msg.

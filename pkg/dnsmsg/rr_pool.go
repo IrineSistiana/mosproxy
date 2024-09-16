@@ -2,18 +2,17 @@ package dnsmsg
 
 import (
 	"sync"
-
-	"github.com/IrineSistiana/mosproxy/internal/pool"
 )
 
 var (
-	poolA    = sync.Pool{New: func() any { return new(A) }}
-	poolAAAA = sync.Pool{New: func() any { return new(AAAA) }}
-	poolMX   = sync.Pool{New: func() any { return new(MX) }}
-	poolNAME = sync.Pool{New: func() any { return new(NAMEResource) }}
-	poolSOA  = sync.Pool{New: func() any { return new(SOA) }}
-	poolSRV  = sync.Pool{New: func() any { return new(SRV) }}
-	poolRaw  = sync.Pool{New: func() any { return new(RawResource) }}
+	poolA     = sync.Pool{New: func() any { return new(A) }}
+	poolAAAA  = sync.Pool{New: func() any { return new(AAAA) }}
+	poolMX    = sync.Pool{New: func() any { return new(MX) }}
+	poolNAME  = sync.Pool{New: func() any { return new(NAMEResource) }}
+	poolSOA   = sync.Pool{New: func() any { return new(SOA) }}
+	poolSRV   = sync.Pool{New: func() any { return new(SRV) }}
+	poolRaw   = sync.Pool{New: func() any { return new(RawResource) }}
+	poolRrHdr = sync.Pool{New: func() any { return new(ResourceHdr) }}
 )
 
 func NewA() *A               { return poolA.Get().(*A) }
@@ -23,6 +22,7 @@ func NewNAME() *NAMEResource { return poolNAME.Get().(*NAMEResource) }
 func NewSOA() *SOA           { return poolSOA.Get().(*SOA) }
 func NewSRV() *SRV           { return poolSRV.Get().(*SRV) }
 func NewRaw() *RawResource   { return poolRaw.Get().(*RawResource) }
+func newRrHdr() *ResourceHdr { return poolRrHdr.Get().(*ResourceHdr) }
 
 func ReleaseResource(r Resource) {
 	switch r := r.(type) {
@@ -43,58 +43,42 @@ func ReleaseResource(r Resource) {
 	}
 }
 
-func releaseNameIfNotNil(n Name) {
-	if n != nil {
-		ReleaseName(n)
-	}
-}
-
 func ReleaseA(r *A) {
-	releaseNameIfNotNil(r.Name)
-	*r = A{}
+	r.reset()
 	poolA.Put(r)
 }
 
 func ReleaseAAAA(r *AAAA) {
-	releaseNameIfNotNil(r.Name)
-	*r = AAAA{}
+	r.reset()
 	poolAAAA.Put(r)
 }
 
 func ReleaseMX(r *MX) {
-	releaseNameIfNotNil(r.Name)
-	releaseNameIfNotNil(r.MX)
-	*r = MX{}
+	r.reset()
 	poolMX.Put(r)
 }
 
 func ReleaseNAME(r *NAMEResource) {
-	releaseNameIfNotNil(r.Name)
-	releaseNameIfNotNil(r.NameData)
-	*r = NAMEResource{}
+	r.reset()
 	poolNAME.Put(r)
 }
 
 func ReleaseSOA(r *SOA) {
-	releaseNameIfNotNil(r.Name)
-	releaseNameIfNotNil(r.NS)
-	releaseNameIfNotNil(r.MBox)
-	*r = SOA{}
+	r.reset()
 	poolSOA.Put(r)
 }
 
 func ReleaseSRV(r *SRV) {
-	releaseNameIfNotNil(r.Name)
-	releaseNameIfNotNil(r.Target)
-	*r = SRV{}
+	r.reset()
 	poolSRV.Put(r)
 }
 
 func ReleaseRaw(r *RawResource) {
-	releaseNameIfNotNil(r.Name)
-	if r.Data != nil {
-		pool.ReleaseBuf(r.Data)
-	}
-	*r = RawResource{}
+	r.reset()
 	poolRaw.Put(r)
+}
+
+func releaseRrHdr(hdr *ResourceHdr) {
+	hdr.reset()
+	poolRrHdr.Put(hdr)
 }

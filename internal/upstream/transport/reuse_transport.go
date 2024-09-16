@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/rs/zerolog"
 )
 
@@ -68,16 +68,7 @@ func (t *ReuseConnTransport) dialTimeout() time.Duration {
 }
 
 // Note: context is not impl while waiting resp. The timeout is hardcoded, which is reuseConnQueryTimeout.
-func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*dnsmsg.Msg, error) {
-	if len(m) < dnsHeaderLen {
-		return nil, ErrPayloadTooSmall
-	}
-	payload, err := copyMsgWithLenHdr(m)
-	if err != nil {
-		return nil, err
-	}
-	defer pool.ReleaseBuf(payload)
-
+func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
 	errs := make([]error, 0)
 	retry := 0
 	for {
@@ -96,7 +87,7 @@ func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*dn
 			}
 		}
 
-		resp, err := t.exchangeConnCtx(ctx, payload, c)
+		resp, err := t.exchangeConnCtx(ctx, m, c)
 		if err != nil {
 			errs = append(errs, err)
 			if !isNewConn && retry <= 5 && !ctxIsDone(ctx) {
@@ -105,23 +96,29 @@ func (t *ReuseConnTransport) ExchangeContext(ctx context.Context, m []byte) (*dn
 			}
 			return nil, joinErr(errs)
 		}
+		resp.ID = m.ID
 		return resp, nil
 	}
 }
 
 // Note: c will be put back to the pool.
-func (t *ReuseConnTransport) exchangeConnCtx(ctx context.Context, payload []byte, c *reusableConn) (*dnsmsg.Msg, error) {
+func (t *ReuseConnTransport) exchangeConnCtx(ctx context.Context, m *dnsmsg.Msg, c *reusableConn) (*dnsmsg.Msg, error) {
 	type res struct {
 		m   *dnsmsg.Msg
 		err error
 	}
 	resChan := make(chan res, 1)
 
+	payload, err := packTcpMsg(m, 0)
+	if err != nil {
+		return nil, err
+	}
 	go func() {
 		resp, err := t.exchangeConn(payload, c)
 		resChan <- res{m: resp, err: err}
 		t.releaseConn(c, err)
 	}()
+
 	select {
 	case r := <-resChan:
 		return r.m, r.err
@@ -130,13 +127,15 @@ func (t *ReuseConnTransport) exchangeConnCtx(ctx context.Context, payload []byte
 	}
 }
 
-func (t *ReuseConnTransport) exchangeConn(payload []byte, c *reusableConn) (*dnsmsg.Msg, error) {
+// will release the payload
+func (t *ReuseConnTransport) exchangeConn(payload pool.Buffer, c *reusableConn) (*dnsmsg.Msg, error) {
 	respTimeout := reuseConnQueryTimeout
 	if t.testRespTimeout > 0 {
 		respTimeout = t.testRespTimeout
 	}
 	c.c.SetDeadline(time.Now().Add(respTimeout))
 	_, err := c.c.Write(payload)
+	pool.ReleaseBuf(payload)
 	if err != nil {
 		return nil, err
 	}

@@ -4,7 +4,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 )
@@ -62,4 +62,49 @@ func Test_findECS(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_packECS(t *testing.T) {
+	r := require.New(t)
+	testFn := func(s string) {
+		p, err := netip.ParsePrefix(s)
+		r.NoError(err)
+		p = p.Masked()
+
+		m := dnsmsg.NewMsg()
+		opt := newEDNS0(0)
+		opt.Data = makeEdns0ClientSubnetReqOpt(p)
+		m.Additionals = append(m.Additionals, opt)
+
+		bb, err := m.Pack(nil, false, 0)
+		r.NoError(err)
+
+		m2 := new(dns.Msg)
+		err = m2.Unpack(bb)
+		r.NoError(err)
+
+		opt2 := m2.IsEdns0()
+		r.NotNil(opt2)
+		r.Equal(1, len(opt2.Option))
+
+		ecs, ok := opt2.Option[0].(*dns.EDNS0_SUBNET)
+		r.True(ok)
+
+		gotAddr, ok := netip.AddrFromSlice(ecs.Address)
+		r.True(ok)
+		gotAddr = gotAddr.Unmap()
+
+		gotMask := ecs.SourceNetmask
+		gotP := netip.PrefixFrom(gotAddr, int(gotMask))
+
+		r.Equal(p, gotP)
+	}
+	testFn("1.2.3.4/0")
+	testFn("1.2.3.4/1")
+	testFn("1.2.3.4/16")
+	testFn("1.2.3.4/32")
+	testFn("1::2/0")
+	testFn("1::2/64")
+	testFn("1::2/127")
+	testFn("1::2/128")
 }

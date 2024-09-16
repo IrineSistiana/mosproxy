@@ -6,7 +6,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 var (
@@ -25,7 +25,7 @@ type Transport interface {
 	// ExchangeContext exchanges query message m to the upstream, and returns
 	// response. It MUST NOT keep or modify m.
 	// It is the caller's responsibility to release the resp.
-	ExchangeContext(ctx context.Context, m []byte) (resp *dnsmsg.Msg, err error)
+	ExchangeContext(ctx context.Context, m *dnsmsg.Msg) (resp *dnsmsg.Msg, err error)
 
 	io.Closer
 }

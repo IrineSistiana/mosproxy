@@ -3,7 +3,6 @@ package transport
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -12,9 +11,9 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/connpool"
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 var (
@@ -57,7 +56,7 @@ func (c *pipelineConn) startLoops() {
 }
 
 // exchange writes payload to connection waits for its reply.
-func (c *pipelineConn) exchange(ctx context.Context, m []byte) (*dnsmsg.Msg, error) {
+func (c *pipelineConn) exchange(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
 	respChan := make(chan *dnsmsg.Msg, 1)
 	qid, err := c.addQueueC(respChan)
 	if err != nil {
@@ -76,7 +75,7 @@ func (c *pipelineConn) exchange(ctx context.Context, m []byte) (*dnsmsg.Msg, err
 	case <-c.ctx.Done():
 		return nil, context.Cause(c.ctx)
 	case r := <-respChan:
-		r.Header.ID = binary.BigEndian.Uint16(m)
+		r.Header.ID = m.Header.ID
 		return r, nil
 	}
 }
@@ -125,7 +124,7 @@ func (c *pipelineConn) readLoop() {
 			return
 		}
 
-		resChan := c.getQueueC(r.Header.ID)
+		resChan := c.getQueueC(r.ID)
 		if resChan != nil {
 			select {
 			case resChan <- r: // resChan has buffer
@@ -138,11 +137,10 @@ func (c *pipelineConn) readLoop() {
 	}
 }
 
-func (c *pipelineConn) write(m []byte, qid uint16) (err error) {
+func (c *pipelineConn) write(m *dnsmsg.Msg, qid uint16) (err error) {
 	isTCP := c.t.opts.IsTCP
 	if isTCP {
-		b, err := copyMsgWithLenHdr(m)
-		setQid(b, 2, qid)
+		b, err := packTcpMsg(m, qid)
 		if err != nil {
 			return err
 		}
@@ -150,13 +148,11 @@ func (c *pipelineConn) write(m []byte, qid uint16) (err error) {
 		pool.ReleaseBuf(b)
 		return err
 	}
-
-	b := pool.GetBuf(len(m))
-	bb := b
-	copy(bb, m)
-	setQid(bb, 0, qid)
-
-	_, err = c.c.Write(bb)
+	b, err := packMsg(m, qid)
+	if err != nil {
+		return err
+	}
+	_, err = c.c.Write(b)
 	pool.ReleaseBuf(b)
 	if err != nil {
 		if isUdpMsgSizeErr(err) {

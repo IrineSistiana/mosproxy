@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
-	"sync/atomic"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/rs/zerolog"
 )
 
@@ -42,14 +42,19 @@ func (r *Router) startTcpServer(cfg *ServerConfig, useTls bool) (*tcpServer, err
 		maxConcurrent = defaultMaxConcurrentRequestPreTCPConn
 	}
 
+	ctx, cancel := context.WithCancelCause(context.Background())
 	s := &tcpServer{
+		cfg:           cfg,
 		r:             r,
 		logger:        r.subLoggerForServer("server_tcp", cfg.Tag),
 		l:             l,
 		tlsConfig:     tlsConfig,
 		idleTimeout:   idleTimeout,
 		maxConcurrent: maxConcurrent,
-		ct:            newConnTracker[net.Conn](func(c net.Conn) { c.Close() }, func() { l.Close() }),
+
+		ctx:    ctx,
+		cancel: cancel,
+		ct:     newConnTracker[net.Conn](func(c net.Conn) { c.Close() }, func() { l.Close() }),
 	}
 	s.logger.Info().
 		Str("network", l.Addr().Network()).
@@ -67,6 +72,7 @@ func (r *Router) startTcpServer(cfg *ServerConfig, useTls bool) (*tcpServer, err
 }
 
 type tcpServer struct {
+	cfg    *ServerConfig
 	r      *Router
 	logger *zerolog.Logger
 
@@ -75,11 +81,12 @@ type tcpServer struct {
 	idleTimeout   time.Duration // valid
 	maxConcurrent int32         // valid
 
-	ct *connTracker[net.Conn]
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	ct     *connTracker[net.Conn]
 }
 
 func (s *tcpServer) run() error {
-	r := s.r
 	for {
 		c, err := s.l.Accept()
 		if err != nil {
@@ -88,34 +95,23 @@ func (s *tcpServer) run() error {
 			}
 			return err
 		}
-
 		debugLogServerConnAccepted(c, s.logger)
 
-		var cost int
-		if s.tlsConfig != nil {
-			cost = costTLSConn
-		} else {
-			cost = costTCPConn
-		}
-		if err := r.limiterAllowN(netAddr2NetipAddr(c.RemoteAddr()).Addr(), cost); err != nil {
-			// TODO: Log or create a metrics entry for refused queries.
+		if !s.ct.Add(c) {
 			c.Close()
-			debugLogServerConnClosed(c, s.logger, err)
-		} else {
-			if !s.ct.Add(c) {
-				c.Close()
-				continue
-			}
-			go func() {
-				defer c.Close()
-				defer s.ct.Del(c)
-				s.handleConn(c)
-			}()
+			debugLogServerConnClosed(c, s.logger, errServerClosed)
+			continue
 		}
+		go func() {
+			defer c.Close()
+			defer s.ct.Del(c)
+			err = s.handleConn(c)
+			debugLogServerConnClosed(c, s.logger, err)
+		}()
 	}
 }
 
-func (s *tcpServer) handleConn(c net.Conn) {
+func (s *tcpServer) handleConn(c net.Conn) error {
 	// TLS handshake
 	if s.tlsConfig != nil {
 		tlsConn := tls.Server(c, s.tlsConfig)
@@ -125,75 +121,79 @@ func (s *tcpServer) handleConn(c net.Conn) {
 		err := tlsConn.HandshakeContext(ctx)
 		cancel()
 		if err != nil {
-			s.logger.Warn().
-				Stringer("local", c.LocalAddr()).
-				Stringer("remote", c.RemoteAddr()).
-				Err(err).
-				Msg("failed to tls handshake")
-			return
+			return fmt.Errorf("failed to tls handshake, %w", err)
 		}
 		c = tlsConn
 	}
 
-	concurrent := new(atomic.Int32)
-	respWriter := newTcpRespWriter(c, concurrent)
+	concurrent := make(chan struct{}, s.maxConcurrent)
 	br := pool.NewBR1K(c)
 	defer pool.ReleaseBR1K(br)
-	remoteAddr := netAddr2NetipAddr(c.RemoteAddr())
-	localAddr := netAddr2NetipAddr(c.LocalAddr())
 	for {
 		c.SetReadDeadline(time.Now().Add(s.idleTimeout))
 		m, n, err := dnsutils.ReadMsgFromTCP(br)
 		if err != nil {
 			if n > 0 { // invalid msg
-				s.logger.Warn().
-					Stringer("local", c.LocalAddr()).
-					Stringer("remote", c.RemoteAddr()).
-					Err(err).
-					Msg("invalid query msg")
+				return fmt.Errorf("invalid query msg, %w", err)
 			}
-			// eof
-			debugLogServerConnClosed(c, s.logger, err)
-			return
+			// eof, no err
+			return nil
 		}
 
-		cc := concurrent.Add(1)
-		if cc > s.maxConcurrent ||
-			s.r.limiterAllowN(netAddr2NetipAddr(c.RemoteAddr()).Addr(), costTCPQuery) != nil {
-			resp := mustHaveEmptyRespForQueryB(m, dnsmsg.RCodeRefused, true, 0)
-			c.Write(resp)
-			pool.ReleaseBuf(resp)
-			concurrent.Add(-1)
-			//TODO: log or add an entry for refused queries.
-		} else {
-			s.r.handleQueryAsync(
-				m,
-				QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr},
-				respWriter,
-			)
+		select {
+		case concurrent <- struct{}{}:
+			pool.Go(func() {
+				defer dnsmsg.ReleaseMsg(m)
+				defer func() {
+					select {
+					case concurrent <- struct{}{}:
+					default:
+						panic("negative concurrent counter")
+					}
+				}()
+				s.handleMsg(c, m)
+			})
+		case <-s.ctx.Done():
+			return context.Cause(s.ctx)
 		}
-		dnsmsg.ReleaseMsg(m)
 	}
 }
 
-type tcpRespWriter struct {
-	c          net.Conn
-	concurrent *atomic.Int32
-}
+func (s *tcpServer) handleMsg(c net.Conn, m *dnsmsg.Msg) {
+	q := NewQueryCtx()
+	defer ReleaseQueryCtx(q)
 
-func newTcpRespWriter(c net.Conn, concurrent *atomic.Int32) RespWriter {
-	return &tcpRespWriter{
-		c:          c,
-		concurrent: concurrent,
+	var respBuf pool.Buffer
+	if ok := q.parseQuery(m); !ok {
+		resp := makeEmptyRespM(m, dnsmsg.RCodeRefused)
+		respBuf = serverFinalRespB(m, resp, true, 0)
+		dnsmsg.ReleaseMsg(resp)
+		goto sendResp
 	}
-}
 
-func (w *tcpRespWriter) WriteResp(m *dnsmsg.Msg) {
-	// TODO: Impl write once
-	b := mustHaveRespB(m, true, 0)
-	w.c.Write(b)
-	pool.ReleaseBuf(b)
-	w.concurrent.Add(-1)
+	q.ServerTag = s.cfg.Tag
+	q.RemoteAddr = netAddr2NetipAddr(c.RemoteAddr())
+	if tc, ok := c.(*tls.Conn); ok {
+		stat := tc.ConnectionState()
+		q.Protocol = ProtoTLS
+		q.ServerName = append(q.ServerName, stat.ServerName...)
+	} else {
+		q.Protocol = ProtoTCP
+	}
+	s.r.handleQuery(q)
+	respBuf = serverFinalRespB(m, q.Resp, true, 0)
+
+sendResp:
+	_, err := c.Write(respBuf)
+	pool.ReleaseBuf(respBuf)
+	if err != nil {
+		e := s.logger.Debug() // This err log might be annoying  Using debug log.
+		if e != nil {
+			e.Stringer("remote", c.RemoteAddr()).
+				Err(err).
+				Msg("failed to write to remote")
+		}
+	}
 }
 
 // Close the listener.

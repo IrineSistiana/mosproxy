@@ -3,15 +3,14 @@ package transport
 import (
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
 	urlpkg "net/url"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/rs/zerolog"
 )
 
@@ -69,31 +68,28 @@ var (
 	bufPool4k = pool.NewBytesBufPool(4096)
 )
 
-func (u *DoHTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.Msg, error) {
-	l := len(q)
-	if l < dnsHeaderLen {
-		return nil, ErrPayloadTooSmall
-	}
-	if l > dohMaximumMsgSize {
-		return nil, ErrPayloadOverFlow
-	}
-	bp := copyMsg(q)
-	bs := bp
+func (u *DoHTransport) ExchangeContext(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
 	// In order to maximize HTTP cache friendliness, DoH clients using media
 	// formats that include the ID field from the DNS message header, such
 	// as "application/dns-message", SHOULD use a DNS ID of 0 in every DNS
 	// request.
 	// https://tools.ietf.org/html/rfc8484#section-4.1
-	bs[0] = 0
-	bs[1] = 0
+	b, err := packMsg(m, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer pool.ReleaseBuf(b)
 
-	rawQuery := make([]byte, 4+base64.RawURLEncoding.EncodedLen(len(bs)))
+	if len(b) > dohMaximumMsgSize {
+		return nil, ErrPayloadOverFlow
+	}
+
+	rawQuery := make([]byte, 4+base64.RawURLEncoding.EncodedLen(len(b)))
 	copy(rawQuery, "dns=")
 
 	// Padding characters for base64url MUST NOT be included.
 	// See: https://tools.ietf.org/html/rfc8484#section-6.
-	base64.RawURLEncoding.Encode(rawQuery[4:], bs)
-	pool.ReleaseBuf(bp)
+	base64.RawURLEncoding.Encode(rawQuery[4:], b)
 
 	type res struct {
 		r   *dnsmsg.Msg
@@ -121,7 +117,7 @@ func (u *DoHTransport) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.M
 		r := res.r
 		err := res.err
 		if r != nil {
-			r.Header.ID = binary.BigEndian.Uint16(q)
+			r.ID = m.ID
 		}
 		return r, err
 	}

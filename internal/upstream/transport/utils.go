@@ -4,17 +4,50 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"unsafe"
 
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/rs/zerolog"
 	"golang.org/x/exp/constraints"
 )
 
-const (
-	dnsHeaderLen = 12 // minimum dns msg size
-)
+func packTcpMsg(m *dnsmsg.Msg, qid uint16) (pool.Buffer, error) {
+	l, err := m.MaxPackLen()
+	if err != nil {
+		return nil, err
+	}
+	if l > math.MaxUint16 {
+		return nil, ErrPayloadOverFlow
+	}
+
+	b := pool.GetBuf(l + 2)
+	_, err = m.Pack(b[:2], false, 0)
+	if err != nil {
+		pool.ReleaseBuf(b)
+		return nil, err
+	}
+	binary.BigEndian.PutUint16(b[:2], uint16(l))
+	binary.BigEndian.PutUint16(b[2:4], uint16(qid))
+	return b, nil
+}
+
+func packMsg(m *dnsmsg.Msg, qid uint16) (pool.Buffer, error) {
+	l, err := m.MaxPackLen()
+	if err != nil {
+		return nil, err
+	}
+	b := pool.GetBuf(l)
+	_, err = m.Pack(b[:0], false, 0)
+	if err != nil {
+		pool.ReleaseBuf(b)
+		return nil, err
+	}
+	binary.BigEndian.PutUint16(b[0:2], uint16(qid))
+	return b, nil
+}
 
 func copyMsgWithLenHdr(m []byte) (pool.Buffer, error) {
 	l := len(m)

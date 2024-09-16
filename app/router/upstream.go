@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/upstream"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -92,7 +92,7 @@ func (uw *upstreamWrapper) RegisterMetricsTo(r prometheus.Registerer) error {
 	return regMetrics(r, uw.queryTotal, uw.errTotal, uw.thread, uw.responseLatency)
 }
 
-func (uw *upstreamWrapper) Exchange(ctx context.Context, m []byte) (*dnsmsg.Msg, error) {
+func (uw *upstreamWrapper) Exchange(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
 	uw.queryTotal.Inc()
 	var (
 		r   *dnsmsg.Msg

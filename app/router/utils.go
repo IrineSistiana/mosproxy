@@ -3,7 +3,7 @@ package router
 import (
 	"context"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 func addOrReplaceOpt(m *dnsmsg.Msg, udpSize uint16) {
@@ -19,7 +19,7 @@ func newEDNS0(udpSize uint16) *dnsmsg.RawResource {
 		udpSize = 512
 	}
 	opt := dnsmsg.NewRaw()
-	// opt.Name is zero, which equals "."
+	opt.Name.Finish() // Just "."
 	opt.Class = dnsmsg.Class(udpSize)
 	opt.Type = dnsmsg.TypeOPT
 	return opt

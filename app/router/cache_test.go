@@ -3,23 +3,12 @@ package router
 import (
 	"crypto/rand"
 	"net"
-	"strings"
 	"testing"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 )
-
-func Test_loadMarker(t *testing.T) {
-	r := require.New(t)
-	data := "224.0.0.0,255.255.255.255,1\n" +
-		"::,::1,2"
-	marker, err := loadIpMarkerFromReader(strings.NewReader(data))
-	r.NoError(err)
-	r.Equal(2, marker.IpLen())
-	r.Equal(2, marker.MarkLen())
-}
 
 func Benchmark_Compress(b *testing.B) {
 	randIp6 := func() net.IP {

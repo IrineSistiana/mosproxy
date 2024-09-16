@@ -18,11 +18,10 @@ type Config struct {
 
 	Addons AddonsConfig `yaml:"addons"`
 
-	Log     LogConfig     `yaml:"log"`
-	Cache   CacheConfig   `yaml:"cache"`
-	ECS     ECSConfig     `yaml:"ecs"`
-	Limiter LimiterConfig `yaml:"limiter"`
-	API     APIConfig     `yaml:"api"`
+	Log   LogConfig   `yaml:"log"`
+	Cache CacheConfig `yaml:"cache"`
+	ECS   ECSConfig   `yaml:"ecs"`
+	API   APIConfig   `yaml:"api"`
 }
 
 type ServerConfig struct {
@@ -39,21 +38,20 @@ type ServerConfig struct {
 }
 
 type UdpConfig struct {
-	MultiRoutes bool `yaml:"multi_routes"`
-	Threads     int  `yaml:"threads"`
+	MultiRoutes  bool `yaml:"multi_routes"`
+	MaxEdns0Size int  `yaml:"max_edns0_size"`
 }
 
 type TcpConfig struct {
 	MaxConcurrentQueries int32 `yaml:"max_concurrent_queries"`
-	Threads              int   `yaml:"threads"`
 }
 
 type TlsConfig struct {
-	Cert               string `yaml:"cert"`
-	Key                string `yaml:"key"`
-	CA                 string `yaml:"ca"`
-	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
-	VerifyClientCert   bool   `yaml:"verify_client_cert"`
+	Certs              []string `yaml:"certs"`
+	Keys               []string `yaml:"keys"`
+	CA                 string   `yaml:"ca"`
+	InsecureSkipVerify bool     `yaml:"insecure_skip_verify"`
+	VerifyClientCert   bool     `yaml:"verify_client_cert"`
 
 	DebugUseTempCert bool `yaml:"debug_use_temp_cert,omitempty"`
 }
@@ -108,26 +106,18 @@ type LogConfig struct {
 }
 
 type CacheConfig struct {
-	MemSize    int    `yaml:"mem_size"`
-	Redis      string `yaml:"redis"`
-	MaximumTTL int    `yaml:"maximum_ttl"`
-	IpMarker   string `yaml:"ip_marker"`
+	MemSize           int     `yaml:"mem_size"`
+	Redis             string  `yaml:"redis"`
+	MinimumTTL        int     `yaml:"minimum_ttl"`
+	MaximumTTL        int     `yaml:"maximum_ttl"`
+	PrefetchThreshold float32 `yaml:"prefetch_threshold"`
 }
 
 type ECSConfig struct {
-	Enabled bool `yaml:"enabled"`
-}
-
-type LimiterConfig struct {
-	GlobalLimit int                 `yaml:"global_limit"`
-	Client      ClientLimiterConfig `yaml:"client"`
-}
-
-type ClientLimiterConfig struct {
-	Limit  int `yaml:"limit"`
-	Burst  int `yaml:"burst"`
-	V4Mask int `yaml:"v4_mask"`
-	V6Mask int `yaml:"v6_mask"`
+	Enabled       bool   `yaml:"enabled"`
+	Forward       bool   `yaml:"forward"`
+	IpZone        string `yaml:"ip_zone"`
+	ZoneOverwrite string `yaml:"zone_overwrite"`
 }
 
 type APIConfig struct {

@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,8 +41,7 @@ func Test_ReuseConnTransport(t *testing.T) {
 			resp, err := rt.ExchangeContext(ctx, req)
 			a.NoError(err)
 			a.EqualValues(666, resp.ID)
-			respName, err := dnsmsg.ToReadable(resp.Questions[0].Name)
-			a.NoError(err)
+			respName := resp.Questions[0].Name.AppendReadableTo(nil)
 			a.True(string(respName) == "test.test")
 		}()
 	}

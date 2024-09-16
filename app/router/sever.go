@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 var (
@@ -21,12 +21,6 @@ func (r *Router) startServer(cfg *ServerConfig) (closeFn func(), err error) {
 		return func() { s.Close() }, nil
 	case "tcp":
 		s, err := r.startTcpServer(cfg, false)
-		if err != nil {
-			return nil, err
-		}
-		return func() { s.Close() }, nil
-	case "gnet":
-		s, err := r.startGnetServer(cfg)
 		if err != nil {
 			return nil, err
 		}

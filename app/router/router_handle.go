@@ -2,202 +2,71 @@ package router
 
 import (
 	"context"
-	"math/rand/v2"
 	"net/netip"
 
-	"github.com/IrineSistiana/gopool"
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
-func (r *Router) handleQueryAsync(q *dnsmsg.Msg, qm QueryMeta, w RespWriter) {
-	resp := r.handleQueryMsg(q, qm, w)
-	if resp != nil {
-		w.WriteResp(resp)
-		dnsmsg.ReleaseMsg(resp)
-	}
-}
-
-func (r *Router) handleQuerySync(q *dnsmsg.Msg, qm QueryMeta) *dnsmsg.Msg {
-	return r.handleQueryMsg(q, qm, nil)
-}
-
-// If w != nil, then it run blocking funcs asynchronously, and write resp to w, return nil.
-// Otherwise, it returns resp.
-func (r *Router) handleQueryMsg(q *dnsmsg.Msg, qMeta QueryMeta, w RespWriter) *dnsmsg.Msg {
-	resp, err := middlewareImpl().PreHandling(q, qMeta)
-	if err != nil {
-		r.logger.Warn().Err(err).Msg("middleware pre-handling error")
-		return makeEmptyRespM(q, dnsmsg.RCodeServerFailure)
-	}
-	if resp != nil {
-		postProcessResp(getQueryInfo(q), resp)
-		return resp
-	}
-
-	hdr := q.Header
-	notImpl := hdr.Response ||
-		!hdr.RecursionDesired ||
-		hdr.OpCode != dnsmsg.OpCode(0) ||
-		len(q.Questions) != 1
-
-	if notImpl {
-		e := r.logger.Debug()
-		if e != nil {
-			e.Stringer("remote", qMeta.RemoteAddr).
-				Stringer("local", qMeta.LocalAddr).
-				Msg("not impl query")
-		}
-		return makeEmptyRespM(q, dnsmsg.RCodeNotImplemented)
-
-	} else {
-		qc := qCtx{
-			uid:   rand.Uint32(),
-			q:     q.Questions[0].Copy(),
-			qMeta: qMeta,
-			qInfo: getQueryInfo(q)}
-		defer dnsmsg.ReleaseQuestion(qc.q)
-		dnsmsg.ToLowerName(qc.q.Name)
-
-		if r.opt.Log.TraceMsgs {
-			r.debugLogMsg(qc, q, "received query from client")
-		}
-
-		resp, meta := r.handleQuestion(qc, w)
-		if resp != nil {
-			postProcessResp(qc.qInfo, resp)
-			if r.opt.Log.Queries {
-				r.logQueryResp(qc, resp, meta)
-			}
-			if r.opt.Log.TraceMsgs {
-				r.debugLogMsg(qc, resp, "sending response to client")
+// always set q.Resp
+func (r *Router) handleQuery(q *QueryCtx) {
+	// Set info about ECS
+	// Priority: client addr < forward client ecs < overwrite
+	if r.opt.ECS.Enabled {
+		if q.RemoteAddr.IsValid() {
+			addr := q.RemoteAddr.Addr().Unmap()
+			if addr.Is4() {
+				q.ECS2Upstream = netip.PrefixFrom(addr, 24)
+			} else {
+				q.ECS2Upstream = netip.PrefixFrom(addr, 48)
 			}
 		}
-		return resp
-	}
-}
+		if r.opt.ECS.Forward && q.ClientECS.IsValid() { //
+			q.ECS2Upstream = q.ClientECS
+		}
 
-func getQueryInfo(m *dnsmsg.Msg) QueryInfo {
-	i := QueryInfo{
-		Id:     m.ID,
-		OpCode: m.OpCode,
-		Rd:     m.RecursionDesired,
-		ECS:    findECS(m),
-	}
-	for _, rr := range m.Additionals {
-		if rr.Hdr().Type == dnsmsg.TypeOPT {
-			i.EDNS0 = true
-			break
+		// Get zone
+		if r.ecsZone != nil {
+			m := r.ecsZone.V()
+			if m != nil {
+				q.ECSZone = m.Mark(q.ECS2Upstream.Addr())
+			}
+		}
+
+		// Overwrite ecs
+		if r.ecsZoneOverwrite != nil {
+			m := r.ecsZoneOverwrite.V()
+			if m != nil {
+				addr, ok := (*m)[q.ECSZone]
+				if ok {
+					q.ECS2Upstream = addr
+				}
+			}
 		}
 	}
-	return i
-}
 
-// Set resp hdr.
-// Set/remove resp edns0.
-func postProcessResp(qInfo QueryInfo, resp *dnsmsg.Msg) {
-	resp.Header.ID = qInfo.Id
-	resp.Header.Response = true
-	resp.Header.OpCode = qInfo.OpCode
-	resp.Header.RecursionAvailable = true
-	resp.Header.RecursionDesired = qInfo.Rd
-
-	if qInfo.EDNS0 {
-		addOrReplaceOpt(resp, udpSize)
-	} else {
-		// remove opt from resp
-		rr := dnsmsg.PopEDNS0(resp)
-		if rr != nil {
-			dnsmsg.ReleaseResource(rr)
+	mw := middleware.Load()
+	if mw != nil {
+		(*mw).Handle(q, r.builtInHandler)
+		if q.Resp == nil { // misbehaved
+			panic("middleware returned a nil resp")
 		}
-	}
-}
-
-func (r *Router) handleQuestion(q qCtx, w RespWriter) (*dnsmsg.Msg, RespMeta) {
-	var remoteAddr netip.Addr
-	if usefulECS(q.qInfo.ECS) {
-		remoteAddr = q.qInfo.ECS.Addr()
 	} else {
-		remoteAddr = q.qMeta.RemoteAddr.Addr()
+		r.builtInHandler(q)
 	}
 
-	resp, upstream, respMeta := r.nonblockingFuncs(q, remoteAddr)
-	if resp != nil {
-		return resp, respMeta
-	}
-
-	if w != nil {
-		args := blockingJobArgs{
-			r: r,
-			q: qCtx{
-				uid:   q.uid,
-				q:     q.q.Copy(),
-				qMeta: q.qMeta,
-				qInfo: q.qInfo,
-			},
-			remoteAddr: remoteAddr,
-			respMeta:   respMeta,
-			upstream:   upstream,
-			w:          w,
-		}
-		r.bJobPool.GoJob(gopool.Job[blockingJobArgs]{
-			Args: args,
-			Fn:   doBlockingJob,
-		})
-		return nil, RespMeta{}
-	} else {
-		return r.blockingFuncs(qCtx{q: q.q, qMeta: q.qMeta, qInfo: q.qInfo}, remoteAddr, respMeta, upstream)
+	if r.opt.Log.Queries {
+		r.logAccess(q)
 	}
 }
 
-type blockingJobArgs struct {
-	r          *Router
-	q          qCtx
-	remoteAddr netip.Addr
-	respMeta   RespMeta
-	upstream   *upstreamWrapper
-	w          RespWriter
-}
-
-func doBlockingJob(a blockingJobArgs) {
-	defer dnsmsg.ReleaseQuestion(a.q.q)
-	resp, meta := a.r.blockingFuncs(a.q, a.remoteAddr, a.respMeta, a.upstream)
-	defer dnsmsg.ReleaseMsg(resp)
-	postProcessResp(a.q.qInfo, resp)
-
-	if a.r.opt.Log.Queries {
-		a.r.logQueryResp(a.q, resp, meta)
-	}
-	if a.r.opt.Log.TraceMsgs {
-		a.r.debugLogMsg(a.q, resp, "sending response to client")
-	}
-
-	a.w.WriteResp(resp)
-}
-
-func usefulECS(p netip.Prefix) bool {
-	if !p.IsValid() {
-		return false
-	}
-	addr := p.Addr().Unmap()
-	bits := p.Bits()
-	if addr.Is4() {
-		return bits >= 24
-	}
-	return bits >= 48 // v6
-}
-
-// return (resp, nil, meta)
-// or (nil, upstream, meta)
-func (r *Router) nonblockingFuncs(q qCtx, remoteAddr netip.Addr) (*dnsmsg.Msg, *upstreamWrapper, RespMeta) {
-	var respMeta RespMeta
-
+func (r *Router) builtInHandler(q *QueryCtx) {
 	// Match rules
 	var matchedRule *rule
 	for i, rule := range r.rules {
 		if rule.matcher != nil {
-			matcher := rule.matcher.m.Load()
-			matched := matcher.Match(q.q.Name)
+			matcher := rule.matcher.V()
+			matched := matcher.Match(&q.Question.Name)
 			if rule.reverse {
 				matched = !matched
 			}
@@ -205,86 +74,70 @@ func (r *Router) nonblockingFuncs(q qCtx, remoteAddr netip.Addr) (*dnsmsg.Msg, *
 				continue
 			}
 		}
-		respMeta.RuleIdx = i
+		q.Trace.RuleIdx = i
 		matchedRule = rule
 		break
 	}
 
 	if matchedRule == nil {
-		resp := makeEmptyRespMQ(q.q, uint16(dnsmsg.RCodeRefused))
-		return resp, nil, respMeta
+		setEmptyRespMQ(q, dnsmsg.RCodeRefused)
+		return
 	}
 	if rejectRCode := matchedRule.reject; rejectRCode > 0 {
-		resp := makeEmptyRespMQ(q.q, rejectRCode)
-		return resp, nil, respMeta
+		setEmptyRespMQ(q, dnsmsg.RCode(rejectRCode))
+		return
 	}
 	if matchedRule.upstream == nil {
-		resp := makeEmptyRespMQ(q.q, uint16(dnsmsg.RCodeRefused))
-		return resp, nil, respMeta
+		setEmptyRespMQ(q, dnsmsg.RCodeRefused)
+		return
 	}
-
 	upstream := matchedRule.upstream
 
-	// lookup cache
-	cacheKey, mark := r.cache.Key(q.q, remoteAddr)
-	respMeta.IpMark = mark
+	cacheKey := r.cache.Key(q)
+	defer pool.ReleaseBuf(cacheKey)
+
+	// lookup mem cache
 	resp, storedTime, expireTime := r.cache.GetMemoryCache(cacheKey)
-	pool.ReleaseBuf(cacheKey)
 	if resp != nil { // mem cache hit
-		if needPrefetch(storedTime, expireTime) {
-			r.asyncSingleFlightPrefetch(q, remoteAddr, upstream)
+		if r.needPrefetch(storedTime, expireTime) {
+			r.asyncSingleFlightPrefetch(cacheKey, q, upstream)
 		}
 		r.queryCacheHitTotal.Inc()
-		r.limiterAllowN(remoteAddr, costFromCache)
-		respMeta.Cached = true
-		return resp, nil, respMeta
+		q.Resp = resp
+		q.Trace.Cached = true
+		return
 	}
-	return nil, upstream, respMeta
-}
 
-// always returns a resp
-func (r *Router) blockingFuncs(q qCtx, remoteAddr netip.Addr, respMeta RespMeta, upstream *upstreamWrapper) (*dnsmsg.Msg, RespMeta) {
 	ctx, cancel := context.WithTimeout(r.ctx, queryTimeout)
 	defer cancel()
 
-	cacheKey, _ := r.cache.Key(q.q, remoteAddr)
-	resp, storedTime, expireTime := r.cache.GetRedisCache(ctx, cacheKey)
-	pool.ReleaseBuf(cacheKey)
+	// lookup redis cache
+	resp, storedTime, expireTime = r.cache.GetRedisCache(ctx, cacheKey)
 	if resp != nil {
-		if needPrefetch(storedTime, expireTime) {
-			r.asyncSingleFlightPrefetch(q, remoteAddr, upstream)
+		if r.needPrefetch(storedTime, expireTime) {
+			r.asyncSingleFlightPrefetch(cacheKey, q, upstream)
 		}
 		r.queryCacheHitTotal.Inc()
-		r.limiterAllowN(remoteAddr, costFromCache)
-		respMeta.Cached = true
-		return resp, respMeta
+		q.Resp = resp
+		q.Trace.Cached = true
+		return
 	}
 
 	if ctxDone(ctx) { // check if redis server timed out
-		resp := makeEmptyRespMQ(q.q, uint16(dnsmsg.RCodeServerFailure))
-		return resp, respMeta
+		setEmptyRespMQ(q, dnsmsg.RCodeServerFailure)
+		return
 	}
 
-	r.limiterAllowN(remoteAddr, costFromUpstream)
-	resp, err := r.forward(ctx, q, remoteAddr, upstream)
+	err := r.forward(ctx, q, upstream)
 	if err != nil {
 		r.logger.Warn().
 			Str("upstream", upstream.tag).
 			Err(err).
 			Msg("failed to forward query")
-		resp := makeEmptyRespMQ(q.q, uint16(dnsmsg.RCodeServerFailure))
-		return resp, respMeta
+		setEmptyRespMQ(q, dnsmsg.RCodeServerFailure)
+		return
 	}
+	q.Trace.UpstreamTag = upstream.tag
 
-	err = middlewareImpl().PostForwarding(ctx, q.q, q.qMeta, q.qInfo, resp)
-	if err != nil {
-		dnsmsg.ReleaseMsg(resp)
-		r.logger.Warn().
-			Err(err).
-			Msg("postprocessor error")
-		return nil, respMeta
-	}
-
-	r.cache.Store(q.q, remoteAddr, resp)
-	return resp, respMeta
+	r.cache.Store(cacheKey, q)
 }

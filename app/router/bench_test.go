@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,10 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/upstream"
-	"github.com/miekg/dns"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 )
@@ -30,8 +28,6 @@ const (
 	httpsAddr    = "127.0.0.1:5004"
 	quicAddr     = "127.0.0.1:5005"
 	tlsAddr      = "127.0.0.1:5006"
-
-	gnetAddr = "127.0.0.1:5010"
 
 	tcpUnixAddr      = "@mosproxy_test_tcp"
 	httpUnixAddr     = "@mosproxy_test_http"
@@ -168,20 +164,12 @@ func Benchmark_https(b *testing.B) {
 }
 
 func Benchmark_quic(b *testing.B) {
+	// os.Setenv("QUIC_GO_DISABLE_GSO", "true")
 	initBenchServerOnce()
 	opts := benchmarkOpts{
 		addr:         fmt.Sprintf("quic://%s", quicAddr),
 		upstreamOpts: upstream.Opt{TLSConfig: &tls.Config{InsecureSkipVerify: true}},
 		concurrent:   512,
-	}
-	loopBench(b, opts)
-}
-
-func Benchmark_gnet(b *testing.B) {
-	initBenchServerOnce()
-	opts := benchmarkOpts{
-		addr:       fmt.Sprintf("tcp://%s", gnetAddr),
-		concurrent: 512,
 	}
 	loopBench(b, opts)
 }
@@ -192,7 +180,7 @@ var initBenchServerOnce = sync.OnceFunc(func() {
 	}
 	cfg := &Config{
 		Servers: []ServerConfig{
-			{Protocol: "udp", Listen: udpAddr, Udp: UdpConfig{Threads: runtime.GOMAXPROCS(-1)}, Socket: SocketConfig{SO_RCVBUF: 1024 * 1024, SO_SNDBUF: 1024 * 1024}},
+			{Protocol: "udp", Listen: udpAddr, Udp: UdpConfig{}, Socket: SocketConfig{SO_RCVBUF: 1024 * 1024, SO_SNDBUF: 1024 * 1024}},
 			{Protocol: "tcp", Listen: tcpAddr, Tcp: TcpConfig{MaxConcurrentQueries: math.MaxInt32}},
 			{Protocol: "tcp", Listen: tcpUnixAddr, Tcp: TcpConfig{MaxConcurrentQueries: math.MaxInt32}},
 
@@ -206,11 +194,9 @@ var initBenchServerOnce = sync.OnceFunc(func() {
 			{Protocol: "http", Listen: fasthttpUnixAddr},
 
 			{Protocol: "quic", Listen: quicAddr, Tls: tlsOpts, Quic: QuicConfig{MaxStreams: math.MaxInt}},
-
-			{Protocol: "gnet", Listen: gnetAddr, Tcp: TcpConfig{Threads: 4}},
 		},
 	}
-	mlog.SetLvl(zerolog.Disabled) // disable log
+
 	_, err := Run(context.Background(), cfg)
 	if err != nil {
 		panic(fmt.Sprintf("failed to start server, %s", err))
@@ -234,21 +220,25 @@ func loopBench(b *testing.B, opts benchmarkOpts) {
 	r.NoError(err)
 	defer u.Close()
 
-	m := new(dns.Msg)
-	m.SetQuestion("test.test.", dns.TypeA)
-	payload, err := m.Pack()
+	m := dnsmsg.NewMsg()
+	m.RecursionDesired = true
+	q := dnsmsg.NewQuestion()
+	err = q.Name.Parse("test.test.")
 	r.NoError(err)
+	m.Questions = append(m.Questions, q)
 
 	// Check upstream config, and also warm up, init connections, etc..
+	mlog.SetLvl(zerolog.WarnLevel) // print any error
 	for i := 0; i < 10; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), opts.timeout)
-		m, err := u.ExchangeContext(ctx, payload)
+		resp, err := u.ExchangeContext(ctx, m)
 		cancel()
 		if err != nil {
-			b.Fatal(err)
+			b.Fatalf("#%d query: %s", i, err)
 		}
-		dnsmsg.ReleaseMsg(m)
+		dnsmsg.ReleaseMsg(resp)
 	}
+	mlog.SetLvl(zerolog.Disabled) // disable log in benchmark
 
 	lw := new(latencyWatcher)
 	var failed atomic.Uint32
@@ -269,7 +259,7 @@ func loopBench(b *testing.B, opts benchmarkOpts) {
 		for next() {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 			start := time.Now()
-			m, err := u.ExchangeContext(ctx, payload)
+			m, err := u.ExchangeContext(ctx, m)
 			latency := time.Since(start)
 			cancel()
 			if err != nil {

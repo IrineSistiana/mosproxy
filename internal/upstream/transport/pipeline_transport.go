@@ -2,12 +2,11 @@ package transport
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"time"
 
 	"github.com/IrineSistiana/connpool"
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/rs/zerolog"
 )
 
@@ -82,11 +81,7 @@ func (t *PipelineTransport) connIdleTimeout() time.Duration {
 	return defaultIfLeZero(t.opts.IdleTimeout, defaultIdleTimeout)
 }
 
-func (t *PipelineTransport) ExchangeContext(ctx context.Context, m []byte) (*dnsmsg.Msg, error) {
-	if len(m) < dnsHeaderLen {
-		return nil, ErrPayloadTooSmall
-	}
-
+func (t *PipelineTransport) ExchangeContext(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
 	retry := 0
 	errs := make([]error, 0)
 	for {
@@ -108,10 +103,6 @@ func (t *PipelineTransport) ExchangeContext(ctx context.Context, m []byte) (*dns
 		}
 		return resp, nil
 	}
-}
-
-func setQid(payload []byte, off int, qid uint16) {
-	binary.BigEndian.PutUint16(payload[off:], qid)
 }
 
 func (t *PipelineTransport) getConn(ctx context.Context) (_ *pipelineConn, newConn bool, err error) {

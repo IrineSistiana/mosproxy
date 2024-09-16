@@ -20,13 +20,11 @@ func runPackUnpackTest(t *testing.T, m *dns.Msg) {
 	r.NoError(err)
 
 	for _, compression := range []bool{false, true} {
-		buf := make([]byte, m2.Len())
-		n, err := m2.Pack(buf, compression, 0)
+		b, err := m2.Pack(nil, compression, 0)
 		r.NoError(err)
 
-		wireGot := buf[:n]
 		msgGot := new(dns.Msg)
-		err = msgGot.Unpack(wireGot)
+		err = msgGot.Unpack(b)
 		r.NoError(err)
 		r.Equal(m.String(), msgGot.String())
 	}
@@ -87,10 +85,17 @@ func Benchmark_Msg(b *testing.B) {
 	}
 
 	m := new(dns.Msg)
+	m.SetQuestion(name, dns.TypeA)
 	m.Answer = rrs
 	m.Compress = true
 	msgBin, err := m.Pack()
 	r.NoError(err)
+
+	mm := NewMsg()
+	err = mm.Unpack(msgBin)
+	if err != nil {
+		b.Fatal(err)
+	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -116,23 +121,19 @@ func Benchmark_Msg(b *testing.B) {
 	})
 
 	b.Run("Msg Pack", func(b *testing.B) {
-		rm := NewMsg()
-		err := rm.Unpack(msgBin)
-		if err != nil {
-			b.Fatal(err)
-		}
-		buf := make([]byte, rm.Len())
 		b.Run("with compression", func(b *testing.B) {
+			buffer := make([]byte, 0, 1024)
 			for i := 0; i < b.N; i++ {
-				_, err := rm.Pack(buf, true, 0)
+				_, err := mm.Pack(buffer, true, 0)
 				if err != nil {
 					b.Fatal(err)
 				}
 			}
 		})
 		b.Run("no compression", func(b *testing.B) {
+			buffer := make([]byte, 0, 1024)
 			for i := 0; i < b.N; i++ {
-				_, err := rm.Pack(buf, false, 0)
+				_, err := mm.Pack(buffer, false, 0)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -166,4 +167,42 @@ func Benchmark_Msg(b *testing.B) {
 			}
 		})
 	})
+
+	b.Run("Msg MaxPackLen", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			mm.MaxPackLen()
+		}
+	})
+	b.Run("dns.Msg Len", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			m.Len()
+		}
+	})
+}
+
+func TestMsg_MaxPackLen(t *testing.T) {
+	r := require.New(t)
+	testFn := func(m *dns.Msg) {
+		b, err := m.Pack()
+		r.NoError(err)
+		mm, err := UnpackMsg(b)
+		r.NoError(err)
+		l, err := mm.MaxPackLen()
+		r.NoError(err)
+		r.Equal(len(b), l, "max pack len should equal to buffer len")
+	}
+
+	m := new(dns.Msg)
+	testFn(m)
+
+	m.SetQuestion("test.test.", dns.TypeA)
+	testFn(m)
+
+	hdr := dns.RR_Header{Name: "test.test."}
+
+	m.Answer = append(m.Answer, &dns.AAAA{Hdr: hdr, AAAA: make(net.IP, 16)})
+	testFn(m)
+
+	m.Answer = append(m.Answer, &dns.SOA{Hdr: hdr, Ns: "test.ns.", Mbox: "test.mbox."})
+	testFn(m)
 }

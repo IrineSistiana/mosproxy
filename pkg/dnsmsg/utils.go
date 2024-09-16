@@ -17,49 +17,24 @@ func bytes2StrUnsafe(b []byte) string {
 	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
-func packByte(b []byte, off int, v byte) (int, error) {
-	if off+1 <= len(b) {
-		b[off] = v
-		off += 1
-		return off, nil
-	}
-	return off, ErrSmallBuffer
+func packByte(b []byte, v byte) []byte {
+	return append(b, v)
 }
 
-func packNamePtr(b []byte, off int, v [2]byte) (int, error) {
-	if off+2 <= len(b) {
-		copy(b[off:], v[:])
-		off += 2
-		return off, nil
-	}
-	return off, ErrSmallBuffer
+func packNamePtr(b []byte, hi, lo byte) []byte {
+	return append(b, hi, lo)
 }
 
-func packUint16(b []byte, off int, v uint16) (int, error) {
-	if off+2 <= len(b) {
-		binary.BigEndian.PutUint16(b[off:], v)
-		off += 2
-		return off, nil
-	}
-	return off, ErrSmallBuffer
+func packUint16(b []byte, v uint16) []byte {
+	return binary.BigEndian.AppendUint16(b, v)
 }
 
-func packUint32(b []byte, off int, v uint32) (int, error) {
-	if off+4 <= len(b) {
-		binary.BigEndian.PutUint32(b[off:], v)
-		off += 4
-		return off, nil
-	}
-	return off, ErrSmallBuffer
+func packUint32(b []byte, v uint32) []byte {
+	return binary.BigEndian.AppendUint32(b, v)
 }
 
-func packBytes(b []byte, off int, v []byte) (int, error) {
-	if off+len(v) <= len(b) {
-		copy(b[off:], v)
-		off += len(v)
-		return off, nil
-	}
-	return off, ErrSmallBuffer
+func packBytes(b []byte, v []byte) []byte {
+	return append(b, v...)
 }
 
 func putUint16(b []byte, v uint16) {
@@ -120,3 +95,23 @@ type noCopy struct{}
 
 func (*noCopy) Lock()   {}
 func (*noCopy) Unlock() {}
+
+func parseDDD(b string) (byte, bool) {
+	const base = 10
+	if len(b) != 3 {
+		return 0, false
+	}
+	s := 0
+	for _, c := range b {
+		if c < 30 || c > 39 {
+			return 0, false
+		}
+		n := c - 30
+		s *= base
+		s += int(n)
+	}
+	if s > 255 {
+		return 0, false
+	}
+	return byte(s), true
+}

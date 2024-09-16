@@ -1,10 +1,12 @@
-package compile
+package domainmatcher
 
 import (
 	"bytes"
 	"errors"
 	"math"
 	"slices"
+
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 var (
@@ -32,14 +34,14 @@ type idxNode struct {
 	childIdx int32
 }
 
-type CompiledTree struct {
+type compiledTree struct {
 	nodes    []compiledNode
 	idxNodes []idxNode
 	labels   []byte
 }
 
-func (t *Tree) compile() (*CompiledTree, error) {
-	e := new(CompiledTree)
+func (t *tree) Compile() (*compiledTree, error) {
+	e := new(compiledTree)
 	e.nodes = make([]compiledNode, t.assignedIdx+1)
 	e.compileNodes(&t.root)
 
@@ -51,7 +53,7 @@ func (t *Tree) compile() (*CompiledTree, error) {
 	return e, nil
 }
 
-func (e *CompiledTree) compileNodes(n *node) {
+func (e *compiledTree) compileNodes(n *node) {
 	cn := &e.nodes[n.idx]
 	if n.hasData {
 		cn.stat |= statHasData
@@ -66,7 +68,7 @@ func (e *CompiledTree) compileNodes(n *node) {
 	}
 }
 
-func (e *CompiledTree) buildIdx(n *node, labelCache map[string]segAddr) error {
+func (e *compiledTree) buildIdx(n *node, labelCache map[string]segAddr) error {
 	cn := &e.nodes[n.idx]
 
 	if t := len(e.idxNodes) + len(n.children); t > math.MaxInt32 || t < 0 {
@@ -113,20 +115,15 @@ func seg[T any](s []T, idx segAddr) []T {
 // the dataOff at node "c" and lvl==2.
 // If matched the root node, lvl==-1.
 // If no match, return -2.
-func (e *CompiledTree) Match(labels [][]byte) (dataOff int64, lvl int) {
-	return e.match(labels, false)
-}
-
-// Same as Match but match the labels in a reversed order.
-func (e *CompiledTree) MatchReverse(labels [][]byte) (dataOff int64, lvl int) {
-	return e.match(labels, true)
-}
-
-func (e *CompiledTree) match(labels [][]byte, reverse bool) (dataOff int64, lvl int) {
+func (e *compiledTree) Match(n *dnsmsg.Name) (dataOff int64, lvl int) {
 	lvl = -2
 	if len(e.nodes) == 0 { // empty tree
 		return
 	}
+
+	var fm bool // full match
+	var fmOff int64
+	var fmLvl int
 
 	curNode := e.nodes[0]
 	if curNode.stat&statHasData > 0 {
@@ -134,23 +131,22 @@ func (e *CompiledTree) match(labels [][]byte, reverse bool) (dataOff int64, lvl 
 			dataOff = curNode.dataOff
 			lvl = -1
 		} else {
-			lvl = -1
-			if lvl == len(labels)-1 { // full match
-				dataOff = curNode.dataOff
-				return
-			}
+			fm = true
+			fmOff = curNode.dataOff
+			fmLvl = -1
 		}
 	}
 
-	tail := len(labels) - 1
-	for i, label := range labels {
-		if reverse {
-			label = labels[tail-i]
-		} else {
-			label = labels[i]
-		}
+	s := dnsmsg.NewNameScanner(n)
+	s.Reverse()
+	for i := 0; s.Scan(); i++ {
+		// reset fm status
+		fm = false
+		fmOff = 0
+		fmLvl = 0
+
 		idxSeg := seg(e.idxNodes, curNode.childIdxSeg)
-		elemIdx := e.binarySearchIdx(idxSeg, label)
+		elemIdx := e.binarySearchIdx(idxSeg, s.Label())
 		if elemIdx < 0 {
 			return
 		}
@@ -161,20 +157,21 @@ func (e *CompiledTree) match(labels [][]byte, reverse bool) (dataOff int64, lvl 
 				dataOff = curNode.dataOff
 				lvl = i
 			} else {
-				if i == len(labels)-1 { // full match
-					dataOff = curNode.dataOff
-					lvl = i
-					return
-				}
+				fm = true
+				fmOff = curNode.dataOff
+				fmLvl = i
 			}
 		}
+	}
+	if fm {
+		return fmOff, fmLvl
 	}
 	return
 }
 
 // Helper func. Returns the total number nodes that contain data.
 // Note: Takes O(n) time.
-func (e *CompiledTree) Len() int {
+func (e *compiledTree) Len() int {
 	s := 0
 	for i := range e.nodes {
 		if e.nodes[i].stat&statHasData > 0 {
@@ -187,7 +184,7 @@ func (e *CompiledTree) Len() int {
 // Modified form slice.BinarySearch.
 // If target was found, return the index of the target, otherwise return
 // -1.
-func (e *CompiledTree) binarySearchIdx(s []idxNode, target []byte) int {
+func (e *compiledTree) binarySearchIdx(s []idxNode, target []byte) int {
 	n := len(s)
 	// Define cmp(x[-1], target) < 0 and cmp(x[n], target) >= 0 .
 	// Invariant: cmp(x[i - 1], target) < 0, cmp(x[j], target) >= 0.

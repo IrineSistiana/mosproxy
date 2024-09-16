@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/stretchr/testify/require"
 )
 
@@ -20,8 +19,7 @@ func Test_pipelineConn(t *testing.T) {
 		resp, err := pipelineConn.exchange(context.Background(), newTestMsg(666, "test.test"))
 		r.NoError(err)
 		r.EqualValues(666, resp.ID)
-		respName, err := dnsmsg.ToReadable(resp.Questions[0].Name)
-		r.NoError(err)
+		respName := resp.Questions[0].Name.AppendReadableTo(nil)
 		r.True(string(respName) == "test.test")
 	})
 

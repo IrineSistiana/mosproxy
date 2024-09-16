@@ -2,7 +2,6 @@ package router
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"os"
@@ -13,11 +12,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/IrineSistiana/gopool"
 	"github.com/IrineSistiana/mosproxy/app"
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/app/router/loader"
+	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
+	"github.com/IrineSistiana/mosproxy/internal/ipmarker"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/mitchellh/mapstructure"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
@@ -113,10 +114,8 @@ type Router struct {
 	cancel     context.CancelCauseFunc
 	logger     *zerolog.Logger
 	metricsReg *prometheus.Registry
-	limiter    *resourceLimiter
 	fatalErr   chan fatalErr
 	prefetch   *prefetchCtl
-	bJobPool   *gopool.Pool[blockingJobArgs] // pool for blocking jobs
 
 	// metrics
 	queryTotal         prometheus.Counter
@@ -126,11 +125,13 @@ type Router struct {
 	closeOnce sync.Once
 
 	// init later
-	cache         *cacheCtl // not nil, noop if no backend is configured
-	upstreams     map[string]*upstreamWrapper
-	domainSets    map[string]*domainSet
-	rules         []*rule
-	serverClosers []func()
+	ecsZone          *loader.Loader[string, ipmarker.IpMarker]       // nil if not configured
+	ecsZoneOverwrite *loader.Loader[string, map[string]netip.Prefix] // nil if not configured
+	cache            *cacheCtl                                       // not nil, noop if no backend is configured
+	upstreams        map[string]*upstreamWrapper
+	domainSets       map[string]*loader.Loader[[]string, domainmatcher.Matcher]
+	rules            []*rule
+	serverClosers    []func()
 
 	reloading atomic.Uint32 // 1 = true
 }
@@ -149,13 +150,11 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 		cancel:     cancel,
 		logger:     logger,
 		metricsReg: newMetricsReg(),
-		limiter:    initResourceLimiter(cfg.Limiter),
 		fatalErr:   make(chan fatalErr, 1),
 		prefetch:   newPrefetchCtl(),
-		bJobPool:   gopool.NewPool[blockingJobArgs](),
 
 		upstreams:  make(map[string]*upstreamWrapper),
-		domainSets: make(map[string]*domainSet),
+		domainSets: make(map[string]*loader.Loader[[]string, domainmatcher.Matcher]),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "query_total",
@@ -200,6 +199,28 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 		if err != nil {
 			err = fmt.Errorf("failed to init upstream #%d, %w", i, err)
 			return nil, err
+		}
+	}
+
+	// init ecs zone
+	if len(cfg.ECS.IpZone) > 0 {
+		err = r.loadEcsZone(cfg.ECS.IpZone)
+		if err != nil {
+			err = fmt.Errorf("failed to load ecs zone file, %w", err)
+			return
+		}
+	} else {
+		if cfg.ECS.Enabled && (cfg.Cache.MemSize > 0 || len(cfg.Cache.Redis) > 0) {
+			r.logger.Warn().Msg("ECS is enabled. But no zone file is configured. Cache WILL NOT work as expected as a geo based cache.")
+		}
+	}
+
+	// init ecs overwrite rules
+	if fp := cfg.ECS.ZoneOverwrite; len(fp) > 0 {
+		err = r.loadZoneEcs(fp)
+		if err != nil {
+			err = fmt.Errorf("failed to zone ecs file, %w", err)
+			return
 		}
 	}
 
@@ -264,7 +285,6 @@ func (r *Router) Close(err error) {
 // or after router is started (from other goroutines).
 func (r *Router) closeImpl(err error) {
 	r.cancel(err)
-	r.limiter.Close()
 	for _, u := range r.upstreams {
 		u.u.Close()
 	}
@@ -283,149 +303,92 @@ func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
 		resp.Questions = append(resp.Questions, q.Copy())
 		break // only return one question. Avoid malicious queries.
 	}
-	postProcessResp(getQueryInfo(m), resp)
 	return resp
 }
 
-func mustHaveEmptyRespForQueryB(q *dnsmsg.Msg, rcode dnsmsg.RCode, tcp bool, size int) pool.Buffer {
-	resp := makeEmptyRespM(q, rcode)
-	b := mustHaveRespB(resp, tcp, size)
-	dnsmsg.ReleaseMsg(resp)
-	return b
-}
-
-// If resp must not be nil.
-// If tcp is true, size is ignored.
-func mustHaveRespB(resp *dnsmsg.Msg, tcp bool, size int) pool.Buffer {
-	var b pool.Buffer
-	var err error
-
-	if tcp {
-		b, err = packRespTCP(resp, true)
-	} else {
-		b, err = packResp(resp, true, size)
-	}
-	if err == nil {
-		return b
-	}
-
-	mlog.L().Error().Err(err).Msg("internal err: failed to pack dns msg")
-
-	// Failed to pack resp.
-	// Try only pack header.
-	var body []byte
-	if tcp {
-		b = pool.GetBuf(2 + 12)
-		body = b[2:]
-	} else {
-		b = pool.GetBuf(12)
-		body = b
-	}
-
-	hdr := resp.Header
-	hdr.RCode = dnsmsg.RCodeServerFailure
-	id, bits := hdr.Pack()
-	binary.BigEndian.PutUint16(body[0:], id)
-	binary.BigEndian.PutUint16(body[2:], bits)
-	return b
-}
-
-func (r *Router) asyncSingleFlightPrefetch(q qCtx, remoteAddr netip.Addr, u *upstreamWrapper) {
-	key := r.cache.keyForPrefetch(q.q, remoteAddr)
-	if ok := r.prefetch.reserve(key); !ok {
+func (r *Router) asyncSingleFlightPrefetch(key []byte, q *QueryCtx, u *upstreamWrapper) {
+	uk := r.prefetch.Key(key)
+	if ok := r.prefetch.Reserve(uk); !ok {
 		return
 	}
-	qCopy := qCtx{q: q.q.Copy(), qMeta: q.qMeta, qInfo: q.qInfo}
+	keyCopy := pool.CopyBuf(key)
+	qCopy := q.Copy()
 	go func() {
-		defer dnsmsg.ReleaseQuestion(qCopy.q)
-		r.doPrefetch(qCopy, remoteAddr, u)
-		r.prefetch.done(key)
+		defer pool.ReleaseBuf(keyCopy)
+		defer ReleaseQueryCtx(qCopy)
+		defer r.prefetch.Done(uk)
+		r.doPrefetch(keyCopy, qCopy, u)
 	}()
 }
 
-func (r *Router) doPrefetch(q qCtx, remoteAddr netip.Addr, u *upstreamWrapper) {
-	r.logger.Debug().Object("query", (*qLogObj)(q.q)).Str("upstream", u.tag).Msg("prefetching cache")
+func (r *Router) doPrefetch(key []byte, q *QueryCtx, u *upstreamWrapper) {
+	e := r.logger.Debug()
+	if e != nil {
+		e.Dict("query", q.LogBasic()).Str("upstream", u.tag).Msg("prefetching cache")
+	}
 
 	ctx, cancel := context.WithTimeout(r.ctx, prefetchTimeout)
 	defer cancel()
-	resp, err := r.forward(ctx, q, remoteAddr, u)
+	err := r.forward(ctx, q, u)
 	if err != nil {
-		r.logger.Warn().Object("query", (*qLogObj)(q.q)).Str("upstream", u.tag).Err(err).
+		r.logger.Warn().Dict("query", q.LogBasic()).Str("upstream", u.tag).Err(err).
 			Msg("failed to prefetch")
 		return
 	}
 	r.prefetchTotal.Inc()
-	r.cache.Store(q.q, remoteAddr, resp)
+	r.cache.Store(key, q)
 }
 
-// Forward query to upstream and return its response.
-// It will remove the EDNS0 Options from response.
-func (r *Router) forward(ctx context.Context,
-	q qCtx,
-	remoteAddr netip.Addr,
-	upstream *upstreamWrapper,
-) (*dnsmsg.Msg, error) {
-	resp, err := r._forward(ctx, q, remoteAddr, upstream)
-	if resp != nil {
-		dnsmsg.RemoveEDNS0(resp)
-	}
-	return resp, err
-}
-
-func (r *Router) _forward(
+// Forward query to upstream and set the response.
+// Will remove edns0 from resp.
+func (r *Router) forward(
 	ctx context.Context,
-	q qCtx,
-	remoteAddr netip.Addr,
+	q *QueryCtx,
 	upstream *upstreamWrapper,
-) (*dnsmsg.Msg, error) {
-	queryMsg := r.makeQueryMsg(q.q, remoteAddr)
+) error {
+	queryMsg := r.makeQueryMsg(q)
 	defer dnsmsg.ReleaseMsg(queryMsg)
-
-	resp, err := middlewareImpl().PreForwarding(ctx, queryMsg, q.qMeta, q.qInfo)
-	if err != nil {
-		return nil, err
-	}
-	if resp != nil {
-		return resp, nil
-	}
 
 	if r.opt.Log.TraceMsgs {
 		r.debugLogMsg(q, queryMsg, "sending query to upstream")
 	}
 
-	queryWire, err := packResp(queryMsg, false, 0)
+	resp, err := upstream.Exchange(ctx, queryMsg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pack req, %w", err)
-	}
-	defer pool.ReleaseBuf(queryWire)
-
-	resp, err = upstream.Exchange(ctx, queryWire)
-	if err != nil {
-		return nil, fmt.Errorf("failed to exchange, %w", err)
+		return fmt.Errorf("failed to exchange, %w", err)
 	}
 
 	if r.opt.Log.TraceMsgs {
 		r.debugLogMsg(q, resp, "response received from upstream")
 	}
 
-	return resp, nil
+	dnsmsg.RemoveEDNS0(resp)
+	q.Resp = resp
+	return nil
 }
 
-func makeEmptyRespMQ(q *dnsmsg.Question, rcode uint16) *dnsmsg.Msg {
+func setEmptyRespMQ(q *QueryCtx, rcode dnsmsg.RCode) {
+	if q.Resp != nil {
+		dnsmsg.ReleaseMsg(q.Resp)
+		q.Resp = nil
+	}
 	resp := dnsmsg.NewMsg()
-	resp.Header.RCode = dnsmsg.RCode(rcode)
-	resp.Questions = append(resp.Questions, q.Copy())
-	return resp
+	resp.RCode = rcode
+	resp.Questions = append(resp.Questions, q.Question.Copy())
+	q.Resp = resp
 }
 
-func (r *Router) makeQueryMsg(q *dnsmsg.Question, remoteAddr netip.Addr) *dnsmsg.Msg {
+func (r *Router) makeQueryMsg(q *QueryCtx) *dnsmsg.Msg {
 	m := dnsmsg.NewMsg()
 	m.Header.RecursionDesired = true
-	m.Questions = append(m.Questions, q.Copy())
+	m.Questions = append(m.Questions, q.Question.Copy())
 
 	opt := newEDNS0(udpSize)
-	if r.opt.ECS.Enabled && remoteAddr.IsValid() && !remoteAddr.IsPrivate() && remoteAddr.IsGlobalUnicast() {
-		opt.Data = makeEdns0ClientSubnetReqOpt(remoteAddr)
+	if ecs := q.ECS2Upstream; ecs.IsValid() {
+		addr := ecs.Addr()
+		if !addr.IsPrivate() && addr.IsGlobalUnicast() {
+			opt.Data = makeEdns0ClientSubnetReqOpt(ecs)
+		}
 	}
 	m.Additionals = append(m.Additionals, opt)
 	return m
@@ -452,9 +415,4 @@ func (r *Router) subLoggerForUpstream(tag string) *zerolog.Logger {
 	}
 	l := ctx.Logger()
 	return &l
-}
-
-// Helper func.
-func (r *Router) limiterAllowN(addr netip.Addr, n int) error {
-	return r.limiter.AllowN(addr, n)
 }

@@ -5,13 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/netip"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/IrineSistiana/mosproxy/internal/utils"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 )
@@ -66,6 +65,7 @@ func (r *Router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 	}
 
 	s := &quicServer{
+		cfg:         cfg,
 		r:           r,
 		l:           l,
 		idleTimeout: idleTimeout,
@@ -90,6 +90,7 @@ func closeQuicConnServerClosing(c quic.Connection) {
 }
 
 type quicServer struct {
+	cfg         *ServerConfig
 	r           *Router
 	l           *quic.Listener
 	idleTimeout time.Duration
@@ -99,7 +100,6 @@ type quicServer struct {
 }
 
 func (s *quicServer) run() error {
-	r := s.r
 	for {
 		c, err := s.l.Accept(context.Background())
 		if err != nil {
@@ -110,27 +110,20 @@ func (s *quicServer) run() error {
 		}
 		debugLogServerConnAccepted(c, s.logger)
 
-		if err := r.limiterAllowN(netAddr2NetipAddr(c.LocalAddr()).Addr(), costQuicConn); err != nil {
-			debugLogServerConnClosed(c, s.logger, err)
-			c.CloseWithError(0, "service unavailable, overloaded")
-		} else {
-			if !s.ct.Add(c) {
-				closeQuicConnServerClosing(c)
-				continue
-			}
-			go func() {
-				defer s.ct.Del(c)
-				err := s.handleConn(c)
-				debugLogServerConnClosed(c, s.logger, err)
-				c.CloseWithError(0, "")
-			}()
+		if !s.ct.Add(c) {
+			closeQuicConnServerClosing(c)
+			continue
 		}
+		go func() {
+			defer s.ct.Del(c)
+			defer c.CloseWithError(0, "")
+			err := s.handleConn(c)
+			debugLogServerConnClosed(c, s.logger, err)
+		}()
 	}
 }
 
 func (s *quicServer) handleConn(c quic.Connection) error {
-	localAddr := netAddr2NetipAddr(c.LocalAddr())
-	remoteAddr := netAddr2NetipAddr(c.RemoteAddr())
 	for {
 		streamAcceptCtx, cancelAccept := context.WithTimeout(context.Background(), s.idleTimeout)
 		stream, err := c.AcceptStream(streamAcceptCtx)
@@ -139,33 +132,23 @@ func (s *quicServer) handleConn(c quic.Connection) error {
 			return err
 		}
 
-		if err := s.r.limiterAllowN(remoteAddr.Addr(), costQUICQuery); err != nil {
-			// TODO: Send dns REFUSE instead of close the quic stream
-			// without any info?
-			// TODO: Log or create a metrics entry for refused queries.
-			stream.Close()
-			stream.CancelRead(0)
-			continue
-		}
-
 		// Handle stream.
 		// For doq, one stream, one query.
-		go func() {
+		pool.Go(func() {
 			defer func() {
 				stream.Close()
 				stream.CancelRead(0) // TODO: Needs a proper error code.
 			}()
-			s.handleStream(stream, c, remoteAddr, localAddr)
-		}()
+			s.handleStream(stream, c)
+		})
 	}
 }
 
-func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteAddr, localAddr netip.AddrPort) {
+func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection) {
 	stream.SetReadDeadline(time.Now().Add(quicStreamReadTimeout))
 	m, _, err := dnsutils.ReadMsgFromTCP(stream)
 	if err != nil {
 		s.logger.Warn().
-			Stringer("local", c.LocalAddr()).
 			Stringer("remote", c.RemoteAddr()).
 			Err(err).
 			Msg("invalid query msg")
@@ -173,17 +156,33 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection, remoteA
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	resp := s.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: localAddr})
-	defer dnsmsg.ReleaseMsg(resp)
-	respBuf := mustHaveRespB(resp, true, 0)
-	defer pool.ReleaseBuf(respBuf)
+	q := NewQueryCtx()
+	defer ReleaseQueryCtx(q)
 
+	var respBuf pool.Buffer
+	if ok := q.parseQuery(m); !ok {
+		resp := makeEmptyRespM(m, dnsmsg.RCodeRefused)
+		respBuf = serverFinalRespB(m, resp, true, 0)
+		dnsmsg.ReleaseMsg(resp)
+		goto sendResp
+	}
+
+	q.ServerTag = s.cfg.Tag
+	q.Protocol = ProtoQUIC
+	q.RemoteAddr = netAddr2NetipAddr(c.RemoteAddr())
+	q.ServerName = append(q.ServerName, c.ConnectionState().TLS.ServerName...)
+
+	s.r.handleQuery(q)
+	respBuf = serverFinalRespB(m, q.Resp, true, 0)
+
+sendResp:
 	if _, err = stream.Write(respBuf); err != nil {
-		s.logger.Warn().
-			Stringer("local", c.LocalAddr()).
-			Stringer("remote", c.RemoteAddr()).
-			Err(err).
-			Msg("failed to write response")
+		e := s.logger.Debug() // This err log might be annoying  Using debug log.
+		if e != nil {
+			e.Stringer("remote", c.RemoteAddr()).
+				Err(err).
+				Msg("failed to write to remote")
+		}
 	}
 }
 

@@ -1,38 +1,35 @@
 package router
 
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash/maphash"
-	"io"
-	"net/netip"
-	"os"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/cache"
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/dnsutils"
-	"github.com/IrineSistiana/mosproxy/internal/netlist"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/klauspost/compress/s2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
 
 const (
-	defaultMaxCacheTtl = time.Hour * 6
+	defaultMinCacheTtl = time.Second * 5
+	defaultMaxCacheTtl = time.Minute * 10
 	prefetchTimeout    = time.Second * 6
 )
 
 func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 	c := new(cacheCtl)
 	c.logger = r.subLogger("cache")
+	c.minimumTtl = time.Duration(cfg.MinimumTTL) * time.Second
+	if c.minimumTtl <= 0 {
+		c.minimumTtl = defaultMinCacheTtl
+	}
 	c.maximumTtl = time.Duration(cfg.MaximumTTL) * time.Second
 	if c.maximumTtl <= 0 {
 		c.maximumTtl = defaultMaxCacheTtl
@@ -65,36 +62,23 @@ func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 			return nil, err
 		}
 	}
-
-	if len(cfg.IpMarker) > 0 {
-		c.ipMarkerFile = cfg.IpMarker
-		marker, err := loadIpMarkerFromFile(cfg.IpMarker)
-		if err != nil {
-			c.Close()
-			return nil, fmt.Errorf("failed to load ip marker, %w", err)
-		}
-		c.logger.Info().
-			Str("file", cfg.IpMarker).
-			Int("len", marker.IpLen()).
-			Int("marks", marker.MarkLen()).
-			Msg("ip marker file loaded")
-		c.ipMarker.Store(marker)
-	}
 	return c, nil
 }
 
 type prefetchCtl struct {
+	seed  maphash.Seed
 	m     sync.Mutex
 	queue map[uint64]struct{}
 }
 
 func newPrefetchCtl() *prefetchCtl {
 	return &prefetchCtl{
+		seed:  maphash.MakeSeed(),
 		queue: make(map[uint64]struct{}),
 	}
 }
 
-func (c *prefetchCtl) reserve(key uint64) bool {
+func (c *prefetchCtl) Reserve(key uint64) bool {
 	c.m.Lock()
 	defer c.m.Unlock()
 	_, dup := c.queue[key]
@@ -105,38 +89,45 @@ func (c *prefetchCtl) reserve(key uint64) bool {
 	return true
 }
 
-func (c *prefetchCtl) done(key uint64) {
+func (c *prefetchCtl) Done(key uint64) {
 	c.m.Lock()
 	defer c.m.Unlock()
 	delete(c.queue, key)
 }
 
-// return true if only <= 25% ttl remaining.
-func needPrefetch(storedTime, expireTime time.Time) bool {
+func (c *prefetchCtl) Key(key []byte) uint64 {
+	h := maphash.Bytes(c.seed, key)
+	return h
+}
+
+func (r *Router) needPrefetch(storedTime, expireTime time.Time) bool {
+	prefetchThreshold := r.opt.Cache.PrefetchThreshold
+	if prefetchThreshold <= 0 || prefetchThreshold >= 1 {
+		prefetchThreshold = 0.25
+	}
+
 	lifeSpan := expireTime.Sub(storedTime)
 	remainTtl := time.Until(expireTime)
-	return remainTtl < (lifeSpan >> 2)
+	prefetchTtl := time.Duration(r.opt.Cache.PrefetchThreshold * float32(lifeSpan))
+	return remainTtl < prefetchTtl
 }
 
 type cacheCtl struct {
 	logger     *zerolog.Logger
-	maximumTtl time.Duration            // Always valid. Has default value.
-	ipMarker   atomic.Pointer[ipMarker] // Maybe nil.
-	memory     *cache.MemoryCache       // Maybe nil
-	redis      *cache.RedisCache        // Maybe nil
-
-	// reloader
-	ipMarkerFile   string
-	stagedIpMarker *ipMarker
+	minimumTtl time.Duration      // Always valid. Has default value.
+	maximumTtl time.Duration      // Always valid. Has default value.
+	memory     *cache.MemoryCache // Maybe nil
+	redis      *cache.RedisCache  // Maybe nil
 }
 
 // Store resp into cache.
 // Remainder: resp must not contain EDNS0 record.
-func (c *cacheCtl) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg.Msg) {
+func (c *cacheCtl) Store(key []byte, q *QueryCtx) {
 	if c.memory == nil && c.redis == nil {
 		return
 	}
-	if resp == nil || resp.Header.Truncated {
+	resp := q.Resp
+	if resp == nil {
 		return
 	}
 
@@ -193,38 +184,43 @@ func (c *cacheCtl) Store(q *dnsmsg.Question, clientAddr netip.Addr, resp *dnsmsg
 	}
 	defer pool.ReleaseBuf(v)
 
-	mark := c.ipMark(clientAddr)
-
 	now := time.Now()
 	storedTime := now
 	expireTime := now.Add(ttl)
 
-	c.logger.Debug().
-		Object("query", (*qLogObj)(q)).
-		Str("mark", mark).
-		Uint16("rcode", uint16(resp.RCode)).
-		Int("ttl", int(ttl.Seconds())).
-		Int("size", len(v)).
-		Msg("store resp")
+	e := c.logger.Debug()
+	if e != nil {
+		e.Dict("query", q.LogBasic()).
+			Str("mark", q.ECSZone).
+			Uint16("rcode", uint16(resp.RCode)).
+			Int("ttl", int(ttl.Seconds())).
+			Int("size", len(v)).
+			Msg("store resp")
+	}
 
-	k := cacheKey(q, mark)
-	defer pool.ReleaseBuf(k)
 	negativeResp := resp.RCode != dnsmsg.RCodeSuccess
 
 	// store in memory
 	if c.memory != nil {
-		c.memory.Store(k, storedTime, expireTime, v, negativeResp)
+		c.memory.Store(key, storedTime, expireTime, v, negativeResp)
 	}
 
 	// store in redis
 	if c.redis != nil {
-		c.redis.Store(k, storedTime, expireTime, v, negativeResp)
+		c.redis.Store(key, storedTime, expireTime, v, negativeResp)
 	}
 }
 
-func (c *cacheCtl) Key(q *dnsmsg.Question, remoteAddr netip.Addr) (k pool.Buffer, ipMark string) {
-	ipMark = c.ipMark(remoteAddr)
-	return cacheKey(q, ipMark), ipMark
+// Get cache key for this query.
+func (c *cacheCtl) Key(q *QueryCtx) pool.Buffer {
+	b := pool.GetBuf(len(q.Question.Name.Data()) + 4 + len(q.ECSZone))
+	off := copy(b, q.Question.Name.Data())
+	binary.BigEndian.PutUint16(b[off:], uint16(q.Question.Class))
+	off += 2
+	binary.BigEndian.PutUint16(b[off:], uint16(q.Question.Type))
+	off += 2
+	copy(b[off:], []byte(q.ECSZone))
+	return b
 }
 
 // If cache hit, Get will return a resp (not shared). It is the caller's
@@ -275,16 +271,6 @@ func (c *cacheCtl) GetRedisCache(ctx context.Context, key []byte) (_ *dnsmsg.Msg
 	return nil, time.Time{}, time.Time{}
 }
 
-// Lookup the mark of the addr.
-// For convenience, if c.ipMarker==nil || addr is not valid, returns "".
-func (c *cacheCtl) ipMark(addr netip.Addr) string {
-	marker := c.ipMarker.Load()
-	if marker == nil || !addr.IsValid() {
-		return ""
-	}
-	return marker.Mark(addr)
-}
-
 // Always returns nil.
 func (c *cacheCtl) Close() error {
 	if c.memory != nil {
@@ -296,57 +282,21 @@ func (c *cacheCtl) Close() error {
 	return nil
 }
 
-var mhSeed = maphash.MakeSeed()
-
-// Hash the request for prefetch
-func (c *cacheCtl) keyForPrefetch(q *dnsmsg.Question, remoteAddr netip.Addr) uint64 {
-	ipMark := c.ipMark(remoteAddr)
-	h := maphash.Bytes(mhSeed, q.Name)
-	h += uint64(q.Class) << 16
-	h += uint64(q.Type)
-	if len(ipMark) > 0 {
-		h ^= maphash.String(mhSeed, ipMark)
-	}
-	return h
-}
-
-func (c *cacheCtl) reload() error {
-	if f := c.ipMarkerFile; len(f) > 0 {
-		marker, err := loadIpMarkerFromFile(f)
-		if err != nil {
-			return err
-		}
-		c.logger.Info().
-			Str("file", f).
-			Int("len", marker.IpLen()).
-			Int("marks", marker.MarkLen()).
-			Msg("new ip marker file loaded")
-		c.stagedIpMarker = marker
-	}
-	return nil
-}
-
-func (c *cacheCtl) commit() {
-	if c.stagedIpMarker != nil {
-		c.ipMarker.Store(c.stagedIpMarker)
-		c.stagedIpMarker = nil
-	}
-}
-
-func (c *cacheCtl) discard() {
-	c.stagedIpMarker = nil
-}
-
 // Pack m into bytes.
 func packCacheMsg(m *dnsmsg.Msg) (pool.Buffer, error) {
-	packBuf := pool.GetBuf(m.Len())
-	defer pool.ReleaseBuf(packBuf)
-	b := packBuf
-	n, err := m.Pack(b, false, 0)
+	l, err := m.MaxPackLen()
 	if err != nil {
 		return nil, err
 	}
-	b = b[:n]
+
+	packBuf := pool.GetBuf(l)
+	defer pool.ReleaseBuf(packBuf)
+
+	b := packBuf
+	_, err = m.Pack(packBuf[:0], false, 0)
+	if err != nil {
+		return nil, err
+	}
 
 	compressMaxLen := s2.MaxEncodedLen(len(b))
 	if compressMaxLen < 0 {
@@ -370,119 +320,4 @@ func unpackCacheMsg(m []byte) (*dnsmsg.Msg, error) {
 		return nil, fmt.Errorf("s2 decode: %w", err)
 	}
 	return dnsmsg.UnpackMsg(decoded)
-}
-
-type ipMarker struct {
-	l *netlist.List[int]
-	s []string
-}
-
-func (m *ipMarker) Mark(addr netip.Addr) string {
-	if !addr.IsValid() {
-		return ""
-	}
-	idx, ok := m.l.LookupAddr(addr)
-	if !ok {
-		return ""
-	}
-	return m.s[idx]
-}
-
-func (m *ipMarker) IpLen() int {
-	return m.l.Len()
-}
-
-func (m *ipMarker) MarkLen() int {
-	return len(m.s)
-}
-
-func loadIpMarkerFromReader(r io.Reader) (*ipMarker, error) {
-	parseLine := func(s string) (_ netip.Addr, _ netip.Addr, _ string, err error) {
-		t, s, ok := strings.Cut(s, ",")
-		if !ok {
-			err = errors.New("missing first comma")
-			return
-		}
-		start, err := netip.ParseAddr(t)
-		if err != nil {
-			err = fmt.Errorf("invalid start addr, %w", err)
-			return
-		}
-		t, s, ok = strings.Cut(s, ",")
-		if !ok {
-			err = errors.New("missing second comma")
-			return
-		}
-		end, err := netip.ParseAddr(t)
-		if err != nil {
-			err = fmt.Errorf("invalid end addr, %w", err)
-			return
-		}
-		return start, end, s, nil
-	}
-
-	listBuilder := netlist.NewBuilder[int](0)
-	labelIndexes := make(map[string]int)
-	labels := make([]string, 0)
-	assignIdx := func(s string) (idx int) {
-		idx, ok := labelIndexes[s]
-		if ok {
-			return idx
-		}
-		labels = append(labels, s)
-		idx = len(labels) - 1
-		labelIndexes[s] = idx
-		return idx
-	}
-
-	scanner := bufio.NewScanner(r)
-	line := 0
-	for scanner.Scan() {
-		line++
-		t := scanner.Text()
-		t, _, _ = strings.Cut(t, "#")
-		t = strings.TrimSpace(t)
-		if len(t) == 0 {
-			continue
-		}
-		start, end, markStr, err := parseLine(t)
-		if err != nil {
-			return nil, fmt.Errorf("invalid line #%d, %w", line, err)
-		}
-		idx := assignIdx(markStr)
-		if ok := listBuilder.Add(start, end, idx); !ok {
-			return nil, fmt.Errorf("invalid range at line #%d", line)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	l, err := listBuilder.Build()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build ip list, %w", err)
-	}
-	return &ipMarker{
-		l: l,
-		s: labels,
-	}, nil
-}
-
-func loadIpMarkerFromFile(fp string) (*ipMarker, error) {
-	f, err := os.Open(fp)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return loadIpMarkerFromReader(f)
-}
-
-func cacheKey(q *dnsmsg.Question, mark string) pool.Buffer {
-	b := pool.GetBuf(len(q.Name) + 4 + len(mark))
-	off := copy(b, q.Name)
-	binary.BigEndian.PutUint16(b[off:], uint16(q.Class))
-	off += 2
-	binary.BigEndian.PutUint16(b[off:], uint16(q.Type))
-	off += 2
-	copy(b[off:], []byte(mark))
-	return b
 }

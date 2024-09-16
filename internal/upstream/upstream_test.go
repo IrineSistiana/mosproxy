@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/internal/utils"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/miekg/dns"
 )
 
@@ -151,23 +152,25 @@ func testUpstream(u Upstream) error {
 		go func() {
 			defer wg.Done()
 
-			q := new(dns.Msg)
-			q.SetQuestion("example.com.", dns.TypeA)
-			q.Id = i
-			queryPayload, err := q.Pack()
+			q := dnsmsg.NewMsg()
+			q.ID = i
+			question := dnsmsg.NewQuestion()
+			err := question.Name.Parse("test2.test1.")
 			if err != nil {
 				logErr(err)
 				return
 			}
+			q.Questions = append(q.Questions, question)
+
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			r, err := u.ExchangeContext(ctx, queryPayload)
+			r, err := u.ExchangeContext(ctx, q)
 			if err != nil {
 				logErr(err)
 				return
 			}
 
-			if q.Id != r.Header.ID {
+			if q.ID != r.ID {
 				logErr(dns.ErrId)
 				return
 			}

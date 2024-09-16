@@ -5,7 +5,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/miekg/dns"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 func newEchoConn() (c, s net.Conn) {
@@ -16,13 +16,14 @@ func newEchoConn() (c, s net.Conn) {
 	return
 }
 
-func newTestMsg(id uint16, name string) []byte {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(name), dns.TypeA)
-	m.Id = id
-	b, err := m.Pack()
+func newTestMsg(id uint16, name string) *dnsmsg.Msg {
+	m := dnsmsg.NewMsg()
+	m.ID = id
+	q := dnsmsg.NewQuestion()
+	err := q.Name.Parse(name)
 	if err != nil {
-		panic(fmt.Sprintf("failed to pack msg, %s", err))
+		panic(fmt.Sprintf("failed to pack name, %s", err))
 	}
-	return b
+	m.Questions = append(m.Questions, q)
+	return m
 }

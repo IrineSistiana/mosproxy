@@ -1,6 +1,7 @@
 package dnsmsg
 
 import (
+	"slices"
 	"sync"
 )
 
@@ -134,6 +135,7 @@ func UnpackHdr(msg []byte, off int) (Header, HeaderCount, int, error) {
 }
 
 type Msg struct {
+	noCopy
 	Header
 	Questions   []*Question
 	Answers     []Resource
@@ -141,23 +143,25 @@ type Msg struct {
 	Additionals []Resource
 }
 
-// Len is the msg length without compression.
-func (m *Msg) Len() (l int) {
-	if m == nil {
-		return 0
-	}
-	l += 12 // header
+func (m *Msg) Copy() *Msg {
+	n := NewMsg()
+	n.Header = m.Header
 
+	n.Questions = slices.Grow(n.Questions, len(m.Questions))
 	for _, q := range m.Questions {
-		l += q.Len()
+		n.Questions = append(n.Questions, q.Copy())
 	}
 
-	for _, rs := range [...][]Resource{m.Answers, m.Authorities, m.Additionals} {
-		for _, r := range rs {
-			l += r.packLen()
+	copy := func(src, dst *[]Resource) {
+		*dst = slices.Grow(*dst, len(*src))
+		for _, rr := range *src {
+			*dst = append(*dst, rr.Copy())
 		}
 	}
-	return l
+	copy(&m.Answers, &n.Answers)
+	copy(&m.Authorities, &n.Authorities)
+	copy(&m.Additionals, &n.Additionals)
+	return n
 }
 
 var msgPool = sync.Pool{New: func() any { return new(Msg) }}
@@ -215,27 +219,30 @@ func (m *Msg) Unpack(msg []byte) error {
 		m.Questions = append(m.Questions, q)
 	}
 
+	hdrBuffer := newRrHdr()
+	defer releaseRrHdr(hdrBuffer)
 	for i := 0; i < int(h.answers); i++ {
 		var r Resource
-		r, off, err = UnpackResource(msg, off)
+		r, off, err = unpackResource(hdrBuffer, msg, off)
+		hdrBuffer.reset()
 		if err != nil {
 			return newSectionErr("answers", err)
 		}
 		m.Answers = append(m.Answers, r)
 	}
-
 	for i := 0; i < int(h.authorities); i++ {
 		var r Resource
-		r, off, err = UnpackResource(msg, off)
+		r, off, err = unpackResource(hdrBuffer, msg, off)
+		hdrBuffer.reset()
 		if err != nil {
 			return newSectionErr("authorities", err)
 		}
 		m.Authorities = append(m.Authorities, r)
 	}
-
 	for i := 0; i < int(h.additionals); i++ {
 		var r Resource
-		r, off, err = UnpackResource(msg, off)
+		r, off, err = unpackResource(hdrBuffer, msg, off)
+		hdrBuffer.reset()
 		if err != nil {
 			return newSectionErr("additionals", err)
 		}
@@ -246,7 +253,7 @@ func (m *Msg) Unpack(msg []byte) error {
 
 var compressMapPool = sync.Pool{
 	New: func() any {
-		return make(map[string]uint16, 50)
+		return make(map[string]uint16, 32)
 	},
 }
 
@@ -259,28 +266,26 @@ func releaseCompressionMap(m map[string]uint16) {
 	compressMapPool.Put(m)
 }
 
-// Pack m into b. Returns the msg size.
-// compression == true will only compress rr header.
+// Pack and append data into b.
 // Size is the msg size limit. Upon reach the limit, no rr will be
 // packed and the msg will be "Truncated". Minimum is 512. 0 means no limit.
-// The size of b should be m.Len(). If b is not big enough, an error will be returned.
-// Without compression, the msg will have the size of m.Len().
-// TODO: Calculate compressed length?
-func (m *Msg) Pack(b []byte, compression bool, size int) (int, error) {
+func (m *Msg) Pack(b []byte, compression bool, size int) ([]byte, error) {
+	msgOff := len(b)
+
 	// Validate the lengths. It is very unlikely that anyone will try to
 	// pack more than 65535 of any particular type, but it is possible and
 	// we should fail gracefully.
 	if len(m.Questions) > int(^uint16(0)) {
-		return 0, errTooManyQuestions
+		return b, errTooManyQuestions
 	}
 	if len(m.Answers) > int(^uint16(0)) {
-		return 0, errTooManyAnswers
+		return b, errTooManyAnswers
 	}
 	if len(m.Authorities) > int(^uint16(0)) {
-		return 0, errTooManyAuthorities
+		return b, errTooManyAuthorities
 	}
 	if len(m.Additionals) > int(^uint16(0)) {
-		return 0, errTooManyAdditionals
+		return b, errTooManyAdditionals
 	}
 
 	var h rawHeader
@@ -294,17 +299,25 @@ func (m *Msg) Pack(b []byte, compression bool, size int) (int, error) {
 		size = 512
 	}
 
-	var msgHdr = m.Header
-	off := 12
-	if len(b) < off {
-		return 0, newSectionErr("header", ErrSmallBuffer)
-	}
+	var msgHdr = m.Header              // copy it, we may change the tc flag
+	b = append(b, make([]byte, 12)...) // allocate header
 
-	var edns0Opt Resource
+	// Find edns0 first, this rr should not be truncated.
+	var eDNS0Opt Resource
 	if size > 0 {
-		edns0Opt = PopEDNS0(m)
-		if edns0Opt != nil {
-			size -= edns0Opt.packLen()
+		for i := len(m.Additionals) - 1; i >= 0; i-- {
+			r := m.Additionals[i]
+			if r.Hdr().Type == TypeOPT {
+				eDNS0Opt = r
+				break
+			}
+		}
+		if eDNS0Opt != nil {
+			l, err := eDNS0Opt.packBodyLen(nil)
+			if err != nil {
+				return b, newSectionErr("edns0", err)
+			}
+			size -= l
 		}
 	}
 
@@ -313,58 +326,98 @@ func (m *Msg) Pack(b []byte, compression bool, size int) (int, error) {
 		compressionMap = newCompressionMap()
 		defer releaseCompressionMap(compressionMap)
 	}
+
+	section := "question"
 	for _, q := range m.Questions {
-		if size > 0 && off+q.Len() > size {
-			msgHdr.Truncated = true
-			continue
+		if size > 0 {
+			l, err := q.packLen(compressionMap)
+			if err != nil {
+				return b, newSectionErr(section, err)
+			}
+			if len(b)+l > size {
+				msgHdr.Truncated = true
+				continue
+			}
 		}
 		var err error
-		if off, err = q.pack(b, off, compressionMap); err != nil {
-			return off, newSectionErr("question", err)
+		if b, err = q.pack(b, compressionMap, msgOff); err != nil {
+			return b, newSectionErr(section, err)
 		}
 	}
 
-	for _, r := range m.Answers {
-		if size > 0 && off+r.packLen() > size {
-			msgHdr.Truncated = true
-			continue
+	packRRs := func(b []byte, rrs []Resource, skipEDNS0 bool) ([]byte, error) {
+		for _, r := range rrs {
+			if skipEDNS0 && r.Hdr().Type == TypeOPT {
+				continue
+			}
+			if size > 0 {
+				l, err := packRRLen(r, compressionMap)
+				if err != nil {
+					return b, err
+				}
+				if len(b)+l > size {
+					msgHdr.Truncated = true
+					continue
+				}
+			}
+			var err error
+			if b, err = packRR(r, b, compressionMap, msgOff); err != nil {
+				return b, err
+			}
 		}
-		var err error
-		if off, err = r.pack(b, off, compressionMap); err != nil {
-			return off, newSectionErr("answer", err)
-		}
+		return b, nil
 	}
-	for _, r := range m.Authorities {
-		if size > 0 && off+r.packLen() > size {
-			msgHdr.Truncated = true
-			continue
-		}
-		var err error
-		if off, err = r.pack(b, off, compressionMap); err != nil {
-			return off, newSectionErr("authority", err)
-		}
+	b, err := packRRs(b, m.Answers, false)
+	if err != nil {
+		return b, newSectionErr("answers", err)
 	}
-	for _, r := range m.Additionals {
-		if size > 0 && off+r.packLen() > size {
-			msgHdr.Truncated = true
-			continue
-		}
+	b, err = packRRs(b, m.Authorities, false)
+	if err != nil {
+		return b, newSectionErr("authority", err)
+	}
+	b, err = packRRs(b, m.Additionals, eDNS0Opt != nil)
+	if err != nil {
+		return b, newSectionErr("additional", err)
+	}
+
+	if eDNS0Opt != nil {
 		var err error
-		if off, err = r.pack(b, off, compressionMap); err != nil {
-			return off, newSectionErr("additional", err)
+		b, err = packRR(eDNS0Opt, b, compressionMap, msgOff)
+		if err != nil {
+			return b, newSectionErr("edns0", err)
 		}
 	}
 
-	if edns0Opt != nil {
-		m.Additionals = append(m.Additionals, edns0Opt)
-		var err error
-		if off, err = edns0Opt.pack(b, off, compressionMap); err != nil {
-			return off, newSectionErr("additional", err)
+	h.pack(b[msgOff : msgOff+12])
+	return b, nil
+}
+
+// Pack length if no compression.
+func (m *Msg) MaxPackLen() (s int, err error) {
+	s += 12
+
+	var l int
+	for _, q := range m.Questions {
+		l, err = q.packLen(nil)
+		if err != nil {
+			err = newSectionErr("question", err)
+			return
 		}
+		s += l
 	}
 
-	h.pack(b[:12])
-	return off, nil
+	secStr := [...]string{"answers", "authorities", "additionals"}
+	for si, rrs := range [...][]Resource{m.Answers, m.Authorities, m.Additionals} {
+		for _, rr := range rrs {
+			l, err = packRRLen(rr, nil)
+			if err != nil {
+				err = newSectionErr(secStr[si], err)
+				return
+			}
+			s += l
+		}
+	}
+	return
 }
 
 func PopEDNS0(m *Msg) Resource {

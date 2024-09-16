@@ -1,26 +1,31 @@
-package compile
+package domainmatcher
 
 import (
 	"errors"
 	"math"
+
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 var (
 	errTooManyNodes = errors.New("too many nodes")
 )
 
-type Tree struct {
+type tree struct {
 	root        node
 	assignedIdx int32
 }
 
-func NewTree() *Tree {
-	return &Tree{}
+func newTree() *tree {
+	return &tree{}
 }
 
-func (t *Tree) Add(labels [][]byte, dataOff int64, inherit bool) error {
+func (t *tree) Add(name *dnsmsg.Name, dataOff int64, inherit bool) error {
+	s := dnsmsg.NewNameScanner(name)
+	s.Reverse()
 	curNode := &t.root
-	for _, label := range labels {
+	for s.Scan() {
+		label := s.Label()
 		child, ok := curNode.children[string(label)]
 		if !ok {
 			var err error
@@ -41,7 +46,7 @@ func (t *Tree) Add(labels [][]byte, dataOff int64, inherit bool) error {
 	return nil
 }
 
-func (t *Tree) newNode() (*node, error) {
+func (t *tree) newNode() (*node, error) {
 	if t.assignedIdx >= math.MaxInt32-1 {
 		return nil, errTooManyNodes
 	}
@@ -50,10 +55,6 @@ func (t *Tree) newNode() (*node, error) {
 		idx: t.assignedIdx,
 	}
 	return n, nil
-}
-
-func (t *Tree) Compile() (*CompiledTree, error) {
-	return t.compile()
 }
 
 type node struct {

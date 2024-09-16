@@ -13,10 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/upstream/transport"
 	"github.com/IrineSistiana/mosproxy/internal/utils"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/rs/zerolog"
@@ -352,14 +352,14 @@ type udpWithFallback struct {
 	t *transport.ReuseConnTransport
 }
 
-func (u *udpWithFallback) ExchangeContext(ctx context.Context, q []byte) (*dnsmsg.Msg, error) {
-	r, err := u.u.ExchangeContext(ctx, q)
+func (u *udpWithFallback) ExchangeContext(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
+	r, err := u.u.ExchangeContext(ctx, m)
 	if err != nil {
 		return nil, err
 	}
 	if r.Header.Truncated {
 		dnsmsg.ReleaseMsg(r)
-		return u.t.ExchangeContext(ctx, q)
+		return u.t.ExchangeContext(ctx, m)
 	}
 	return r, nil
 }

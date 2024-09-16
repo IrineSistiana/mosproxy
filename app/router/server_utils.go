@@ -2,6 +2,7 @@ package router
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -9,8 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
+	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
 const (
@@ -18,31 +20,102 @@ const (
 	tlsHandshakeTimeout   = time.Second * 3
 )
 
-// Note: the returned buffer is not trimmed. It supports to be released asap.
-func packResp(m *dnsmsg.Msg, compression bool, size int) (pool.Buffer, error) {
-	if size > 65535 {
-		size = 65535
-	}
-	b := pool.GetBuf(m.Len())
-	n, err := m.Pack(b, compression, size)
+func packResp(m *dnsmsg.Msg, size int) (pool.Buffer, error) {
+	l, err := m.MaxPackLen()
 	if err != nil {
-		pool.ReleaseBuf(b)
 		return nil, err
 	}
-	b = b[:n]
-	return b, nil
+	b := pool.GetBuf(l)
+	defer pool.ReleaseBuf(b)
+
+	payload, err := m.Pack(b[:0], true, size)
+	if err != nil {
+		return nil, err
+	}
+	return pool.CopyBuf(payload), nil
 }
 
-func packRespTCP(m *dnsmsg.Msg, compression bool) (pool.Buffer, error) {
-	b := pool.GetBuf(2 + m.Len())
-	n, err := m.Pack(b[2:], compression, 65535)
+var errPayloadOverflowed = errors.New("payload size overflowed")
+
+func packRespTCP(m *dnsmsg.Msg) (pool.Buffer, error) {
+	l, err := m.MaxPackLen()
 	if err != nil {
-		pool.ReleaseBuf(b)
 		return nil, err
 	}
-	binary.BigEndian.PutUint16(b, uint16(n))
-	b = b[:2+n]
-	return b, nil
+	b := pool.GetBuf(2 + l)
+	defer pool.ReleaseBuf(b)
+
+	payload, err := m.Pack(b[:2], true, 65535)
+	if err != nil {
+		return nil, err
+	}
+	payloadLen := len(payload) - 2
+	if payloadLen > 65535 {
+		return nil, errPayloadOverflowed
+	}
+	binary.BigEndian.PutUint16(payload, uint16(payloadLen))
+	return pool.CopyBuf(payload), nil
+}
+
+// Used by servers for the final step before sending resp payload to client.
+// If resp must not be nil.
+// If tcp is true, size is ignored.
+// If resp failed to pack, an header will be packed.
+func serverFinalRespB(req, resp *dnsmsg.Msg, tcp bool, size int) pool.Buffer {
+
+	// Set resp hdr according to q.
+	// Also set or remove resp edns0 depending on whether q has edns0 or not.
+	postProcessResp := func(udpSize uint16) {
+		resp.ID = req.ID
+		resp.Response = true
+		resp.OpCode = req.OpCode
+		resp.RecursionAvailable = true
+		resp.RecursionDesired = req.RecursionDesired
+
+		if hasEDNS0(req) {
+			addOrReplaceOpt(resp, udpSize)
+		} else {
+			// remove opt from resp
+			rr := dnsmsg.PopEDNS0(resp)
+			if rr != nil {
+				dnsmsg.ReleaseResource(rr)
+			}
+		}
+	}
+
+	var b pool.Buffer
+	var err error
+	if tcp {
+		postProcessResp(4096)
+		b, err = packRespTCP(resp)
+	} else {
+		postProcessResp(uint16(size))
+		b, err = packResp(resp, size)
+	}
+	if err == nil {
+		return b
+	}
+
+	mlog.L().Error().Err(err).Msg("internal err: failed to pack dns msg")
+
+	// Failed to pack resp.
+	// Try only pack header.
+	var body []byte
+	if tcp {
+		b = pool.GetBuf(2 + 12)
+		binary.BigEndian.PutUint16(b[:2], 12)
+		body = b[2:]
+	} else {
+		b = pool.GetBuf(12)
+		body = b
+	}
+
+	hdr := resp.Header
+	hdr.RCode = dnsmsg.RCodeServerFailure
+	id, bits := hdr.Pack()
+	binary.BigEndian.PutUint16(body[0:], id)
+	binary.BigEndian.PutUint16(body[2:], bits)
+	return b
 }
 
 // return an invalid addr if v is not supported.
@@ -132,4 +205,36 @@ func (ct *connTracker[T]) Closed() bool {
 	ct.m.Lock()
 	defer ct.m.Unlock()
 	return ct.closed
+}
+
+func (q *QueryCtx) parseQuery(m *dnsmsg.Msg) bool {
+	// header
+	notImpl := m.Response ||
+		!m.RecursionDesired ||
+		m.OpCode != dnsmsg.OpCode(0)
+	if notImpl {
+		return false
+	}
+
+	if len(m.Questions) != 1 ||
+		len(m.Answers) != 0 ||
+		len(m.Authorities) != 0 ||
+		len(m.Additionals) > 1 { // edns0
+		return false
+	}
+
+	q.Question.CopyFrom(m.Questions[0])
+	q.ClientECS = findECS(m)
+	return true
+}
+
+func hasEDNS0(m *dnsmsg.Msg) bool {
+	end := len(m.Additionals) - 1
+	for i := end; i >= 0; i-- {
+		r := m.Additionals[i]
+		if r.Hdr().Type == dnsmsg.TypeOPT {
+			return true
+		}
+	}
+	return false
 }

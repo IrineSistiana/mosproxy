@@ -3,27 +3,29 @@ package router
 import (
 	"net"
 	"net/netip"
+	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
 )
 
-type qLogObj dnsmsg.Question
+// qid name class type ecs
+func (q *QueryCtx) LogBasic() *zerolog.Event {
+	e := zerolog.Dict()
+	e.Uint32("qid", q.Qid)
 
-func (o *qLogObj) MarshalZerologObject(e *zerolog.Event) {
-	q := (*dnsmsg.Question)(o)
-
-	b, err := dnsmsg.ToReadable(q.Name)
-	if err != nil {
-		e.Bytes("invalid_name", q.Name)
-	} else {
-		e.Bytes("name", b)
-		pool.ReleaseBuf(b)
+	b := pool.GetBuf(1024)
+	e.Bytes("name", q.Question.Name.AppendReadableTo(b[:0]))
+	pool.ReleaseBuf(b)
+	e.Uint16("class", uint16(q.Question.Class))
+	e.Uint16("type", uint16(q.Question.Type))
+	logNetipPrefix(e, "ecs", q.ECS2Upstream)
+	if len(q.ECSZone) > 0 {
+		e.Str("ecs_zone", q.ECSZone)
 	}
-	e.Uint16("class", uint16(q.Class))
-	e.Uint16("type", uint16(q.Type))
+	return e
 }
 
 type logConn interface {
@@ -32,49 +34,74 @@ type logConn interface {
 }
 
 func debugLogServerConnAccepted(c logConn, logger *zerolog.Logger) {
-	logger.Debug().
-		Str("network", c.LocalAddr().Network()).
-		Stringer("local", c.LocalAddr()).
-		Stringer("remote", c.RemoteAddr()).
-		Msg("connection opened")
+	e := logger.Debug()
+	if e != nil {
+		e.Str("network", c.LocalAddr().Network()).
+			Stringer("local", c.LocalAddr()).
+			Stringer("remote", c.RemoteAddr()).
+			Msg("connection opened")
+	}
 }
 
 func debugLogServerConnClosed(c logConn, logger *zerolog.Logger, cause error) {
-	logger.Debug().
-		Str("network", c.LocalAddr().Network()).
-		Stringer("local", c.LocalAddr()).
-		Stringer("remote", c.RemoteAddr()).
-		AnErr("cause", cause).
-		Msg("connection closed")
+	e := logger.Debug()
+	if e != nil {
+		e.Str("network", c.LocalAddr().Network()).
+			Stringer("local", c.LocalAddr()).
+			Stringer("remote", c.RemoteAddr()).
+			AnErr("cause", cause).
+			Msg("connection closed")
+	}
 }
 
 // log query info without lvl
-func (r *Router) logQueryResp(q qCtx, resp *dnsmsg.Msg, rm RespMeta) {
+func (r *Router) logAccess(q *QueryCtx) {
 	e := r.logger.Log()
 	if e == nil {
 		return
 	}
-	e.Dict("query", logQuery(q))
-	e.Dict("resp", logResp(resp, rm))
-	e.Msg("query log")
-}
 
-func logQuery(q qCtx) *zerolog.Event {
-	e := zerolog.Dict()
-	e.Uint32("quid", q.uid)
-	b, err := dnsmsg.ToReadable(q.q.Name)
-	if err != nil {
-		e.Bytes("invalid_name", q.q.Name)
-	} else {
-		e.Bytes("name", b)
-		pool.ReleaseBuf(b)
+	// dns query
+	e.Uint32("qid", q.Qid)
+	b := pool.GetBuf(1024)
+	e.Bytes("name", q.Question.Name.AppendReadableTo(b[:0]))
+	pool.ReleaseBuf(b)
+	e.Uint16("class", uint16(q.Question.Class))
+	e.Uint16("type", uint16(q.Question.Type))
+	logNetipPrefix(e, "ecs", q.ECS2Upstream)
+	if len(q.ECSZone) > 0 {
+		e.Str("ecs_zone", q.ECSZone)
 	}
-	e.Uint16("class", uint16(q.q.Class))
-	e.Uint16("type", uint16(q.q.Type))
-	logNetipAddrPort(e, "remote", q.qMeta.RemoteAddr)
-	logNetipAddrPort(e, "local", q.qMeta.LocalAddr)
-	logNetipPrefix(e, "ecs", q.qInfo.ECS)
-	return e
+
+	// server meta
+	if len(q.ServerTag) > 0 {
+		e.Str("server", q.ServerTag)
+	}
+	logNetipAddrPort(e, "remote", q.RemoteAddr)
+	if len(q.ServerName) > 0 {
+		e.Bytes("sni", q.ServerName)
+	}
+	if len(q.Host) > 0 {
+		e.Bytes("host", q.Host)
+	}
+	if len(q.Path) > 0 {
+		e.Bytes("path", q.Path)
+	}
+
+	// resp
+	if r := q.Resp; r != nil {
+		e.Uint16("rcode", uint16(r.RCode))
+	}
+
+	e.Int("rule", q.Trace.RuleIdx)
+	if q.Trace.Cached {
+		e.Bool("cached", true)
+	}
+
+	if !q.Start.IsZero() {
+		e.Dur("elapsed", time.Since(q.Start))
+	}
+	e.Msg("query log")
 }
 
 // If addr is invalid, do nothing.
@@ -84,8 +111,7 @@ func logNetipAddrPort(e *zerolog.Event, key string, addr netip.AddrPort) {
 	}
 	buf := pool.GetBuf(64) // ipv6: maximum 39 bytes string + 2 for "[]" + 6 ":xxxxx" port.
 	defer pool.ReleaseBuf(buf)
-	b := addr.AppendTo(buf[:0])
-	e.Bytes(key, b)
+	e.Bytes(key, addr.AppendTo(buf[:0]))
 }
 
 // If p is invalid, do nothing.
@@ -95,31 +121,15 @@ func logNetipPrefix(e *zerolog.Event, key string, p netip.Prefix) {
 	}
 	buf := pool.GetBuf(64) // ipv6: maximum 39 bytes string + 2 for "[]" + 4 "/xxx" bits.
 	defer pool.ReleaseBuf(buf)
-	b := p.AppendTo(buf[:0])
-	e.Bytes(key, b)
+	e.Bytes(key, p.AppendTo(buf[:0]))
 }
 
-func logResp(r *dnsmsg.Msg, rm RespMeta) *zerolog.Event {
-	e := zerolog.Dict()
-	e.Int("rule", rm.RuleIdx)
-	if rm.Cached {
-		e.Bool("cached", true)
-	}
-	if len(rm.IpMark) > 0 {
-		e.Str("ip_mark", rm.IpMark)
-	}
-	if r != nil {
-		e.Uint16("rcode", uint16(r.Header.RCode))
-	}
-	return e
-}
-
-func (r *Router) debugLogMsg(q qCtx, m *dnsmsg.Msg, msg string) {
+func (r *Router) debugLogMsg(q *QueryCtx, m *dnsmsg.Msg, msg string) {
 	e := r.logger.Log()
 	if e == nil {
 		return
 	}
-	e.Dict("query", logQuery(q))
+	e.Dict("query", q.LogBasic())
 
 	m2, err := dnsmsg2dns(m)
 	if err != nil {
@@ -130,12 +140,17 @@ func (r *Router) debugLogMsg(q qCtx, m *dnsmsg.Msg, msg string) {
 }
 
 func dnsmsg2dns(m *dnsmsg.Msg) (*dns.Msg, error) {
-	b := pool.GetBuf(m.Len())
-	_, err := m.Pack(b, false, 0)
+	l, err := m.MaxPackLen()
 	if err != nil {
 		return nil, err
 	}
+	b := pool.GetBuf(l)
 	defer pool.ReleaseBuf(b)
+
+	_, err = m.Pack(b[:0], false, 0)
+	if err != nil {
+		return nil, err
+	}
 
 	m2 := new(dns.Msg)
 	err = m2.Unpack(b)

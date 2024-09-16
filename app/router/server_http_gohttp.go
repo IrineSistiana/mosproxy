@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IrineSistiana/mosproxy/internal/dnsmsg"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/IrineSistiana/mosproxy/internal/utils"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/rs/zerolog"
 	"golang.org/x/net/http2"
 )
@@ -26,6 +26,7 @@ func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 	}
 
 	h := &httpHandler{
+		cfg:              cfg,
 		r:                r,
 		clientAddrHeader: cfg.Http.ClientAddrHeader,
 	}
@@ -64,14 +65,6 @@ func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 	h.logger = r.subLoggerForServer("server_http", cfg.Tag)
 	hs.ErrorLog = log.New(mlog.WriteToLogger(h.logger, "redirected http log", "msg"), "", 0)
 
-	var cost int
-	if useTls {
-		cost = costTLSConn
-	} else {
-		cost = costTCPConn
-	}
-	l = newListener(l, h.logger, r.limiter, cost)
-
 	h.logger.Info().
 		Str("network", l.Addr().Network()).
 		Stringer("addr", l.Addr()).
@@ -92,6 +85,7 @@ func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 }
 
 type httpHandler struct {
+	cfg              *ServerConfig
 	r                *Router
 	localAddr        netip.AddrPort // maybe invalid, e.g. server is on unix socket
 	path             string
@@ -142,30 +136,46 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		remoteAddr, _ = netip.ParseAddrPort(req.RemoteAddr)
 	}
 
-	if err := h.r.limiterAllowN(remoteAddr.Addr(), costHTTPQuery); err != nil {
-		// TODO: Log or create a metrics entry for refused queries.
-		w.WriteHeader(http.StatusServiceUnavailable)
-		return
-	}
-
 	m := h.readReqMsg(w, req)
 	if m == nil {
 		return
 	}
 	defer dnsmsg.ReleaseMsg(m)
 
-	resp := h.r.handleQuerySync(m, QueryMeta{RemoteAddr: remoteAddr, LocalAddr: h.localAddr})
-	defer dnsmsg.ReleaseMsg(resp)
-	msgBody := mustHaveRespB(resp, false, 65535)
-	defer pool.ReleaseBuf(msgBody)
+	q := NewQueryCtx()
+	defer ReleaseQueryCtx(q)
+
+	var respBuf pool.Buffer
+	if ok := q.parseQuery(m); !ok {
+		resp := makeEmptyRespM(m, dnsmsg.RCodeRefused)
+		respBuf = serverFinalRespB(m, resp, true, 0)
+		dnsmsg.ReleaseMsg(resp)
+	} else {
+		q.ServerTag = h.cfg.Tag
+		q.RemoteAddr = remoteAddr
+		if stat := req.TLS; stat != nil {
+			q.Protocol = ProtoHTTPS
+			q.ServerName = append(q.ServerName, stat.ServerName...)
+		} else {
+			q.Protocol = ProtoHTTP
+		}
+		q.Host = append(q.Host, req.Host...)
+		q.Path = append(q.Path, req.URL.Path...)
+
+		h.r.handleQuery(q)
+		respBuf = serverFinalRespB(m, q.Resp, false, udpSize)
+	}
 
 	w.Header().Set("Content-Type", "application/dns-message")
-	if _, err := w.Write(msgBody); err != nil {
-		h.logger.Error().
-			Object("request", (*httpReqLoggerObj)(req)).
-			Err(err).
-			Msg("failed to write http response")
-		return
+	_, err := w.Write(respBuf)
+	pool.ReleaseBuf(respBuf)
+	if err != nil {
+		e := h.logger.Debug() // This err log might be annoying  Using debug log.
+		if e != nil {
+			e.Object("request", (*httpReqLoggerObj)(req)).
+				Err(err).
+				Msg("failed to write to remote")
+		}
 	}
 }
 
