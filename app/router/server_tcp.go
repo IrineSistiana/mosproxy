@@ -146,7 +146,7 @@ func (s *tcpServer) handleConn(c net.Conn) error {
 				defer dnsmsg.ReleaseMsg(m)
 				defer func() {
 					select {
-					case concurrent <- struct{}{}:
+					case <-concurrent:
 					default:
 						panic("negative concurrent counter")
 					}
