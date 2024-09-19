@@ -167,7 +167,7 @@ func (c *RedisCache) Store(k []byte, storedTime, expireTime time.Time, v []byte,
 		cmd = c.client.B().Set().Key(rueidis.BinaryString(k)).Value(rueidis.BinaryString(data)).PxMilliseconds(ttlMs).Build()
 	}
 	err := c.client.Do(ctx, cmd).Error()
-	if err != nil {
+	if err != nil && !errors.Is(err, rueidis.Nil) { // NX may response a Nil reply if key exists.
 		c.logger.Err(err).Msg("redis set cmd failed")
 	} else {
 		c.setTotal.Inc()
