@@ -96,19 +96,20 @@ func (c *RedisCache) Close() error {
 	return nil
 }
 
-func (c *RedisCache) buildValue(storedTime, expireTime time.Time, v []byte) pool.Buffer {
-	b := pool.GetBuf(16 + len(v))
-	binary.BigEndian.PutUint64(b, uint64(storedTime.Unix()))
-	binary.BigEndian.PutUint64(b[8:], uint64(expireTime.Unix()))
-	copy(b[16:], v)
+func (c *RedisCache) buildValue(v []byte, t Times) pool.Buffer {
+	b := pool.GetBuf(24 + len(v))
+	binary.BigEndian.PutUint64(b[0:8], uint64(t.StoredAtUnix))
+	binary.BigEndian.PutUint64(b[8:16], uint64(t.ExpireAtUnix))
+	binary.BigEndian.PutUint64(b[16:24], uint64(t.CacheExpireAtUnix))
+	copy(b[24:], v)
 	return b
 }
 
 // Get dose not return error.
 // All errors (of broking/invalid stored data, connection lost, etc.) will be logged.
-func (c *RedisCache) Get(ctx context.Context, k []byte) (storedTime, expireTime time.Time, v []byte) {
+func (c *RedisCache) Get(ctx context.Context, k []byte) ([]byte, Times) {
 	if !c.backendOnline.Load() {
-		return
+		return nil, Times{}
 	}
 
 	start := time.Now()
@@ -122,38 +123,40 @@ func (c *RedisCache) Get(ctx context.Context, k []byte) (storedTime, expireTime 
 			// This is a redis io/type error.
 			c.logger.Error().Err(err).Msg("get cmd failed")
 		}
-		return time.Time{}, time.Time{}, nil
+		return nil, Times{}
 	}
 
 	// hit
-	if len(b) < 16 {
+	if len(b) < 24 {
 		c.logger.Error().Msg("invalid cache data, too short")
 		// TODO: Delete this invalid key here?
-		return time.Time{}, time.Time{}, nil
+		return nil, Times{}
 	}
 	c.getTotal.Inc()
 	c.hitTotal.Inc()
 	c.getLatency.Observe(float64(time.Since(start).Milliseconds()))
 
-	storedTime = time.Unix(int64(binary.BigEndian.Uint64(b[:8])), 0)
-	expireTime = time.Unix(int64(binary.BigEndian.Uint64(b[8:16])), 0)
-	v = b[16:]
-	return
+	t := Times{
+		StoredAtUnix:      int64(binary.BigEndian.Uint64(b[:8])),
+		ExpireAtUnix:      int64(binary.BigEndian.Uint64(b[8:16])),
+		CacheExpireAtUnix: int64(binary.BigEndian.Uint64(b[16:24])),
+	}
+	v := b[24:]
+	return v, t
 }
 
 // Store v in to redis.
 // Errors will be logged to the RedisCache logger.
-func (c *RedisCache) Store(k []byte, storedTime, expireTime time.Time, v []byte, setNX bool) {
+func (c *RedisCache) Store(k []byte, v []byte, t Times, setNX bool) {
 	if !c.backendOnline.Load() {
 		return
 	}
 
-	ttlMs := time.Until(expireTime).Milliseconds()
-	if ttlMs <= 10 {
+	if time.Now().Unix() >= t.CacheExpireAtUnix {
 		return
 	}
 
-	data := c.buildValue(storedTime, expireTime, v)
+	data := c.buildValue(v, t)
 	defer pool.ReleaseBuf(data)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*1)
@@ -162,9 +165,9 @@ func (c *RedisCache) Store(k []byte, storedTime, expireTime time.Time, v []byte,
 	start := time.Now()
 	var cmd rueidis.Completed
 	if setNX {
-		cmd = c.client.B().Set().Key(rueidis.BinaryString(k)).Value(rueidis.BinaryString(data)).Nx().PxMilliseconds(ttlMs).Build()
+		cmd = c.client.B().Set().Key(rueidis.BinaryString(k)).Value(rueidis.BinaryString(data)).Nx().ExatTimestamp(t.CacheExpireAtUnix).Build()
 	} else {
-		cmd = c.client.B().Set().Key(rueidis.BinaryString(k)).Value(rueidis.BinaryString(data)).PxMilliseconds(ttlMs).Build()
+		cmd = c.client.B().Set().Key(rueidis.BinaryString(k)).Value(rueidis.BinaryString(data)).ExatTimestamp(t.CacheExpireAtUnix).Build()
 	}
 	err := c.client.Do(ctx, cmd).Error()
 	if err != nil && !errors.Is(err, rueidis.Nil) { // NX may response a Nil reply if key exists.

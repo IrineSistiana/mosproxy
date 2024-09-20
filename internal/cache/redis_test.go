@@ -24,14 +24,16 @@ func Test_RedisCache(t *testing.T) {
 	k := []byte("key")
 	v := []byte("value")
 
-	st := time.Now()
-	et := st.Add(time.Minute)
-	c.Store(k, st, et, v, false)
+	ts := Times{
+		StoredAtUnix:      1,
+		ExpireAtUnix:      2,
+		CacheExpireAtUnix: time.Now().Unix() + 300,
+	}
+	c.Store(k, v, ts, false)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	gotSt, gotEt, gotV := c.Get(ctx, k)
+	gotV, gotTs := c.Get(ctx, k)
 	r.Equal(v, gotV)
-	r.Equal(st.Unix(), gotSt.Unix())
-	r.Equal(et.Unix(), gotEt.Unix())
+	r.Equal(ts, gotTs)
 }

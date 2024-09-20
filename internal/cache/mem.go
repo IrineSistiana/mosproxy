@@ -1,17 +1,16 @@
 package cache
 
 import (
-	"sync"
 	"time"
+	"unsafe"
 
-	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/IrineSistiana/mosproxy/internal/utils"
 	"github.com/maypok86/otter"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 type MemoryCache struct {
-	backend otter.CacheWithVariableTTL[string, *cacheEntry]
+	backend otter.CacheWithVariableTTL[string, cacheEntry]
 
 	getTotal prometheus.Counter
 	hitTotal prometheus.Counter
@@ -19,16 +18,14 @@ type MemoryCache struct {
 }
 
 func NewMemoryCache(size int) (*MemoryCache, error) {
-	builder, err := otter.NewBuilder[string, *cacheEntry](size)
+	builder, err := otter.NewBuilder[string, cacheEntry](size)
 	if err != nil {
 		return nil, err
 	}
 	backend, err := builder.WithVariableTTL().
-		Cost(func(key string, value *cacheEntry) uint32 {
-			return uint32(len(key) + len(value.v))
-		}).
-		DeletionListener(func(key string, value *cacheEntry, cause otter.DeletionCause) {
-			releaseEntry(value)
+		Cost(func(key string, value cacheEntry) uint32 {
+			// Approximate cost
+			return uint32(unsafe.Sizeof(key)) + uint32(len(key)) + uint32(unsafe.Sizeof(value)) + uint32(len(value.v))
 		}).Build()
 	if err != nil {
 		return nil, err
@@ -53,18 +50,18 @@ func (c *MemoryCache) Collectors() []prometheus.Collector {
 	return []prometheus.Collector{c.getTotal, c.hitTotal, c.size}
 }
 
-func (c *MemoryCache) Store(k []byte, storedTime, expireTime time.Time, v []byte, setNX bool) {
-	ks := string(k)
-	vCopy := pool.CopyBuf(v)
-	e := newCacheEntry()
-	e.l.Lock()
-	e.storedTime = storedTime
-	e.expireTime = expireTime
-	e.k = ks
-	e.v = vCopy
-	e.l.Unlock()
+func (c *MemoryCache) Store(k []byte, v []byte, t Times, setNX bool) {
+	ttl := time.Duration(t.CacheExpireAtUnix-time.Now().Unix()) * time.Second
+	if ttl <= 0 {
+		return
+	}
 
-	ttl := time.Until(expireTime)
+	ks := string(k)
+	e := cacheEntry{
+		t: t,
+		v: clone(v),
+	}
+
 	if setNX {
 		c.backend.SetIfAbsent(ks, e, ttl)
 	} else {
@@ -72,26 +69,14 @@ func (c *MemoryCache) Store(k []byte, storedTime, expireTime time.Time, v []byte
 	}
 }
 
-func (c *MemoryCache) Get(k []byte) (v pool.Buffer, storedTime, expireTime time.Time) {
+func (c *MemoryCache) Get(k []byte) (v []byte, t Times) {
 	c.getTotal.Inc()
 	e, ok := c.backend.Get(utils.Bytes2StrUnsafe(k))
 	if ok { // key hit
-		if e.l.TryRLock() {
-			if e.v == nil || e.k != string(k) { // entry has been released or reused
-				e.l.RUnlock()
-				return nil, time.Time{}, time.Time{}
-			}
-
-			v = pool.CopyBuf(e.v)
-			storedTime = e.storedTime
-			expireTime = e.expireTime
-			e.l.RUnlock()
-			c.hitTotal.Inc()
-			return v, storedTime, expireTime
-		}
-		return nil, time.Time{}, time.Time{} // entry is being released
+		c.hitTotal.Inc()
+		return e.v, e.t
 	}
-	return nil, time.Time{}, time.Time{} // miss
+	return nil, Times{} // miss
 }
 
 // Always returns nil.
@@ -100,31 +85,14 @@ func (c *MemoryCache) Close() error {
 	return nil
 }
 
+// cacheEntry is a static.
 type cacheEntry struct {
-	l          sync.RWMutex
-	storedTime time.Time
-	expireTime time.Time
-	k          string
-	v          pool.Buffer
+	t Times
+	v []byte
 }
 
-var cacheEntryPool = sync.Pool{
-	New: func() any { return new(cacheEntry) },
-}
-
-func newCacheEntry() *cacheEntry {
-	return cacheEntryPool.Get().(*cacheEntry)
-}
-
-func releaseEntry(e *cacheEntry) {
-	e.l.Lock()
-	e.storedTime = time.Time{}
-	e.expireTime = time.Time{}
-	e.k = ""
-	if e.v != nil {
-		pool.ReleaseBuf(e.v)
-		e.v = nil
-	}
-	e.l.Unlock()
-	cacheEntryPool.Put(e)
+func clone[T any](s []T) []T {
+	n := make([]T, len(s))
+	copy(n, s)
+	return n
 }

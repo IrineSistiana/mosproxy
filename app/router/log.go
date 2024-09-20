@@ -11,8 +11,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// qid name class type ecs
-func (q *QueryCtx) LogBasic() *zerolog.Event {
+// qid name class type and ecs zone
+func (q *QueryCtx) LogQuery() *zerolog.Event {
 	e := zerolog.Dict()
 	e.Uint32("qid", q.Qid)
 
@@ -24,6 +24,43 @@ func (q *QueryCtx) LogBasic() *zerolog.Event {
 	logNetipPrefix(e, "ecs", q.ECS2Upstream)
 	if len(q.ECSZone) > 0 {
 		e.Str("ecs_zone", q.ECSZone)
+	}
+	return e
+}
+
+// qid name class type and ecs zone
+func (q *QueryCtx) LogServerMeta() *zerolog.Event {
+	e := zerolog.Dict()
+	if len(q.ServerTag) > 0 {
+		e.Str("server", q.ServerTag)
+	}
+	logNetipAddrPort(e, "remote", q.RemoteAddr)
+	if len(q.ServerName) > 0 {
+		e.Bytes("sni", q.ServerName)
+	}
+	if len(q.Host) > 0 {
+		e.Bytes("host", q.Host)
+	}
+	if len(q.Path) > 0 {
+		e.Bytes("path", q.Path)
+	}
+	return e
+}
+
+// qid name class type and ecs zone
+func (q *QueryCtx) LogResp() *zerolog.Event {
+	e := zerolog.Dict()
+	if r := q.Resp; r != nil {
+		e.Uint16("rcode", uint16(r.RCode))
+	}
+
+	e.Int("rule", q.Trace.RuleIdx)
+	if q.Trace.Cached {
+		e.Bool("cached", true)
+	}
+
+	if !q.Start.IsZero() {
+		e.Dur("elapsed", time.Since(q.Start))
 	}
 	return e
 }
@@ -61,46 +98,9 @@ func (r *Router) logAccess(q *QueryCtx) {
 		return
 	}
 
-	// dns query
-	e.Uint32("qid", q.Qid)
-	b := pool.GetBuf(1024)
-	e.Bytes("name", q.Question.Name.AppendReadableTo(b[:0]))
-	pool.ReleaseBuf(b)
-	e.Uint16("class", uint16(q.Question.Class))
-	e.Uint16("type", uint16(q.Question.Type))
-	logNetipPrefix(e, "ecs", q.ECS2Upstream)
-	if len(q.ECSZone) > 0 {
-		e.Str("ecs_zone", q.ECSZone)
-	}
-
-	// server meta
-	if len(q.ServerTag) > 0 {
-		e.Str("server", q.ServerTag)
-	}
-	logNetipAddrPort(e, "remote", q.RemoteAddr)
-	if len(q.ServerName) > 0 {
-		e.Bytes("sni", q.ServerName)
-	}
-	if len(q.Host) > 0 {
-		e.Bytes("host", q.Host)
-	}
-	if len(q.Path) > 0 {
-		e.Bytes("path", q.Path)
-	}
-
-	// resp
-	if r := q.Resp; r != nil {
-		e.Uint16("rcode", uint16(r.RCode))
-	}
-
-	e.Int("rule", q.Trace.RuleIdx)
-	if q.Trace.Cached {
-		e.Bool("cached", true)
-	}
-
-	if !q.Start.IsZero() {
-		e.Dur("elapsed", time.Since(q.Start))
-	}
+	e.Dict("query", q.LogQuery())
+	e.Dict("meta", q.LogServerMeta())
+	e.Dict("resp", q.LogResp())
 	e.Msg("query log")
 }
 
@@ -129,7 +129,7 @@ func (r *Router) debugLogMsg(q *QueryCtx, m *dnsmsg.Msg, msg string) {
 	if e == nil {
 		return
 	}
-	e.Dict("query", q.LogBasic())
+	e.Dict("query", q.LogQuery())
 
 	m2, err := dnsmsg2dns(m)
 	if err != nil {

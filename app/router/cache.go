@@ -18,22 +18,23 @@ import (
 )
 
 const (
-	defaultMinCacheTtl = time.Second * 5
-	defaultMaxCacheTtl = time.Minute * 10
+	defaultMinCacheTtl = 5
+	defaultMaxCacheTtl = 60 * 10 // 10 min
 	prefetchTimeout    = time.Second * 6
 )
 
 func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 	c := new(cacheCtl)
 	c.logger = r.subLogger("cache")
-	c.minimumTtl = time.Duration(cfg.MinimumTTL) * time.Second
+	c.minimumTtl = cfg.MinimumTTL
 	if c.minimumTtl <= 0 {
 		c.minimumTtl = defaultMinCacheTtl
 	}
-	c.maximumTtl = time.Duration(cfg.MaximumTTL) * time.Second
+	c.maximumTtl = cfg.MaximumTTL
 	if c.maximumTtl <= 0 {
 		c.maximumTtl = defaultMaxCacheTtl
 	}
+	c.optimisticTtl = cfg.OptimisticTTL
 
 	// init memory cache if configured
 	if cfg.MemSize > 0 {
@@ -100,24 +101,25 @@ func (c *prefetchCtl) Key(key []byte) uint64 {
 	return h
 }
 
-func (r *Router) needPrefetch(storedTime, expireTime time.Time) bool {
-	prefetchThreshold := r.opt.Cache.PrefetchThreshold
-	if prefetchThreshold <= 0 || prefetchThreshold >= 1 {
-		prefetchThreshold = 0.25
+func (r *Router) needPrefetch(t cache.Times) bool {
+	prefetchThresholdRatio := r.opt.Cache.PrefetchThreshold
+	if prefetchThresholdRatio <= 0 || prefetchThresholdRatio >= 1 {
+		prefetchThresholdRatio = 0.25
 	}
 
-	lifeSpan := expireTime.Sub(storedTime)
-	remainTtl := time.Until(expireTime)
-	prefetchTtl := time.Duration(r.opt.Cache.PrefetchThreshold * float32(lifeSpan))
-	return remainTtl < prefetchTtl
+	initTtl := t.ExpireAtUnix - t.StoredAtUnix
+	remainTtl := t.ExpireAtUnix - time.Now().Unix() // Note: maybe negative
+	prefetchThresholdTtl := int64(r.opt.Cache.PrefetchThreshold * float32(initTtl))
+	return remainTtl < prefetchThresholdTtl
 }
 
 type cacheCtl struct {
-	logger     *zerolog.Logger
-	minimumTtl time.Duration      // Always valid. Has default value.
-	maximumTtl time.Duration      // Always valid. Has default value.
-	memory     *cache.MemoryCache // Maybe nil
-	redis      *cache.RedisCache  // Maybe nil
+	logger        *zerolog.Logger
+	minimumTtl    int // Always valid. Has default value.
+	maximumTtl    int // Always valid. Has default value.
+	optimisticTtl int
+	memory        *cache.MemoryCache // Maybe nil
+	redis         *cache.RedisCache  // Maybe nil
 }
 
 // Store resp into cache.
@@ -132,49 +134,50 @@ func (c *cacheCtl) Store(key []byte, q *QueryCtx) {
 	}
 
 	u, hasRr := dnsutils.GetMinimalTTL(resp)
-	msgRrMinTtl := time.Duration(u) * time.Second
-
-	var ttl time.Duration
+	msgRrMinTtl := int(u)
+	var msgTtl int
+	var applyOptimistic bool
 	switch resp.Header.RCode {
 	case dnsmsg.RCodeNameError: // NXDOMAIN, cache for 30s
-		const defaultTtl = time.Second * 30
+		const defaultTtl = 30
 		if hasRr {
-			ttl = min(defaultTtl, msgRrMinTtl)
+			msgTtl = min(defaultTtl, msgRrMinTtl)
 		} else {
-			ttl = defaultTtl
+			msgTtl = defaultTtl
 		}
-	case dnsmsg.RCodeServerFailure: // SERVFAIL, cache for 1s
-		const defaultTtl = time.Second * 1
+	case dnsmsg.RCodeServerFailure: // SERVFAIL, cache for 3s
+		const defaultTtl = 3
 		if hasRr {
-			ttl = min(defaultTtl, msgRrMinTtl)
+			msgTtl = min(defaultTtl, msgRrMinTtl)
 		} else {
-			ttl = defaultTtl
+			msgTtl = defaultTtl
 		}
 	case dnsmsg.RCodeSuccess:
-		const defaultTtl = time.Second * 30
+		const defaultTtl = 30
 		if hasRr {
-			ttl = msgRrMinTtl
+			msgTtl = msgRrMinTtl
+			applyOptimistic = true
 		} else {
 			// SUCCESS, but no record, cache for 30s
 			// TODO: Use minttl from SOA record.
-			ttl = defaultTtl
+			msgTtl = defaultTtl
 		}
 	default: // Other rcode. cache for 5s
-		const defaultTtl = time.Second * 5
+		const defaultTtl = 5
 		if hasRr {
-			ttl = min(defaultTtl, msgRrMinTtl)
+			msgTtl = min(defaultTtl, msgRrMinTtl)
 		} else {
-			ttl = defaultTtl
+			msgTtl = defaultTtl
 		}
 	}
 
-	// Minimum ttl is 1.
-	if ttl <= 0 {
-		ttl = time.Second
+	// Apply minimum.
+	if msgTtl < c.minimumTtl {
+		msgTtl = c.minimumTtl
 	}
 	// Apply maximum.
-	if ttl > c.maximumTtl {
-		ttl = c.maximumTtl
+	if msgTtl > c.maximumTtl {
+		msgTtl = c.maximumTtl
 	}
 
 	v, err := packCacheMsg(resp)
@@ -185,29 +188,39 @@ func (c *cacheCtl) Store(key []byte, q *QueryCtx) {
 	defer pool.ReleaseBuf(v)
 
 	now := time.Now()
-	storedTime := now
-	expireTime := now.Add(ttl)
+
+	storedTime := now.Unix()
+	expireTime := storedTime + int64(msgTtl)
+	cacheExpireTime := expireTime
+	if c.optimisticTtl > 0 && applyOptimistic {
+		cacheExpireTime += int64(c.optimisticTtl)
+	}
+	t := cache.Times{
+		StoredAtUnix:      storedTime,
+		ExpireAtUnix:      expireTime,
+		CacheExpireAtUnix: cacheExpireTime,
+	}
 
 	e := c.logger.Debug()
 	if e != nil {
-		e.Dict("query", q.LogBasic()).
-			Str("mark", q.ECSZone).
-			Uint16("rcode", uint16(resp.RCode)).
-			Int("ttl", int(ttl.Seconds())).
-			Int("size", len(v)).
-			Msg("store resp")
+		e.Dict("query", q.LogQuery())
+		e.Uint16("rcode", uint16(resp.RCode))
+		e.Int("ttl", msgTtl)
+		e.Int("cache_ttl", msgTtl+c.optimisticTtl)
+		e.Int("size", len(v))
+		e.Msg("store resp")
 	}
 
 	negativeResp := resp.RCode != dnsmsg.RCodeSuccess
 
 	// store in memory
 	if c.memory != nil {
-		c.memory.Store(key, storedTime, expireTime, v, negativeResp)
+		c.memory.Store(key, v, t, negativeResp)
 	}
 
 	// store in redis
 	if c.redis != nil {
-		c.redis.Store(key, storedTime, expireTime, v, negativeResp)
+		c.redis.Store(key, v, t, negativeResp)
 	}
 }
 
@@ -226,49 +239,47 @@ func (c *cacheCtl) Key(q *QueryCtx) pool.Buffer {
 // If cache hit, Get will return a resp (not shared). It is the caller's
 // responsibility to release the reap. TTLs of the reap are properly subtracted.
 // Non-blocking func.
-func (c *cacheCtl) GetMemoryCache(key []byte) (_ *dnsmsg.Msg, storedTime, expireTime time.Time) {
+func (c *cacheCtl) GetMemoryCache(key []byte) (*dnsmsg.Msg, cache.Times) {
 	if c.memory == nil {
-		return
+		return nil, cache.Times{}
 	}
-	v, storedTime, expireTime := c.memory.Get(key)
+	v, t := c.memory.Get(key)
 	if v != nil {
 		m, err := unpackCacheMsg(v)
-		pool.ReleaseBuf(v)
 		if err != nil {
 			c.logger.Err(err).Msg("invalid cache data in memory")
 			// TODO: Remove the invalid data here?
-			return nil, time.Time{}, time.Time{}
+			return nil, cache.Times{}
 		}
-		dnsutils.SubtractTTL(m, uint32(time.Since(storedTime).Seconds()))
-		return m, storedTime, expireTime
+		dnsutils.SubtractTTL(m, uint32(time.Now().Unix()-t.StoredAtUnix))
+		return m, t
 	}
-	return nil, time.Time{}, time.Time{}
+	return nil, cache.Times{}
 }
 
 // If cache hit, Get will return a resp (not shared). It is the caller's
 // responsibility to release the reap. TTLs of the reap are properly subtracted.
 // It will also save a copy to memory cache if it is enabled.
-// Blocking func.
-func (c *cacheCtl) GetRedisCache(ctx context.Context, key []byte) (_ *dnsmsg.Msg, storedTime, expireTime time.Time) {
+func (c *cacheCtl) GetRedisCache(ctx context.Context, key []byte) (*dnsmsg.Msg, cache.Times) {
 	if c.redis == nil {
-		return
+		return nil, cache.Times{}
 	}
 
-	storedTime, expireTime, v := c.redis.Get(ctx, key)
-	if v != nil { // hit
+	v, t := c.redis.Get(ctx, key)
+	if len(v) > 0 { // hit
 		m, err := unpackCacheMsg(v)
 		if err != nil {
 			c.logger.Err(err).Msg("invalid cache data in redis")
 			// TODO: Remove the invalid data here?
-			return nil, time.Time{}, time.Time{}
+			return nil, cache.Times{}
 		}
 		if c.memory != nil { // put v into memory cache
-			c.memory.Store(key, storedTime, expireTime, v, true)
+			c.memory.Store(key, v, t, true)
 		}
-		dnsutils.SubtractTTL(m, uint32(time.Since(storedTime).Seconds()))
-		return m, storedTime, expireTime
+		dnsutils.SubtractTTL(m, uint32(time.Now().Unix()-t.StoredAtUnix))
+		return m, t
 	}
-	return nil, time.Time{}, time.Time{}
+	return nil, cache.Times{}
 }
 
 // Always returns nil.

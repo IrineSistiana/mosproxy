@@ -12,9 +12,9 @@ require (
 	github.com/miekg/dns v1.1.62
 	github.com/mitchellh/mapstructure v1.5.0
 	github.com/panjf2000/gnet/v2 v2.5.7
-	github.com/prometheus/client_golang v1.20.3
+	github.com/prometheus/client_golang v1.20.4
 	github.com/quic-go/quic-go v0.47.0
-	github.com/redis/rueidis v1.0.45
+	github.com/redis/rueidis v1.0.46
 	github.com/rs/zerolog v1.33.0
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.9.0

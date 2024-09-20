@@ -324,14 +324,14 @@ func (r *Router) asyncSingleFlightPrefetch(key []byte, q *QueryCtx, u *upstreamW
 func (r *Router) doPrefetch(key []byte, q *QueryCtx, u *upstreamWrapper) {
 	e := r.logger.Debug()
 	if e != nil {
-		e.Dict("query", q.LogBasic()).Str("upstream", u.tag).Msg("prefetching cache")
+		e.Dict("query", q.LogQuery()).Str("upstream", u.tag).Msg("prefetching cache")
 	}
 
 	ctx, cancel := context.WithTimeout(r.ctx, prefetchTimeout)
 	defer cancel()
 	err := r.forward(ctx, q, u)
 	if err != nil {
-		r.logger.Warn().Dict("query", q.LogBasic()).Str("upstream", u.tag).Err(err).
+		r.logger.Warn().Dict("query", q.LogQuery()).Str("upstream", u.tag).Err(err).
 			Msg("failed to prefetch")
 		return
 	}

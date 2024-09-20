@@ -97,9 +97,9 @@ func (r *Router) builtInHandler(q *QueryCtx) {
 	defer pool.ReleaseBuf(cacheKey)
 
 	// lookup mem cache
-	resp, storedTime, expireTime := r.cache.GetMemoryCache(cacheKey)
+	resp, t := r.cache.GetMemoryCache(cacheKey)
 	if resp != nil { // mem cache hit
-		if r.needPrefetch(storedTime, expireTime) {
+		if r.needPrefetch(t) {
 			r.asyncSingleFlightPrefetch(cacheKey, q, upstream)
 		}
 		r.queryCacheHitTotal.Inc()
@@ -112,9 +112,9 @@ func (r *Router) builtInHandler(q *QueryCtx) {
 	defer cancel()
 
 	// lookup redis cache
-	resp, storedTime, expireTime = r.cache.GetRedisCache(ctx, cacheKey)
+	resp, t = r.cache.GetRedisCache(ctx, cacheKey)
 	if resp != nil {
-		if r.needPrefetch(storedTime, expireTime) {
+		if r.needPrefetch(t) {
 			r.asyncSingleFlightPrefetch(cacheKey, q, upstream)
 		}
 		r.queryCacheHitTotal.Inc()

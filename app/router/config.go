@@ -110,6 +110,7 @@ type CacheConfig struct {
 	Redis             string  `yaml:"redis"`
 	MinimumTTL        int     `yaml:"minimum_ttl"`
 	MaximumTTL        int     `yaml:"maximum_ttl"`
+	OptimisticTTL     int     `yaml:"optimistic_ttl"`
 	PrefetchThreshold float32 `yaml:"prefetch_threshold"`
 }
 
