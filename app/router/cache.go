@@ -18,7 +18,6 @@ import (
 )
 
 const (
-	defaultMinCacheTtl = 5
 	defaultMaxCacheTtl = 60 * 10 // 10 min
 	prefetchTimeout    = time.Second * 6
 )
@@ -26,10 +25,6 @@ const (
 func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 	c := new(cacheCtl)
 	c.logger = r.subLogger("cache")
-	c.minimumTtl = cfg.MinimumTTL
-	if c.minimumTtl <= 0 {
-		c.minimumTtl = defaultMinCacheTtl
-	}
 	c.maximumTtl = cfg.MaximumTTL
 	if c.maximumTtl <= 0 {
 		c.maximumTtl = defaultMaxCacheTtl
@@ -115,7 +110,6 @@ func (r *Router) needPrefetch(t cache.Times) bool {
 
 type cacheCtl struct {
 	logger        *zerolog.Logger
-	minimumTtl    int // Always valid. Has default value.
 	maximumTtl    int // Always valid. Has default value.
 	optimisticTtl int
 	memory        *cache.MemoryCache // Maybe nil
@@ -171,9 +165,8 @@ func (c *cacheCtl) Store(key []byte, q *QueryCtx) {
 		}
 	}
 
-	// Apply minimum.
-	if msgTtl < c.minimumTtl {
-		msgTtl = c.minimumTtl
+	if msgTtl < 1 {
+		msgTtl = 1
 	}
 	// Apply maximum.
 	if msgTtl > c.maximumTtl {
