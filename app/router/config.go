@@ -99,6 +99,7 @@ type LoadBalancerConfig struct {
 type LoadBalancerBackendConfig struct {
 	Tag    string `yaml:"tag"`
 	Weight int    `yaml:"weight"`
+	QPS    int    `yaml:"qps"`
 }
 
 type HealthCheckConfig struct {

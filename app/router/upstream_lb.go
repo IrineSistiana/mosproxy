@@ -12,13 +12,14 @@ import (
 	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/cespare/xxhash/v2"
 	"github.com/rs/zerolog"
+	"golang.org/x/time/rate"
 )
 
 type LoadBalancer struct {
 	tag      string
 	logger   *zerolog.Logger
 	e        []*lbBackend
-	simpleFn func(s *lbSampler, q *QueryCtx) *UpstreamWrapper
+	simpleFn func(s *lbSampler, q *QueryCtx) *lbBackend // simple from sampler, may return nil if no backend is available
 
 	idxM    sync.Mutex
 	sampler atomic.Pointer[lbSampler]
@@ -35,16 +36,27 @@ func (r *Router) initLoadBalancer(cfg *LoadBalancerConfig) error {
 
 	switch cfg.Method {
 	case "", "random":
-		lb.simpleFn = func(s *lbSampler, q *QueryCtx) *UpstreamWrapper {
+		lb.simpleFn = func(s *lbSampler, q *QueryCtx) *lbBackend {
 			return s.simple(rand.Int())
 		}
+	case "fall_through":
+		lb.simpleFn = func(s *lbSampler, q *QueryCtx) *lbBackend {
+			for _, b := range s.bs {
+				if b.rateLimiter == nil {
+					return b
+				} else if b.rateLimiter.Allow() {
+					return b
+				}
+			}
+			return nil
+		}
 	case "qname_hash":
-		lb.simpleFn = func(s *lbSampler, q *QueryCtx) *UpstreamWrapper {
+		lb.simpleFn = func(s *lbSampler, q *QueryCtx) *lbBackend {
 			h := xxhash.Sum64(q.Question.Name.Data())
 			return s.simple(int(h))
 		}
 	case "client_ip_hash":
-		lb.simpleFn = func(s *lbSampler, q *QueryCtx) *UpstreamWrapper {
+		lb.simpleFn = func(s *lbSampler, q *QueryCtx) *lbBackend {
 			if q.RemoteAddr.IsValid() {
 				b := q.RemoteAddr.Addr().As16()
 				h := xxhash.Sum64(b[:])
@@ -80,7 +92,7 @@ func (r *Router) initLoadBalancerBackends(lb *LoadBalancer, backends []LoadBalan
 
 func (lb *LoadBalancer) buildIdx() {
 	s := &lbSampler{
-		us: make([]*UpstreamWrapper, 0, len(lb.e)),
+		bs: make([]*lbBackend, 0, len(lb.e)),
 		wa: make([]int, 0, len(lb.e)),
 	}
 	offline := make([]string, 0, len(lb.e))
@@ -93,15 +105,15 @@ func (lb *LoadBalancer) buildIdx() {
 			continue
 		}
 		ws += b.weight
-		s.us = append(s.us, b.u)
+		s.bs = append(s.bs, b)
 		s.wa = append(s.wa, ws)
 	}
 	lb.sampler.Store(s)
 	lb.idxM.Unlock()
 
-	online := make([]string, 0, len(s.us))
-	for _, u := range s.us {
-		online = append(online, u.Tag())
+	online := make([]string, 0, len(s.bs))
+	for _, b := range s.bs {
+		online = append(online, b.u.Tag())
 	}
 	lb.logger.Info().
 		Strs("online", online).
@@ -113,14 +125,18 @@ func (lb *LoadBalancer) Tag() string { return lb.tag }
 
 func (lb *LoadBalancer) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
 	s := lb.sampler.Load()
-	u, zero := s.fastPath()
+	b, zero := s.fastPath()
 	if zero {
 		return nil, errors.New("all backends are offline")
 	}
-	if u == nil {
-		u = lb.simpleFn(s, q)
+	if b == nil {
+		b = lb.simpleFn(s, q)
+	}
+	if b == nil {
+		return nil, errors.New("no backend available")
 	}
 
+	u := b.u
 	q.Trace.Upstream = u.Tag()
 	resp, err := u.Exchange(ctx, q, m)
 	if err != nil {
@@ -141,27 +157,27 @@ func (lb *LoadBalancer) close() {
 
 type lbSampler struct {
 	wa []int
-	us []*UpstreamWrapper
+	bs []*lbBackend
 }
 
-func (s *lbSampler) fastPath() (one *UpstreamWrapper, zero bool) {
-	if len(s.us) == 0 {
+func (s *lbSampler) fastPath() (one *lbBackend, zero bool) {
+	if len(s.bs) == 0 {
 		return nil, true
 	}
-	if len(s.us) == 1 {
-		return s.us[0], false
+	if len(s.bs) == 1 {
+		return s.bs[0], false
 	}
 	return nil, false
 }
 
 // return nil if no element in s.
-func (s *lbSampler) simple(n int) *UpstreamWrapper {
+func (s *lbSampler) simple(n int) *lbBackend {
 	l := len(s.wa)
 	if l == 0 {
 		return nil
 	}
 	if l == 1 {
-		return s.us[0]
+		return s.bs[0]
 	}
 
 	r := s.wa[l-1]
@@ -174,12 +190,13 @@ func (s *lbSampler) simple(n int) *UpstreamWrapper {
 		i++
 	}
 	i = min(i, l-1)
-	return s.us[i]
+	return s.bs[i]
 }
 
 type lbBackend struct {
-	u      *UpstreamWrapper
-	weight int // not zero
+	u           *UpstreamWrapper
+	weight      int           // not zero
+	rateLimiter *rate.Limiter // nil if not configured
 }
 
 func (r *Router) initLbBackend(lb *LoadBalancer, cfg LoadBalancerBackendConfig) error {
@@ -193,6 +210,9 @@ func (r *Router) initLbBackend(lb *LoadBalancer, cfg LoadBalancerBackendConfig) 
 	lbb := &lbBackend{
 		u:      u,
 		weight: defaultIfELZero(cfg.Weight, 1),
+	}
+	if cfg.QPS > 0 {
+		lbb.rateLimiter = rate.NewLimiter(rate.Limit(cfg.QPS), cfg.QPS)
 	}
 	u.regLb(lb)
 	lb.e = append(lb.e, lbb)
