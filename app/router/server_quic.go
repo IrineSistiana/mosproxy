@@ -79,7 +79,7 @@ func (r *Router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 		defer l.Close()
 		err := s.run()
 		if !errors.Is(err, errServerClosed) {
-			r.fatal("quic server exited", err)
+			r.Close(fmt.Errorf("quic server exited, %w", err))
 		}
 	}()
 	return s, nil
@@ -160,7 +160,7 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection) {
 	defer ReleaseQueryCtx(q)
 
 	var respBuf pool.Buffer
-	if ok := q.parseQuery(m); !ok {
+	if ok := parseQuery(q, m); !ok {
 		resp := makeEmptyRespM(m, dnsmsg.RCodeRefused)
 		respBuf = serverFinalRespB(m, resp, true, 0)
 		dnsmsg.ReleaseMsg(resp)
@@ -172,7 +172,7 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection) {
 	q.RemoteAddr = netAddr2NetipAddr(c.RemoteAddr())
 	q.ServerName = append(q.ServerName, c.ConnectionState().TLS.ServerName...)
 
-	s.r.handleQuery(q)
+	s.r.serverEntryHandler(q)
 	respBuf = serverFinalRespB(m, q.Resp, true, 0)
 
 sendResp:

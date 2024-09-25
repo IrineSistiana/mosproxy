@@ -197,7 +197,7 @@ var initBenchServerOnce = sync.OnceFunc(func() {
 		},
 	}
 
-	_, err := Run(context.Background(), cfg)
+	_, err := Run(cfg)
 	if err != nil {
 		panic(fmt.Sprintf("failed to start server, %s", err))
 	}

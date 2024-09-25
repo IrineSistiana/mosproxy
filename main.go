@@ -3,6 +3,7 @@ package main
 import (
 	"github.com/IrineSistiana/mosproxy/app"
 	_ "github.com/IrineSistiana/mosproxy/app/router"
+	_ "github.com/IrineSistiana/mosproxy/app/router/middleware"
 )
 
 var (

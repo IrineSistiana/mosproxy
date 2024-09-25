@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
+	"golang.org/x/exp/constraints"
 )
 
 func addOrReplaceOpt(m *dnsmsg.Msg, udpSize uint16) {
@@ -32,4 +33,12 @@ func ctxDone(ctx context.Context) bool {
 	default:
 		return false
 	}
+}
+
+func defaultIfELZero[T constraints.Ordered](in T, v T) T {
+	var zero T
+	if in <= zero {
+		return v
+	}
+	return in
 }

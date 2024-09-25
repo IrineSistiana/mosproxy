@@ -65,7 +65,7 @@ func (r *Router) startTcpServer(cfg *ServerConfig, useTls bool) (*tcpServer, err
 		defer l.Close()
 		err := s.run()
 		if !errors.Is(err, errServerClosed) {
-			s.r.fatal("tcp server exited", err)
+			s.r.Close(fmt.Errorf("tcp server exited, %w", err))
 		}
 	}()
 	return s, nil
@@ -164,7 +164,7 @@ func (s *tcpServer) handleMsg(c net.Conn, m *dnsmsg.Msg) {
 	defer ReleaseQueryCtx(q)
 
 	var respBuf pool.Buffer
-	if ok := q.parseQuery(m); !ok {
+	if ok := parseQuery(q, m); !ok {
 		resp := makeEmptyRespM(m, dnsmsg.RCodeRefused)
 		respBuf = serverFinalRespB(m, resp, true, 0)
 		dnsmsg.ReleaseMsg(resp)
@@ -180,7 +180,7 @@ func (s *tcpServer) handleMsg(c net.Conn, m *dnsmsg.Msg) {
 	} else {
 		q.Protocol = ProtoTCP
 	}
-	s.r.handleQuery(q)
+	s.r.serverEntryHandler(q)
 	respBuf = serverFinalRespB(m, q.Resp, true, 0)
 
 sendResp:

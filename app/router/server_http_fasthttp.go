@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/netip"
@@ -65,7 +66,7 @@ func (r *Router) startFastHttpServer(cfg *ServerConfig) (*fastHttpServer, error)
 		err := s.serve()
 		if err != nil {
 			if !errors.Is(err, errServerClosed) {
-				r.fatal("fasthttp server exited", err)
+				r.Close(fmt.Errorf("fasthttp server exited, %w", err))
 			}
 		}
 	}()
@@ -182,7 +183,7 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 	defer ReleaseQueryCtx(q)
 
 	var respBuf pool.Buffer
-	if ok := q.parseQuery(m); !ok {
+	if ok := parseQuery(q, m); !ok {
 		resp := makeEmptyRespM(m, dnsmsg.RCodeRefused)
 		respBuf = serverFinalRespB(m, resp, true, 0)
 		dnsmsg.ReleaseMsg(resp)
@@ -198,7 +199,7 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 		q.Host = append(q.Host, ctx.Host()...)
 		q.Path = append(q.Path, ctx.Path()...)
 
-		h.r.handleQuery(q)
+		h.r.serverEntryHandler(q)
 		respBuf = serverFinalRespB(m, q.Resp, false, udpSize)
 	}
 

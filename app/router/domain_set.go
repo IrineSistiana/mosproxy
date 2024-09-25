@@ -47,23 +47,3 @@ func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
 	r.domainSets[cfg.Tag] = l
 	return nil
 }
-
-func loadDomainSets(fs []string) (*domainmatcher.Matcher, error) {
-	loader := domainmatcher.NewLoader()
-	for _, fp := range fs {
-		f, err := os.Open(fp)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open domain file %s, %w", fp, err)
-		}
-		err = loader.LoadRulesFromReader(f)
-		f.Close()
-		if err != nil {
-			return nil, fmt.Errorf("failed to load data from file %s, %w", fp, err)
-		}
-	}
-	m, err := loader.Compile()
-	if err != nil {
-		return nil, fmt.Errorf("failed to compile data set, %w", err)
-	}
-	return m, nil
-}

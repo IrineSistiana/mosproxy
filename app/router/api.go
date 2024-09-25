@@ -2,6 +2,7 @@ package router
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"time"
@@ -55,7 +56,7 @@ func (r *Router) initApiServer(cfg *APIConfig) error {
 	go func() {
 		err := s.Serve(l)
 		if !errors.Is(err, http.ErrServerClosed) {
-			r.fatal("api endpoint exited", err)
+			r.Close(fmt.Errorf("api endpoint exited, %w", err))
 		}
 	}()
 	return nil

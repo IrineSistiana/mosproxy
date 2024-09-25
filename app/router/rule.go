@@ -11,7 +11,7 @@ type rule struct {
 	reverse  bool
 	matcher  *loader.Loader[[]string, domainmatcher.Matcher]
 	reject   uint16
-	upstream *upstreamWrapper // maybe nil
+	upstream Upstream // maybe nil
 }
 
 func (r *Router) loadRule(cfg *RuleConfig) (*rule, error) {
@@ -28,11 +28,17 @@ func (r *Router) loadRule(cfg *RuleConfig) (*rule, error) {
 	ru.reject = cfg.Reject
 
 	if len(cfg.Forward) > 0 {
-		u := r.upstreams[cfg.Forward]
-		if u == nil {
-			return nil, fmt.Errorf("cannot find upstream [%s]", cfg.Forward)
+		uw := r.upstreams[cfg.Forward]
+		if uw != nil {
+			ru.upstream = uw
+		} else {
+			lb := r.loadBalancers[cfg.Forward]
+			if lb != nil {
+				ru.upstream = lb
+			} else {
+				return nil, fmt.Errorf("unknown forward target [%s]", cfg.Forward)
+			}
 		}
-		ru.upstream = u
 	}
 	return ru, nil
 }

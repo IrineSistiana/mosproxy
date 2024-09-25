@@ -32,8 +32,16 @@ func (r *Router) loadEcsZone(f string) error {
 	return nil
 }
 
-func (r *Router) loadZoneEcs(f string) error {
-	loadFn := func(args string) (*map[string]netip.Prefix, error) {
+type ECSZoneOverWrite struct {
+	m map[string]netip.Prefix
+}
+
+func (ezo *ECSZoneOverWrite) Get(z string) netip.Prefix {
+	return ezo.m[z]
+}
+
+func (r *Router) loadEcsZoneOverwrite(f string) error {
+	loadFn := func(args string) (*ECSZoneOverWrite, error) {
 		f, err := os.Open(args)
 		if err != nil {
 			return nil, err
@@ -44,10 +52,10 @@ func (r *Router) loadZoneEcs(f string) error {
 			return nil, err
 		}
 		r.logger.Info().Str("file", args).Int("len", len(m)).Msg("zone ecs data loaded")
-		return &m, nil
+		return &ECSZoneOverWrite{m: m}, nil
 	}
 
-	l := loader.NewLoader[string, map[string]netip.Prefix](f, loadFn, nil)
+	l := loader.NewLoader[string, ECSZoneOverWrite](f, loadFn, nil)
 	err := l.LoadAndStage()
 	if err != nil {
 		return err

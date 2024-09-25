@@ -10,8 +10,9 @@ import (
 )
 
 type Config struct {
-	Servers   []ServerConfig   `yaml:"servers"`
-	Upstreams []UpstreamConfig `yaml:"upstreams"`
+	Servers       []ServerConfig       `yaml:"servers"`
+	Upstreams     []UpstreamConfig     `yaml:"upstreams"`
+	LoadBalancers []LoadBalancerConfig `yaml:"load_balancers"`
 
 	DomainSets []DomainSetConfig `yaml:"domain_sets"`
 	Rules      []RuleConfig      `yaml:"rules"`
@@ -22,6 +23,8 @@ type Config struct {
 	Cache CacheConfig `yaml:"cache"`
 	ECS   ECSConfig   `yaml:"ecs"`
 	API   APIConfig   `yaml:"api"`
+
+	Middleware []map[string]any `yaml:"middleware"`
 }
 
 type ServerConfig struct {
@@ -79,11 +82,28 @@ type SocketConfig struct {
 }
 
 type UpstreamConfig struct {
-	Tag      string       `yaml:"tag"`
-	Addr     string       `yaml:"addr"`
-	DialAddr string       `yaml:"dial_addr"`
-	Tls      TlsConfig    `yaml:"tls"`
-	Socket   SocketConfig `yaml:"socket"`
+	Tag         string            `yaml:"tag"`
+	Addr        string            `yaml:"addr"`
+	DialAddr    string            `yaml:"dial_addr"`
+	Tls         TlsConfig         `yaml:"tls"`
+	Socket      SocketConfig      `yaml:"socket"`
+	HealthCheck HealthCheckConfig `yaml:"health_check"`
+}
+
+type LoadBalancerConfig struct {
+	Tag      string                      `yaml:"tag"`
+	Method   string                      `yaml:"method"`
+	Backends []LoadBalancerBackendConfig `yaml:"backends"`
+}
+
+type LoadBalancerBackendConfig struct {
+	Tag    string `yaml:"tag"`
+	Weight int    `yaml:"weight"`
+}
+
+type HealthCheckConfig struct {
+	MaxFails int `yaml:"max_fails"`
+	Interval int `yaml:"interval"`
 }
 
 type DomainSetConfig struct {

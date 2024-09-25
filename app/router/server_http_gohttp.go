@@ -78,7 +78,7 @@ func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 			err = hs.Serve(l)
 		}
 		if !errors.Is(err, http.ErrServerClosed) {
-			r.fatal("http server exited", err)
+			r.Close(fmt.Errorf("http server exited, %w", err))
 		}
 	}()
 	return hs, nil
@@ -146,7 +146,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer ReleaseQueryCtx(q)
 
 	var respBuf pool.Buffer
-	if ok := q.parseQuery(m); !ok {
+	if ok := parseQuery(q, m); !ok {
 		resp := makeEmptyRespM(m, dnsmsg.RCodeRefused)
 		respBuf = serverFinalRespB(m, resp, true, 0)
 		dnsmsg.ReleaseMsg(resp)
@@ -162,7 +162,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		q.Host = append(q.Host, req.Host...)
 		q.Path = append(q.Path, req.URL.Path...)
 
-		h.r.handleQuery(q)
+		h.r.serverEntryHandler(q)
 		respBuf = serverFinalRespB(m, q.Resp, false, udpSize)
 	}
 

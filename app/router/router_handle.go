@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 
 	"github.com/IrineSistiana/mosproxy/internal/pool"
@@ -9,7 +10,7 @@ import (
 )
 
 // always set q.Resp
-func (r *Router) handleQuery(q *QueryCtx) {
+func (r *Router) serverEntryHandler(q *QueryCtx) {
 	// Set info about ECS
 	// Priority: client addr < forward client ecs < overwrite
 	if r.opt.ECS.Enabled {
@@ -37,30 +38,30 @@ func (r *Router) handleQuery(q *QueryCtx) {
 		if r.ecsZoneOverwrite != nil {
 			m := r.ecsZoneOverwrite.V()
 			if m != nil {
-				addr, ok := (*m)[q.ECSZone]
-				if ok {
+				addr := m.Get(q.ECSZone)
+				if addr.IsValid() {
 					q.ECS2Upstream = addr
 				}
 			}
 		}
 	}
 
-	mw := middleware.Load()
-	if mw != nil {
-		(*mw).Handle(q, r.builtInHandler)
-		if q.Resp == nil { // misbehaved
-			panic("middleware returned a nil resp")
-		}
+	if len(r.middlewares) > 0 {
+		r.middlewares[0].Handle(q)
 	} else {
-		r.builtInHandler(q)
+		r.BuiltInHandler(q)
 	}
 
+	if q.Resp == nil {
+		SetEmptyRespMQ(q, dnsmsg.RCodeRefused)
+	}
 	if r.opt.Log.Queries {
 		r.logAccess(q)
 	}
 }
 
-func (r *Router) builtInHandler(q *QueryCtx) {
+// router main handle func.
+func (r *Router) BuiltInHandler(q *QueryCtx) {
 	// Match rules
 	var matchedRule *rule
 	for i, rule := range r.rules {
@@ -80,42 +81,30 @@ func (r *Router) builtInHandler(q *QueryCtx) {
 	}
 
 	if matchedRule == nil {
-		setEmptyRespMQ(q, dnsmsg.RCodeRefused)
+		SetEmptyRespMQ(q, dnsmsg.RCodeRefused)
 		return
 	}
 	if rejectRCode := matchedRule.reject; rejectRCode > 0 {
-		setEmptyRespMQ(q, dnsmsg.RCode(rejectRCode))
-		return
-	}
-	if matchedRule.upstream == nil {
-		setEmptyRespMQ(q, dnsmsg.RCodeRefused)
+		SetEmptyRespMQ(q, dnsmsg.RCode(rejectRCode))
 		return
 	}
 	upstream := matchedRule.upstream
-
-	cacheKey := r.cache.Key(q)
-	defer pool.ReleaseBuf(cacheKey)
-
-	// lookup mem cache
-	resp, t := r.cache.GetMemoryCache(cacheKey)
-	if resp != nil { // mem cache hit
-		if r.needPrefetch(t) {
-			r.asyncSingleFlightPrefetch(cacheKey, q, upstream)
-		}
-		r.queryCacheHitTotal.Inc()
-		q.Resp = resp
-		q.Trace.Cached = true
+	if upstream == nil {
+		SetEmptyRespMQ(q, dnsmsg.RCodeRefused)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.ctx, queryTimeout)
 	defer cancel()
 
-	// lookup redis cache
-	resp, t = r.cache.GetRedisCache(ctx, cacheKey)
+	cacheKey := r.cache.Key(q)
+	defer pool.ReleaseBuf(cacheKey)
+
+	// lookup cache
+	resp, t := r.cache.Get(ctx, cacheKey)
 	if resp != nil {
 		if r.needPrefetch(t) {
-			r.asyncSingleFlightPrefetch(cacheKey, q, upstream)
+			r.AsyncSingleFlightPrefetch(cacheKey, q, upstream)
 		}
 		r.queryCacheHitTotal.Inc()
 		q.Resp = resp
@@ -124,20 +113,75 @@ func (r *Router) builtInHandler(q *QueryCtx) {
 	}
 
 	if ctxDone(ctx) { // check if redis server timed out
-		setEmptyRespMQ(q, dnsmsg.RCodeServerFailure)
+		SetEmptyRespMQ(q, dnsmsg.RCodeServerFailure)
 		return
 	}
 
 	err := r.forward(ctx, q, upstream)
 	if err != nil {
-		r.logger.Warn().
-			Str("upstream", upstream.tag).
-			Err(err).
-			Msg("failed to forward query")
-		setEmptyRespMQ(q, dnsmsg.RCodeServerFailure)
+		SetEmptyRespMQ(q, dnsmsg.RCodeServerFailure)
 		return
 	}
-	q.Trace.UpstreamTag = upstream.tag
 
 	r.cache.Store(cacheKey, q)
+}
+
+// Prefetching q in other goroutine. If key is currently prefetching, do nothing.
+func (r *Router) AsyncSingleFlightPrefetch(key []byte, q *QueryCtx, u Upstream) {
+	if ok := r.prefetchSf.Reserve(key); !ok {
+		return
+	}
+	keyCopy := pool.CopyBuf(key)
+	qCopy := q.Copy()
+	go func() {
+		defer pool.ReleaseBuf(keyCopy)
+		defer ReleaseQueryCtx(qCopy)
+		defer r.prefetchSf.Done(keyCopy)
+		r.DoPrefetch(keyCopy, qCopy, u)
+	}()
+}
+
+// Send q to u, and save response using key.
+func (r *Router) DoPrefetch(key []byte, q *QueryCtx, u Upstream) {
+	q.Prefetch = true
+	ctx, cancel := context.WithTimeout(r.ctx, prefetchTimeout)
+	defer cancel()
+	err := r.forward(ctx, q, u)
+	if err != nil {
+		return
+	}
+	r.prefetchTotal.Inc()
+	r.cache.Store(key, q)
+}
+
+// forward query to upstream and set the response.
+// Will remove edns0 from resp.
+func (r *Router) forward(ctx context.Context, q *QueryCtx, upstream Upstream) error {
+	m := r.MakeQueryMsg(q)
+	defer dnsmsg.ReleaseMsg(m)
+
+	resp, err := upstream.Exchange(ctx, q, m)
+	if err != nil {
+		return fmt.Errorf("failed to exchange, %w", err)
+	}
+	dnsmsg.RemoveEDNS0(resp)
+	q.Resp = resp
+	return nil
+}
+
+// Make a dns msg from q, according to r's settings.
+func (r *Router) MakeQueryMsg(q *QueryCtx) *dnsmsg.Msg {
+	m := dnsmsg.NewMsg()
+	m.Header.RecursionDesired = true
+	m.Questions = append(m.Questions, q.Question.Copy())
+
+	opt := newEDNS0(udpSize)
+	if ecs := q.ECS2Upstream; ecs.IsValid() {
+		addr := ecs.Addr()
+		if !addr.IsPrivate() && addr.IsGlobalUnicast() {
+			opt.Data = makeEdns0ClientSubnetReqOpt(ecs)
+		}
+	}
+	m.Additionals = append(m.Additionals, opt)
+	return m
 }

@@ -207,7 +207,7 @@ func (ct *connTracker[T]) Closed() bool {
 	return ct.closed
 }
 
-func (q *QueryCtx) parseQuery(m *dnsmsg.Msg) bool {
+func parseQuery(q *QueryCtx, m *dnsmsg.Msg) bool {
 	// header
 	notImpl := m.Response ||
 		!m.RecursionDesired ||
@@ -237,4 +237,14 @@ func hasEDNS0(m *dnsmsg.Msg) bool {
 		}
 	}
 	return false
+}
+
+func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
+	resp := dnsmsg.NewMsg()
+	resp.RCode = rcode
+	for _, q := range m.Questions {
+		resp.Questions = append(resp.Questions, q.Copy())
+		break // only return one question. Avoid malicious queries.
+	}
+	return resp
 }

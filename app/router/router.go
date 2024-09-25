@@ -3,7 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
-	"net/netip"
+	"io"
 	"os"
 	"os/signal"
 	"runtime"
@@ -17,8 +17,6 @@ import (
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
 	"github.com/IrineSistiana/mosproxy/internal/ipmarker"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
-	"github.com/IrineSistiana/mosproxy/internal/pool"
-	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 	"github.com/mitchellh/mapstructure"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
@@ -66,7 +64,7 @@ func newRouterCmd() *cobra.Command {
 			}
 			logger.Info().Str("file", cfgPath).Msg("config file loaded")
 
-			r, err := Run(cmd.Context(), cfg)
+			r, err := Run(cfg)
 			if err != nil {
 				logger.Fatal().Err(err).Msg("failed to start router")
 			}
@@ -74,19 +72,20 @@ func newRouterCmd() *cobra.Command {
 			exitSigChan := make(chan os.Signal, 1)
 			signal.Notify(exitSigChan, append([]os.Signal{os.Interrupt}, exitSig...)...)
 
+			var shutdownLog *zerolog.Event
 			select {
 			case sig := <-exitSigChan:
 				err = fmt.Errorf("signal %s", sig)
+				shutdownLog = logger.Info()
 				goto shutdown
 			case <-r.ctx.Done():
 				err = context.Cause(r.ctx)
+				shutdownLog = logger.Error()
 				goto shutdown
-			case fatalErr := <-r.fatalErr:
-				logger.Fatal().Err(fatalErr.err).Msg(fatalErr.msg)
 			}
 
 		shutdown:
-			logger.Info().AnErr("cause", err).Msg("router exiting")
+			shutdownLog.AnErr("cause", err).Msg("router exiting")
 			r.Close(err)
 			logger.Info().Msg("router exited, context closed")
 			os.Exit(0)
@@ -114,8 +113,7 @@ type Router struct {
 	cancel     context.CancelCauseFunc
 	logger     *zerolog.Logger
 	metricsReg *prometheus.Registry
-	fatalErr   chan fatalErr
-	prefetch   *prefetchCtl
+	prefetchSf *prefetchCtl
 
 	// metrics
 	queryTotal         prometheus.Counter
@@ -125,36 +123,33 @@ type Router struct {
 	closeOnce sync.Once
 
 	// init later
-	ecsZone          *loader.Loader[string, ipmarker.IpMarker]       // nil if not configured
-	ecsZoneOverwrite *loader.Loader[string, map[string]netip.Prefix] // nil if not configured
-	cache            *cacheCtl                                       // not nil, noop if no backend is configured
-	upstreams        map[string]*upstreamWrapper
-	domainSets       map[string]*loader.Loader[[]string, domainmatcher.Matcher]
+	ecsZone          *loader.Loader[string, ipmarker.IpMarker]                  // nil if not configured
+	ecsZoneOverwrite *loader.Loader[string, ECSZoneOverWrite]                   // nil if not configured
+	cache            *CacheCtl                                                  // not nil, noop if no backend is configured
+	upstreams        map[string]*UpstreamWrapper                                // not nil
+	loadBalancers    map[string]*LoadBalancer                                   // not nil
+	domainSets       map[string]*loader.Loader[[]string, domainmatcher.Matcher] // not nil
 	rules            []*rule
+	middlewares      []Handler // nil if no middleware
 	serverClosers    []func()
 
 	reloading atomic.Uint32 // 1 = true
 }
 
-type fatalErr struct {
-	msg string
-	err error
-}
-
-func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
+func Run(cfg *Config) (_ *Router, err error) {
 	logger := mlog.L()
-	ctx, cancel := context.WithCancelCause(ctx)
+	ctx, cancel := context.WithCancelCause(context.Background())
 	r := &Router{
 		opt:        cfg,
 		ctx:        ctx,
 		cancel:     cancel,
 		logger:     logger,
 		metricsReg: newMetricsReg(),
-		fatalErr:   make(chan fatalErr, 1),
-		prefetch:   newPrefetchCtl(),
+		prefetchSf: newPrefetchCtl(),
 
-		upstreams:  make(map[string]*upstreamWrapper),
-		domainSets: make(map[string]*loader.Loader[[]string, domainmatcher.Matcher]),
+		upstreams:     make(map[string]*UpstreamWrapper),
+		loadBalancers: make(map[string]*LoadBalancer),
+		domainSets:    make(map[string]*loader.Loader[[]string, domainmatcher.Matcher]),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "query_total",
@@ -177,28 +172,33 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 		}
 	}()
 
-	err = regMetrics(r.metricsReg,
+	err = RegMetrics(r.metricsReg,
 		r.queryTotal,
 		r.queryCacheHitTotal,
 		r.prefetchTotal,
 	)
 	if err != nil {
-		err = fmt.Errorf("failed to reg prometheus metrics, %w", err)
-		return
+		return nil, fmt.Errorf("failed to reg prometheus metrics, %w", err)
 	}
 
 	err = r.initApiServer(&cfg.API)
 	if err != nil {
-		err = fmt.Errorf("failed to start api server, %w", err)
-		return
+		return nil, fmt.Errorf("failed to start api server, %w", err)
 	}
 
 	// init upstreams
 	for i, upstreamCfg := range cfg.Upstreams {
 		err := r.initUpstream(&upstreamCfg)
 		if err != nil {
-			err = fmt.Errorf("failed to init upstream #%d, %w", i, err)
-			return nil, err
+			return nil, fmt.Errorf("failed to init upstream #%d, %w", i, err)
+		}
+	}
+
+	// init load balancers
+	for i, lbCfg := range cfg.LoadBalancers {
+		err := r.initLoadBalancer(&lbCfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init load balancer #%d, %w", i, err)
 		}
 	}
 
@@ -206,8 +206,7 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 	if len(cfg.ECS.IpZone) > 0 {
 		err = r.loadEcsZone(cfg.ECS.IpZone)
 		if err != nil {
-			err = fmt.Errorf("failed to load ecs zone file, %w", err)
-			return
+			return nil, fmt.Errorf("failed to load ecs zone file, %w", err)
 		}
 	} else {
 		if cfg.ECS.Enabled && (cfg.Cache.MemSize > 0 || len(cfg.Cache.Redis) > 0) {
@@ -217,10 +216,9 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 
 	// init ecs overwrite rules
 	if fp := cfg.ECS.ZoneOverwrite; len(fp) > 0 {
-		err = r.loadZoneEcs(fp)
+		err = r.loadEcsZoneOverwrite(fp)
 		if err != nil {
-			err = fmt.Errorf("failed to zone ecs file, %w", err)
-			return
+			return nil, fmt.Errorf("failed to zone ecs file, %w", err)
 		}
 	}
 
@@ -228,8 +226,7 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 	for i, domainSet := range cfg.DomainSets {
 		err := r.loadDomainSet(&domainSet)
 		if err != nil {
-			err = fmt.Errorf("failed to init domain set #%d, %w", i, err)
-			return nil, err
+			return nil, fmt.Errorf("failed to init domain set #%d, %w", i, err)
 		}
 	}
 
@@ -237,8 +234,7 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 	for i, ruleCfg := range cfg.Rules {
 		ru, err := r.loadRule(&ruleCfg)
 		if err != nil {
-			err = fmt.Errorf("failed to load rule #%d, %w", i, err)
-			return nil, err
+			return nil, fmt.Errorf("failed to load rule #%d, %w", i, err)
 		}
 		r.rules = append(r.rules, ru)
 	}
@@ -246,18 +242,24 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 	// init cache
 	cache, err := r.initCache(&cfg.Cache)
 	if err != nil {
-		err = fmt.Errorf("failed to init cache, %w", err)
-		return
+		return nil, fmt.Errorf("failed to init cache, %w", err)
 	}
 	r.cache = cache
+
+	// init middlewares
+	if len(cfg.Middleware) > 0 {
+		err := r.initMiddlewares(cfg.Middleware)
+		if err != nil {
+			return nil, fmt.Errorf("failed to init middlewares, %w", err)
+		}
+	}
 
 	// start servers
 	for i, serverCfg := range cfg.Servers {
 		closer, err := r.startServer(&serverCfg)
 		r.serverClosers = append(r.serverClosers, closer)
 		if err != nil {
-			err = fmt.Errorf("failed to start server #%d, %w", i, err)
-			return nil, err
+			return nil, fmt.Errorf("failed to start server #%d, %w", i, err)
 		}
 	}
 
@@ -268,11 +270,9 @@ func Run(ctx context.Context, cfg *Config) (_ *Router, err error) {
 	return r, nil
 }
 
-func (r *Router) fatal(msg string, err error) {
-	select {
-	case r.fatalErr <- fatalErr{msg: msg, err: err}:
-	default:
-	}
+// Context will be canceled then Router being closed.
+func (r *Router) Context() context.Context {
+	return r.ctx
 }
 
 func (r *Router) Close(err error) {
@@ -285,113 +285,23 @@ func (r *Router) Close(err error) {
 // or after router is started (from other goroutines).
 func (r *Router) closeImpl(err error) {
 	r.cancel(err)
-	for _, u := range r.upstreams {
-		u.u.Close()
-	}
-	if r.cache != nil {
-		r.cache.Close()
-	}
 	for _, f := range r.serverClosers {
 		f()
 	}
-}
-
-func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
-	resp := dnsmsg.NewMsg()
-	resp.RCode = rcode
-	for _, q := range m.Questions {
-		resp.Questions = append(resp.Questions, q.Copy())
-		break // only return one question. Avoid malicious queries.
-	}
-	return resp
-}
-
-func (r *Router) asyncSingleFlightPrefetch(key []byte, q *QueryCtx, u *upstreamWrapper) {
-	uk := r.prefetch.Key(key)
-	if ok := r.prefetch.Reserve(uk); !ok {
-		return
-	}
-	keyCopy := pool.CopyBuf(key)
-	qCopy := q.Copy()
-	go func() {
-		defer pool.ReleaseBuf(keyCopy)
-		defer ReleaseQueryCtx(qCopy)
-		defer r.prefetch.Done(uk)
-		r.doPrefetch(keyCopy, qCopy, u)
-	}()
-}
-
-func (r *Router) doPrefetch(key []byte, q *QueryCtx, u *upstreamWrapper) {
-	e := r.logger.Debug()
-	if e != nil {
-		e.Dict("query", q.LogQuery()).Str("upstream", u.tag).Msg("prefetching cache")
-	}
-
-	ctx, cancel := context.WithTimeout(r.ctx, prefetchTimeout)
-	defer cancel()
-	err := r.forward(ctx, q, u)
-	if err != nil {
-		r.logger.Warn().Dict("query", q.LogQuery()).Str("upstream", u.tag).Err(err).
-			Msg("failed to prefetch")
-		return
-	}
-	r.prefetchTotal.Inc()
-	r.cache.Store(key, q)
-}
-
-// Forward query to upstream and set the response.
-// Will remove edns0 from resp.
-func (r *Router) forward(
-	ctx context.Context,
-	q *QueryCtx,
-	upstream *upstreamWrapper,
-) error {
-	queryMsg := r.makeQueryMsg(q)
-	defer dnsmsg.ReleaseMsg(queryMsg)
-
-	if r.opt.Log.TraceMsgs {
-		r.debugLogMsg(q, queryMsg, "sending query to upstream")
-	}
-
-	resp, err := upstream.Exchange(ctx, queryMsg)
-	if err != nil {
-		return fmt.Errorf("failed to exchange, %w", err)
-	}
-
-	if r.opt.Log.TraceMsgs {
-		r.debugLogMsg(q, resp, "response received from upstream")
-	}
-
-	dnsmsg.RemoveEDNS0(resp)
-	q.Resp = resp
-	return nil
-}
-
-func setEmptyRespMQ(q *QueryCtx, rcode dnsmsg.RCode) {
-	if q.Resp != nil {
-		dnsmsg.ReleaseMsg(q.Resp)
-		q.Resp = nil
-	}
-	resp := dnsmsg.NewMsg()
-	resp.RCode = rcode
-	resp.Questions = append(resp.Questions, q.Question.Copy())
-	q.Resp = resp
-}
-
-func (r *Router) makeQueryMsg(q *QueryCtx) *dnsmsg.Msg {
-	m := dnsmsg.NewMsg()
-	m.Header.RecursionDesired = true
-	m.Questions = append(m.Questions, q.Question.Copy())
-
-	opt := newEDNS0(udpSize)
-	if ecs := q.ECS2Upstream; ecs.IsValid() {
-		addr := ecs.Addr()
-		if !addr.IsPrivate() && addr.IsGlobalUnicast() {
-			opt.Data = makeEdns0ClientSubnetReqOpt(ecs)
+	for _, m := range r.middlewares {
+		if closer, ok := m.(io.Closer); ok {
+			closer.Close()
 		}
 	}
-	m.Additionals = append(m.Additionals, opt)
-	return m
+	for _, u := range r.upstreams {
+		u.close()
+	}
+	for _, lb := range r.loadBalancers {
+		lb.close()
+	}
+	if r.cache!=nil{
+		r.cache.close()
+	}
 }
 
 func (r *Router) subLogger(modName string) *zerolog.Logger {
@@ -415,4 +325,65 @@ func (r *Router) subLoggerForUpstream(tag string) *zerolog.Logger {
 	}
 	l := ctx.Logger()
 	return &l
+}
+
+func (r *Router) subLoggerForLb(tag string) *zerolog.Logger {
+	ctx := r.logger.With().Str("module", "load_balancer")
+	if len(tag) > 0 {
+		ctx = ctx.Str("load_balancer_tag", tag)
+	}
+	l := ctx.Logger()
+	return &l
+}
+
+func (r *Router) subLoggerForMiddleware(typ string) *zerolog.Logger {
+	ctx := r.logger.With().Str("middleware", typ)
+	l := ctx.Logger()
+	return &l
+}
+
+// Nil if not configured. DO NOT retain the result. It will be replaced
+// when router reloaded.
+func (r *Router) GetECSZone() *ipmarker.IpMarker {
+	if r.ecsZone != nil {
+		return r.ecsZone.V()
+	}
+	return nil
+}
+
+// Nil if not configured. DO NOT retain the result. It will be replaced
+// when router reloaded.
+func (r *Router) GetECSZoneOverwrite() *ECSZoneOverWrite {
+	if r.ecsZoneOverwrite != nil {
+		return r.ecsZoneOverwrite.V()
+	}
+	return nil
+}
+
+// Nil if not configured.
+func (r *Router) GetUpstream(tag string) *UpstreamWrapper {
+	return r.upstreams[tag]
+}
+
+// Nil if not configured.
+func (r *Router) GetLoadBalancer(tag string) *LoadBalancer {
+	return r.loadBalancers[tag]
+}
+
+// Nil if not configured. DO NOT retain the result. It will be replaced
+// when router reloaded.
+func (r *Router) GetDomainSet(tag string) *domainmatcher.Matcher {
+	loader, ok := r.domainSets[tag]
+	if !ok {
+		return nil
+	}
+	return loader.V()
+}
+
+func (r *Router) GetCache() *CacheCtl {
+	return r.cache
+}
+
+func (r *Router) GetMetricsReg() *prometheus.Registry {
+	return r.metricsReg
 }

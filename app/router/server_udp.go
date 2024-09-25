@@ -67,7 +67,7 @@ func (r *Router) startUdpServer(cfg *ServerConfig) (*udpServer, error) {
 			Msg("udp server started")
 		err := s.startServer()
 		if !errors.Is(err, errServerClosed) {
-			r.fatal("udp server exited", err)
+			r.Close(fmt.Errorf("udp server exited, %w", err))
 		}
 	}()
 	return s, nil
@@ -338,7 +338,7 @@ func (s *udpServer) handleMsg(b, oob []byte, remoteAddr netip.AddrPort) {
 	}
 
 	q := NewQueryCtx()
-	if ok := q.parseQuery(m); !ok {
+	if ok := parseQuery(q, m); !ok {
 		// Drop invalid query
 		ReleaseQueryCtx(q)
 		return
@@ -351,7 +351,7 @@ func (s *udpServer) handleMsg(b, oob []byte, remoteAddr netip.AddrPort) {
 	pool.Go(func() {
 		defer ReleaseQueryCtx(q)
 		defer dnsmsg.ReleaseMsg(m)
-		s.r.handleQuery(q)
+		s.r.serverEntryHandler(q)
 		resp := serverFinalRespB(m, q.Resp, false, udpSize)
 		op := udpSendOp{
 			b:      resp,

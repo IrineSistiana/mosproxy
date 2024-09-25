@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"hash/maphash"
 	"sync"
 	"time"
 
@@ -22,8 +21,8 @@ const (
 	prefetchTimeout    = time.Second * 6
 )
 
-func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
-	c := new(cacheCtl)
+func (r *Router) initCache(cfg *CacheConfig) (*CacheCtl, error) {
+	c := new(CacheCtl)
 	c.logger = r.subLogger("cache")
 	c.maximumTtl = cfg.MaximumTTL
 	if c.maximumTtl <= 0 {
@@ -38,9 +37,9 @@ func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 			return nil, fmt.Errorf("failed to init memory cache backend, %w", err)
 		}
 		c.memory = memCache
-		err = regMetrics(prometheus.WrapRegistererWithPrefix("cache_memory", r.metricsReg), memCache.Collectors()...)
+		err = RegMetrics(prometheus.WrapRegistererWithPrefix("cache_memory", r.metricsReg), memCache.Collectors()...)
 		if err != nil {
-			c.Close()
+			c.close()
 			return nil, err
 		}
 	}
@@ -52,48 +51,13 @@ func (r *Router) initCache(cfg *CacheConfig) (*cacheCtl, error) {
 			return nil, fmt.Errorf("failed to init redis cache, %w", err)
 		}
 		c.redis = redisCache
-		err = regMetrics(prometheus.WrapRegistererWithPrefix("cache_redis", r.metricsReg), redisCache.Collectors()...)
+		err = RegMetrics(prometheus.WrapRegistererWithPrefix("cache_redis", r.metricsReg), redisCache.Collectors()...)
 		if err != nil {
-			c.Close()
+			c.close()
 			return nil, err
 		}
 	}
 	return c, nil
-}
-
-type prefetchCtl struct {
-	seed  maphash.Seed
-	m     sync.Mutex
-	queue map[uint64]struct{}
-}
-
-func newPrefetchCtl() *prefetchCtl {
-	return &prefetchCtl{
-		seed:  maphash.MakeSeed(),
-		queue: make(map[uint64]struct{}),
-	}
-}
-
-func (c *prefetchCtl) Reserve(key uint64) bool {
-	c.m.Lock()
-	defer c.m.Unlock()
-	_, dup := c.queue[key]
-	if dup {
-		return false
-	}
-	c.queue[key] = struct{}{}
-	return true
-}
-
-func (c *prefetchCtl) Done(key uint64) {
-	c.m.Lock()
-	defer c.m.Unlock()
-	delete(c.queue, key)
-}
-
-func (c *prefetchCtl) Key(key []byte) uint64 {
-	h := maphash.Bytes(c.seed, key)
-	return h
 }
 
 func (r *Router) needPrefetch(t cache.Times) bool {
@@ -108,22 +72,35 @@ func (r *Router) needPrefetch(t cache.Times) bool {
 	return remainTtl < prefetchThresholdTtl
 }
 
-type cacheCtl struct {
+type CacheCtl struct {
 	logger        *zerolog.Logger
 	maximumTtl    int // Always valid. Has default value.
 	optimisticTtl int
-	memory        *cache.MemoryCache // Maybe nil
-	redis         *cache.RedisCache  // Maybe nil
+
+	memory *cache.MemoryCache // Maybe nil
+	redis  *cache.RedisCache  // Maybe nil
+}
+
+// No backend.
+func (c *CacheCtl) Nop() bool {
+	return c.memory == nil && c.redis == nil
 }
 
 // Store resp into cache.
-// Remainder: resp must not contain EDNS0 record.
-func (c *cacheCtl) Store(key []byte, q *QueryCtx) {
+// Note: resp must not contain EDNS0 record.
+func (c *CacheCtl) Store(key []byte, q *QueryCtx) {
 	if c.memory == nil && c.redis == nil {
 		return
 	}
+
 	resp := q.Resp
 	if resp == nil {
+		return
+	}
+
+	// Check EDNS0, EDNS0 CANNOT be cached
+	if hasEDNS0(resp) {
+		c.logger.Error().Dict("query", q.LogQuery()).Msg("storing a msg with EDNS0 rr")
 		return
 	}
 
@@ -218,7 +195,7 @@ func (c *cacheCtl) Store(key []byte, q *QueryCtx) {
 }
 
 // Get cache key for this query.
-func (c *cacheCtl) Key(q *QueryCtx) pool.Buffer {
+func (c *CacheCtl) Key(q *QueryCtx) pool.Buffer {
 	b := pool.GetBuf(len(q.Question.Name.Data()) + 4 + len(q.ECSZone))
 	off := copy(b, q.Question.Name.Data())
 	binary.BigEndian.PutUint16(b[off:], uint16(q.Question.Class))
@@ -231,8 +208,15 @@ func (c *cacheCtl) Key(q *QueryCtx) pool.Buffer {
 
 // If cache hit, Get will return a resp (not shared). It is the caller's
 // responsibility to release the reap. TTLs of the reap are properly subtracted.
-// Non-blocking func.
-func (c *cacheCtl) GetMemoryCache(key []byte) (*dnsmsg.Msg, cache.Times) {
+func (c *CacheCtl) Get(ctx context.Context, key []byte) (*dnsmsg.Msg, cache.Times) {
+	m, t := c.getMemoryCache(key)
+	if m != nil {
+		return m, t
+	}
+	return c.getRedisCache(ctx, key)
+}
+
+func (c *CacheCtl) getMemoryCache(key []byte) (*dnsmsg.Msg, cache.Times) {
 	if c.memory == nil {
 		return nil, cache.Times{}
 	}
@@ -250,10 +234,8 @@ func (c *cacheCtl) GetMemoryCache(key []byte) (*dnsmsg.Msg, cache.Times) {
 	return nil, cache.Times{}
 }
 
-// If cache hit, Get will return a resp (not shared). It is the caller's
-// responsibility to release the reap. TTLs of the reap are properly subtracted.
-// It will also save a copy to memory cache if it is enabled.
-func (c *cacheCtl) GetRedisCache(ctx context.Context, key []byte) (*dnsmsg.Msg, cache.Times) {
+// Will also update memory cache.
+func (c *CacheCtl) getRedisCache(ctx context.Context, key []byte) (*dnsmsg.Msg, cache.Times) {
 	if c.redis == nil {
 		return nil, cache.Times{}
 	}
@@ -275,15 +257,13 @@ func (c *cacheCtl) GetRedisCache(ctx context.Context, key []byte) (*dnsmsg.Msg, 
 	return nil, cache.Times{}
 }
 
-// Always returns nil.
-func (c *cacheCtl) Close() error {
+func (c *CacheCtl) close() {
 	if c.memory != nil {
 		c.memory.Close()
 	}
 	if c.redis != nil {
 		c.redis.Close()
 	}
-	return nil
 }
 
 // Pack m into bytes.
@@ -324,4 +304,32 @@ func unpackCacheMsg(m []byte) (*dnsmsg.Msg, error) {
 		return nil, fmt.Errorf("s2 decode: %w", err)
 	}
 	return dnsmsg.UnpackMsg(decoded)
+}
+
+type prefetchCtl struct {
+	m     sync.Mutex
+	queue map[string]struct{}
+}
+
+func newPrefetchCtl() *prefetchCtl {
+	return &prefetchCtl{
+		queue: make(map[string]struct{}),
+	}
+}
+
+func (c *prefetchCtl) Reserve(key []byte) bool {
+	c.m.Lock()
+	defer c.m.Unlock()
+	_, dup := c.queue[string(key)]
+	if dup {
+		return false
+	}
+	c.queue[string(key)] = struct{}{}
+	return true
+}
+
+func (c *prefetchCtl) Done(key []byte) {
+	c.m.Lock()
+	defer c.m.Unlock()
+	delete(c.queue, string(key))
 }

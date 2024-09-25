@@ -12,7 +12,7 @@ func newMetricsReg() *prometheus.Registry {
 	return reg
 }
 
-func regMetrics(r prometheus.Registerer, cs ...prometheus.Collector) error {
+func RegMetrics(r prometheus.Registerer, cs ...prometheus.Collector) error {
 	for _, c := range cs {
 		if err := r.Register(c); err != nil {
 			return err
