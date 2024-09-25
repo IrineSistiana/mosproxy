@@ -64,11 +64,32 @@ func (c *pipelineConn) exchange(ctx context.Context, m *dnsmsg.Msg) (*dnsmsg.Msg
 	}
 	defer c.deleteQueueC(qid)
 
+	if !c.t.opts.IsTCP { // If udp, resend udp package every 1s.
+		resend := time.NewTicker(time.Second)
+		defer resend.Stop()
+		for {
+			err = c.write(m, qid)
+			if err != nil {
+				return nil, err
+			}
+			select {
+			case <-resend.C:
+				continue
+			case <-ctx.Done():
+				return nil, context.Cause(ctx)
+			case <-c.ctx.Done():
+				return nil, context.Cause(c.ctx)
+			case r := <-respChan:
+				r.Header.ID = m.Header.ID
+				return r, nil
+			}
+		}
+	}
+
 	err = c.write(m, qid)
 	if err != nil {
 		return nil, err
 	}
-
 	select {
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
