@@ -102,8 +102,8 @@ type LoadBalancerBackendConfig struct {
 }
 
 type HealthCheckConfig struct {
-	MaxFails int `yaml:"max_fails"`
-	Interval int `yaml:"interval"`
+	MaxFails     int `yaml:"max_fails"`
+	PingInterval int `yaml:"ping_interval"`
 }
 
 type DomainSetConfig struct {

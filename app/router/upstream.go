@@ -65,8 +65,8 @@ type UpstreamWrapper struct {
 	cancel context.CancelFunc
 
 	// hc
-	maxFails   int
-	hcInterval time.Duration // not zero
+	maxFails       int
+	hcPingInterval time.Duration // not zero
 
 	hcLock     sync.Mutex
 	errCounter int
@@ -94,8 +94,8 @@ func (r *Router) wrapUpstream(tag string, u upstream.Upstream, logger *zerolog.L
 		ctx:    ctx,
 		cancel: cancel,
 
-		maxFails:   hcCfg.MaxFails,
-		hcInterval: time.Duration(defaultIfELZero(hcCfg.Interval, 120)) * time.Second,
+		maxFails:       hcCfg.MaxFails,
+		hcPingInterval: time.Duration(defaultIfELZero(hcCfg.PingInterval, 120)) * time.Second,
 
 		lbs: make(map[*LoadBalancer]struct{}),
 
@@ -299,7 +299,7 @@ func (b *UpstreamWrapper) healthCheckLoopTillOnline() {
 				return
 			}
 
-			interval := b.hcInterval
+			interval := b.hcPingInterval
 			if i < 8 {
 				fastRecover := (1 << i) * time.Second
 				if fastRecover < interval {
