@@ -18,7 +18,7 @@ import (
 type LoadBalancer struct {
 	tag      string
 	logger   *zerolog.Logger
-	e        []*lbBackend
+	e        []*lbBackend                               // not zero
 	simpleFn func(s *lbSampler, q *QueryCtx) *lbBackend // simple from sampler, may return nil if no backend is available
 
 	idxM    sync.Mutex
@@ -127,6 +127,9 @@ func (lb *LoadBalancer) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg
 	s := lb.sampler.Load()
 	b, zero := s.fastPath()
 	if zero {
+		// Try to start a ping test in a random upstream.
+		// Hope some upstreams may have recovered already.
+		lb.e[rand.IntN(len(lb.e))].u.HcTryStartPing()
 		return nil, errors.New("all backends are offline")
 	}
 	if b == nil {
@@ -135,16 +138,7 @@ func (lb *LoadBalancer) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg
 	if b == nil {
 		return nil, errors.New("no backend available")
 	}
-
-	u := b.u
-	q.Trace.Upstream = u.Tag()
-	resp, err := u.Exchange(ctx, q, m)
-	if err != nil {
-		u.Failed()
-	} else {
-		u.Succeed()
-	}
-	return resp, err
+	return b.u.Exchange(ctx, q, m)
 }
 
 // Unregister the LoadBalancer from UpstreamWrapper.

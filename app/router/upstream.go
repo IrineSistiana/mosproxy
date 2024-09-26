@@ -13,6 +13,10 @@ import (
 	"github.com/rs/zerolog"
 )
 
+var (
+	ErrUpstreamOffline = errors.New("upstream is currently offline")
+)
+
 func (r *Router) initUpstream(cfg *UpstreamConfig) error {
 	if len(cfg.Tag) == 0 {
 		return errors.New("missing tag")
@@ -67,10 +71,13 @@ type UpstreamWrapper struct {
 	// hc
 	maxFails       int
 	hcPingInterval time.Duration // not zero
+	standalonePing chan struct{} // not nil, no buffer
 
-	hcLock     sync.Mutex
-	errCounter int
-	offline    bool
+	hcLock         sync.Mutex
+	continuousErr  int
+	offline        bool
+	offlineTime    time.Time
+	cancelPingLoop context.CancelFunc
 
 	lbsLock sync.Mutex
 	lbs     map[*LoadBalancer]struct{} // lbs that use this upstream as backend
@@ -90,12 +97,12 @@ func (r *Router) wrapUpstream(tag string, u upstream.Upstream, logger *zerolog.L
 		tag:    tag,
 		u:      u,
 		logger: logger,
-
 		ctx:    ctx,
 		cancel: cancel,
 
 		maxFails:       hcCfg.MaxFails,
 		hcPingInterval: time.Duration(defaultIfELZero(hcCfg.PingInterval, 120)) * time.Second,
+		standalonePing: make(chan struct{}),
 
 		lbs: make(map[*LoadBalancer]struct{}),
 
@@ -158,6 +165,22 @@ func (uw *UpstreamWrapper) Ping(ctx context.Context) error {
 }
 
 func (uw *UpstreamWrapper) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
+	if uw.HcEnabled() && uw.HcOffline() {
+		uw.HcTryStartPing()
+		return nil, ErrUpstreamOffline
+	}
+	r, err := uw.exchange(ctx, q, m)
+	if uw.HcEnabled() {
+		if err != nil {
+			uw.hcFailed()
+		} else {
+			uw.hcSucceed()
+		}
+	}
+	return r, err
+}
+
+func (uw *UpstreamWrapper) exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
 	r := uw.r
 	if r.opt.Log.TraceMsgs {
 		r.debugLogMsg(q, m, uw.tag, "sending query to upstream")
@@ -194,6 +217,121 @@ func (b *UpstreamWrapper) HcEnabled() bool {
 	return b.maxFails > 0
 }
 
+// Is upstream currently offline.
+// Always return false if health check is disabled.
+func (b *UpstreamWrapper) HcOffline() bool {
+	if !b.HcEnabled() {
+		return false
+	}
+
+	b.hcLock.Lock()
+	defer b.hcLock.Unlock()
+	return b.offline
+}
+
+// Notify the health check that the upstream has a successful query.
+// Will reset the error counter, stop ongoing ping checks, and notify load
+// balancers to rebuild their index.
+func (b *UpstreamWrapper) hcSucceed() {
+	b.hcLock.Lock()
+	b.continuousErr = 0
+	prevOffline := b.offline
+	b.offline = false
+	prevOfflineTime := b.offlineTime
+	b.offlineTime = time.Time{}
+	if b.cancelPingLoop != nil {
+		b.cancelPingLoop()
+		b.cancelPingLoop = nil
+	}
+	b.hcLock.Unlock()
+
+	if prevOffline { // offline -> online
+		b.logger.Info().Dur("offline_dur", time.Since(prevOfflineTime)).Msg("upstream online")
+		b.hcRebuildLbsIdx()
+	}
+}
+
+// Notify health check the upstream hcFailed once.
+// May trigger offline status if condition meets.
+func (b *UpstreamWrapper) hcFailed() {
+	b.hcLock.Lock()
+	b.continuousErr++
+	if !b.offline && b.continuousErr >= b.maxFails {
+		b.offline = true
+		b.offlineTime = time.Now()
+		ctx, cancel := context.WithCancel(b.ctx)
+		b.cancelPingLoop = cancel
+		b.hcLock.Unlock()
+		go func() {
+			b.logger.Error().Msg("upstream offline")
+			b.hcRebuildLbsIdx()
+			b.hcOfflinePingLoop(ctx)
+		}()
+		return
+	}
+	b.hcLock.Unlock()
+}
+
+// Try to start a health check ping asynchronously if upstream is offline.
+// This is useful if caller want trigger the ping test more frequently.
+// e.g. After query failed.
+// 5s minimal ping interval limit applied.
+func (b *UpstreamWrapper) HcTryStartPing() {
+	select {
+	case b.standalonePing <- struct{}{}:
+	default:
+	}
+}
+
+// Stop if ping succeed or ctx canceled
+func (b *UpstreamWrapper) hcOfflinePingLoop(ctx context.Context) {
+	const sdPingMinimalInterval = time.Second * 5
+
+	b.logger.Debug().Msg("health check ping loop started")
+
+	t := time.NewTimer(time.Second)
+	defer t.Stop()
+	var latestSdPing time.Time
+	for i := 0; ; i++ {
+	again:
+		standalone := false
+		select {
+		case <-ctx.Done():
+			err := context.Cause(ctx)
+			b.logger.Debug().Err(err).Msg("health check ping loop canceled")
+			return
+		case <-b.standalonePing:
+			now := time.Now()
+			if now.Sub(latestSdPing) < sdPingMinimalInterval {
+				goto again
+			}
+			standalone = true
+			latestSdPing = now
+		case <-t.C:
+		}
+		b.logger.Debug().Int("attempt_id", i).Bool("standalone", standalone).Msg("health check ping started")
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+		err := b.Ping(ctx)
+		cancel()
+		if err == nil {
+			b.logger.Info().Int("attempt_id", i).Dur("latency", time.Since(start)).Msg("health check ping succeed")
+			b.hcSucceed()
+			return
+		}
+
+		interval := b.hcPingInterval
+		if i < 8 {
+			fastRecover := (1 << i) * time.Second
+			if fastRecover < interval {
+				interval = fastRecover
+			}
+		}
+		t.Reset(interval)
+		b.logger.Warn().Int("attempt_id", i).Dur("elapsed", time.Since(start)).Dur("next_scheduled_ping", interval).Err(err).Msg("health check ping failed")
+	}
+}
+
 func (b *UpstreamWrapper) regLb(lb *LoadBalancer) {
 	b.lbsLock.Lock()
 	defer b.lbsLock.Unlock()
@@ -206,111 +344,12 @@ func (b *UpstreamWrapper) unRegLb(lb *LoadBalancer) {
 	delete(b.lbs, lb)
 }
 
+// Must called outside b.hcLock.
+// LoadBalancer will call b.HcOffline() which require b.hcLock.
 func (b *UpstreamWrapper) hcRebuildLbsIdx() {
 	b.lbsLock.Lock()
 	defer b.lbsLock.Unlock()
 	for lb := range b.lbs {
 		lb.buildIdx()
-	}
-}
-
-// Note: Always return false if health check is disabled.
-func (b *UpstreamWrapper) HcOffline() bool {
-	if !b.HcEnabled() {
-		return false
-	}
-
-	b.hcLock.Lock()
-	defer b.hcLock.Unlock()
-	return b.offline
-}
-
-func (b *UpstreamWrapper) Succeed() {
-	if !b.HcEnabled() {
-		return
-	}
-
-	b.hcLock.Lock()
-	b.errCounter = 0
-	b.hcLock.Unlock()
-}
-
-func (b *UpstreamWrapper) Failed() {
-	if !b.HcEnabled() {
-		return
-	}
-
-	var wentOffline bool
-	b.hcLock.Lock()
-	b.errCounter++
-	if !b.offline {
-		// Query failed to many times continuously || No query was successful during a period of time.
-		if b.errCounter >= b.maxFails {
-			b.offline = true
-			wentOffline = true
-		}
-	}
-	b.hcLock.Unlock()
-
-	if wentOffline {
-		b.logger.Error().Msg("upstream offline")
-		offlineTime := time.Now()
-		b.hcRebuildLbsIdx()
-		go func() {
-			defer func() {
-				b.hcLock.Lock()
-				b.errCounter = 0
-				b.offline = false
-				b.hcLock.Unlock()
-				b.logger.Info().Dur("offline_dur", time.Since(offlineTime)).Msg("backend online")
-				b.hcRebuildLbsIdx()
-			}()
-			b.healthCheckLoopTillOnline()
-		}()
-	}
-}
-
-func (b *UpstreamWrapper) healthCheckLoopTillOnline() {
-	e := b.logger.Debug()
-	if e != nil {
-		e.Msg("health check loop started")
-	}
-
-	t := time.NewTimer(time.Second)
-	defer t.Stop()
-	for i := 0; ; i++ {
-		select {
-		case <-b.ctx.Done():
-			return
-		case <-t.C:
-			e := b.logger.Debug()
-			if e != nil {
-				e.Int("attempt_id", i).Msg("health check started")
-			}
-
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
-			err := b.Ping(ctx)
-			cancel()
-			if err == nil {
-				e := b.logger.Debug()
-				if e != nil {
-					e.Int("attempt_id", i).Msg("health check succeed")
-				}
-				return
-			}
-
-			interval := b.hcPingInterval
-			if i < 8 {
-				fastRecover := (1 << i) * time.Second
-				if fastRecover < interval {
-					interval = fastRecover
-				}
-			}
-			t.Reset(interval)
-			e = b.logger.Debug()
-			if e != nil {
-				e.Int("attempt_id", i).Dur("next_check", interval).Err(err).Msg("health check failed")
-			}
-		}
 	}
 }
