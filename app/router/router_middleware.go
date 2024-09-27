@@ -1,6 +1,7 @@
 package router
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -9,19 +10,19 @@ import (
 	"github.com/rs/zerolog"
 )
 
-type Handler interface {
+type Middleware interface {
 	// q will be released and reused, thus Handler MUST NOT access it after Handle() returned.
-	Handle(q *QueryCtx)
+	Handle(ctx context.Context, q *QueryCtx)
 
 	// io.Closer is optimal. If implemented, will be called when router is shutting down.
 }
 
-type MiddlewareCtx struct {
+type PluginCtx struct {
 	R      *Router         // Not nil
 	Logger *zerolog.Logger // Not nil
 }
 
-type NewMiddlewareFunc func(ctx MiddlewareCtx, args map[string]any, next Handler) (Handler, error)
+type NewMiddlewareFunc func(ctx PluginCtx, args map[string]any, next Middleware) (Middleware, error)
 
 var _middlewareReg = middlewareReg{
 	factories: make(map[string]NewMiddlewareFunc),
@@ -65,15 +66,15 @@ func MustRegMiddleware(typ string, fn NewMiddlewareFunc) {
 }
 
 type middlewareConnector struct {
-	next func(q *QueryCtx)
+	next func(ctx context.Context, q *QueryCtx)
 }
 
-func (mc *middlewareConnector) Handle(q *QueryCtx) {
-	mc.next(q)
+func (mc *middlewareConnector) Handle(ctx context.Context, q *QueryCtx) {
+	mc.next(ctx, q)
 }
 
 func (r *Router) initMiddlewares(cfgs []map[string]any) error {
-	ms := make([]Handler, 0, len(cfgs))
+	ms := make([]Middleware, 0, len(cfgs))
 	var prevMc *middlewareConnector
 	for i, cfg := range cfgs {
 		mc := &middlewareConnector{}
@@ -95,7 +96,7 @@ func (r *Router) initMiddlewares(cfgs []map[string]any) error {
 	return nil
 }
 
-func (r *Router) initMiddleware(cfg map[string]any, next Handler) (Handler, error) {
+func (r *Router) initMiddleware(cfg map[string]any, next Middleware) (Middleware, error) {
 	v := cfg["type"]
 	typ, ok := v.(string)
 	if !ok {
@@ -107,7 +108,7 @@ func (r *Router) initMiddleware(cfg map[string]any, next Handler) (Handler, erro
 	if ff == nil {
 		return nil, fmt.Errorf("unknown middleware type [%s]", typ)
 	}
-	ctx := MiddlewareCtx{
+	ctx := PluginCtx{
 		R:      r,
 		Logger: r.subLoggerForMiddleware(typ),
 	}

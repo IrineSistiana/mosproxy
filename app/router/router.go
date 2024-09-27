@@ -13,7 +13,8 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/mosproxy/app"
-	"github.com/IrineSistiana/mosproxy/app/router/loader"
+	"github.com/go-chi/chi/v5"
+
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
 	"github.com/IrineSistiana/mosproxy/internal/ipmarker"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
@@ -114,6 +115,7 @@ type Router struct {
 	logger     *zerolog.Logger
 	metricsReg *prometheus.Registry
 	prefetchSf *prefetchCtl
+	apiMux     *chi.Mux
 
 	// metrics
 	queryTotal         prometheus.Counter
@@ -123,14 +125,14 @@ type Router struct {
 	closeOnce sync.Once
 
 	// init later
-	ecsZone          *loader.Loader[string, ipmarker.IpMarker]                  // nil if not configured
-	ecsZoneOverwrite *loader.Loader[string, ECSZoneOverWrite]                   // nil if not configured
-	cache            *CacheCtl                                                  // not nil, noop if no backend is configured
-	upstreams        map[string]*UpstreamWrapper                                // not nil
-	loadBalancers    map[string]*LoadBalancer                                   // not nil
-	domainSets       map[string]*loader.Loader[[]string, domainmatcher.Matcher] // not nil
+	ecsZone          *dataloaderImpl[string, ipmarker.IpMarker]                  // nil if not configured
+	ecsZoneOverwrite *dataloaderImpl[string, ECSZoneOverWrite]                   // nil if not configured
+	cache            *CacheCtl                                                   // not nil, noop if no backend is configured
+	upstreams        map[string]*UpstreamWrapper                                 // not nil
+	loadBalancers    map[string]*LoadBalancer                                    // not nil
+	domainSets       map[string]*dataloaderImpl[[]string, domainmatcher.Matcher] // not nil
 	rules            []*rule
-	middlewares      []Handler // nil if no middleware
+	middlewares      []Middleware // nil if no middleware
 	serverClosers    []func()
 
 	reloading atomic.Uint32 // 1 = true
@@ -146,10 +148,11 @@ func Run(cfg *Config) (_ *Router, err error) {
 		logger:     logger,
 		metricsReg: newMetricsReg(),
 		prefetchSf: newPrefetchCtl(),
+		apiMux:     chi.NewMux(),
 
 		upstreams:     make(map[string]*UpstreamWrapper),
 		loadBalancers: make(map[string]*LoadBalancer),
-		domainSets:    make(map[string]*loader.Loader[[]string, domainmatcher.Matcher]),
+		domainSets:    make(map[string]*dataloaderImpl[[]string, domainmatcher.Matcher]),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "query_total",
@@ -232,7 +235,7 @@ func Run(cfg *Config) (_ *Router, err error) {
 
 	// init rules
 	for i, ruleCfg := range cfg.Rules {
-		ru, err := r.loadRule(&ruleCfg)
+		ru, err := r.loadRule(ruleCfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load rule #%d, %w", i, err)
 		}
@@ -299,7 +302,7 @@ func (r *Router) closeImpl(err error) {
 	for _, lb := range r.loadBalancers {
 		lb.close()
 	}
-	if r.cache!=nil{
+	if r.cache != nil {
 		r.cache.close()
 	}
 }
@@ -342,11 +345,10 @@ func (r *Router) subLoggerForMiddleware(typ string) *zerolog.Logger {
 	return &l
 }
 
-// Nil if not configured. DO NOT retain the result. It will be replaced
-// when router reloaded.
-func (r *Router) GetECSZone() *ipmarker.IpMarker {
+// Nil if not configured.
+func (r *Router) GetECSZone() DataProvider[ipmarker.IpMarker] {
 	if r.ecsZone != nil {
-		return r.ecsZone.V()
+		return r.ecsZone
 	}
 	return nil
 }
@@ -370,14 +372,13 @@ func (r *Router) GetLoadBalancer(tag string) *LoadBalancer {
 	return r.loadBalancers[tag]
 }
 
-// Nil if not configured. DO NOT retain the result. It will be replaced
-// when router reloaded.
-func (r *Router) GetDomainSet(tag string) *domainmatcher.Matcher {
+// Nil if not configured.
+func (r *Router) GetDomainSet(tag string) DataProvider[domainmatcher.Matcher] {
 	loader, ok := r.domainSets[tag]
 	if !ok {
 		return nil
 	}
-	return loader.V()
+	return loader
 }
 
 func (r *Router) GetCache() *CacheCtl {
@@ -386,4 +387,8 @@ func (r *Router) GetCache() *CacheCtl {
 
 func (r *Router) GetMetricsReg() *prometheus.Registry {
 	return r.metricsReg
+}
+
+func (r *Router) GetApiMux() *chi.Mux {
+	return r.apiMux
 }

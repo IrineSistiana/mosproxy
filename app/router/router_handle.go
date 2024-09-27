@@ -46,10 +46,13 @@ func (r *Router) serverEntryHandler(q *QueryCtx) {
 		}
 	}
 
+	ctx, cancel := context.WithTimeout(r.ctx, queryTimeout)
+	defer cancel()
+
 	if len(r.middlewares) > 0 {
-		r.middlewares[0].Handle(q)
+		r.middlewares[0].Handle(ctx, q)
 	} else {
-		r.BuiltInHandler(q)
+		r.BuiltInHandler(ctx, q)
 	}
 
 	if q.Resp == nil {
@@ -61,7 +64,7 @@ func (r *Router) serverEntryHandler(q *QueryCtx) {
 }
 
 // router main handle func.
-func (r *Router) BuiltInHandler(q *QueryCtx) {
+func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 	// Match rules
 	var matchedRule *rule
 	for i, rule := range r.rules {
@@ -93,9 +96,6 @@ func (r *Router) BuiltInHandler(q *QueryCtx) {
 		SetEmptyRespMQ(q, dnsmsg.RCodeRefused)
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(r.ctx, queryTimeout)
-	defer cancel()
 
 	cacheKey := r.cache.Key(q)
 	defer pool.ReleaseBuf(cacheKey)

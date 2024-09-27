@@ -1,6 +1,7 @@
 package testmw
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 
@@ -16,7 +17,7 @@ type Args struct {
 }
 
 func init() {
-	router.RegMiddleware("limit", func(ctx router.MiddlewareCtx, args map[string]any, next router.Handler) (router.Handler, error) {
+	router.RegMiddleware("limit", func(ctx router.PluginCtx, args map[string]any, next router.Middleware) (router.Middleware, error) {
 		a := Args{}
 		err := router.WakeDecode(&a, args, "yaml")
 		if err != nil {
@@ -50,8 +51,8 @@ func init() {
 }
 
 type Limit struct {
-	ctx  router.MiddlewareCtx
-	next router.Handler
+	ctx  router.PluginCtx
+	next router.Middleware
 	args Args
 
 	concurrent atomic.Int32
@@ -61,7 +62,7 @@ type Limit struct {
 	rejectedQpsTotal prometheus.Counter
 }
 
-func (h *Limit) Handle(q *router.QueryCtx) {
+func (h *Limit) Handle(ctx context.Context, q *router.QueryCtx) {
 	if h.rate != nil {
 		if !h.rate.Allow() {
 			h.rejectedQpsTotal.Inc()
@@ -79,5 +80,5 @@ func (h *Limit) Handle(q *router.QueryCtx) {
 		}
 		defer h.concurrent.Add(-1)
 	}
-	h.next.Handle(q)
+	h.next.Handle(ctx, q)
 }

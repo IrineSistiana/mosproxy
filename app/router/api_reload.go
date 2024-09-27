@@ -3,13 +3,12 @@ package router
 import (
 	"errors"
 	"fmt"
-
-	"github.com/IrineSistiana/mosproxy/app/router/loader"
 )
 
 var (
 	ErrConcurrentReload = errors.New("concurrent reloading call")
 )
+
 
 func (r *Router) Reload() (err error) {
 	if !r.reloading.CompareAndSwap(0, 1) {
@@ -17,8 +16,8 @@ func (r *Router) Reload() (err error) {
 	}
 	defer r.reloading.Store(0)
 
-	var stagedReloaders []loader.Reloader
-	ready := func(r loader.Reloader) {
+	var stagedReloaders []dataloader
+	ready := func(r dataloader) {
 		stagedReloaders = append(stagedReloaders, r)
 	}
 	failed := false
@@ -26,15 +25,15 @@ func (r *Router) Reload() (err error) {
 	defer func() { // commit or discard changes
 		for _, r := range stagedReloaders {
 			if failed {
-				r.Discard()
+				r.discard()
 			} else {
-				r.Commit()
+				r.commit()
 			}
 		}
 	}()
 
 	if loader := r.ecsZone; loader != nil {
-		err := loader.LoadAndStage()
+		err := loader.loadAndStage()
 		if err != nil {
 			failed = true
 			return fmt.Errorf("failed to reload , %w", err)
@@ -43,7 +42,7 @@ func (r *Router) Reload() (err error) {
 	}
 
 	if loader := r.ecsZoneOverwrite; loader != nil {
-		err := loader.LoadAndStage()
+		err := loader.loadAndStage()
 		if err != nil {
 			failed = true
 			return fmt.Errorf("failed to reload ecs overwrite rules, %w", err)
@@ -52,7 +51,7 @@ func (r *Router) Reload() (err error) {
 	}
 
 	for tag, loader := range r.domainSets {
-		err := loader.LoadAndStage()
+		err := loader.loadAndStage()
 		if err != nil {
 			failed = true
 			return fmt.Errorf("failed to reload domain set [%s], %w", tag, err)

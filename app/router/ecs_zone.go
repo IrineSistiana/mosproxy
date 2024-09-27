@@ -4,7 +4,6 @@ import (
 	"net/netip"
 	"os"
 
-	"github.com/IrineSistiana/mosproxy/app/router/loader"
 	"github.com/IrineSistiana/mosproxy/internal/ipmarker"
 )
 
@@ -22,12 +21,12 @@ func (r *Router) loadEcsZone(f string) error {
 		r.logger.Info().Str("file", args).Int("len", m.IpLen()).Int("zone_num", m.MarkLen()).Msg("ecs ip zone file loaded")
 		return m, nil
 	}
-	l := loader.NewLoader[string, ipmarker.IpMarker](f, loadFn, nil)
-	err := l.LoadAndStage()
+	l := newDataLoader[string, ipmarker.IpMarker](f, loadFn, nil)
+	err := l.loadAndStage()
 	if err != nil {
 		return err
 	}
-	l.Commit()
+	l.commit()
 	r.ecsZone = l
 	return nil
 }
@@ -55,12 +54,12 @@ func (r *Router) loadEcsZoneOverwrite(f string) error {
 		return &ECSZoneOverWrite{m: m}, nil
 	}
 
-	l := loader.NewLoader[string, ECSZoneOverWrite](f, loadFn, nil)
-	err := l.LoadAndStage()
+	l := newDataLoader[string, ECSZoneOverWrite](f, loadFn, nil)
+	err := l.loadAndStage()
 	if err != nil {
 		return err
 	}
-	l.Commit()
+	l.commit()
 	r.ecsZoneOverwrite = l
 	return nil
 }

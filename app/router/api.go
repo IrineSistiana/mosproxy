@@ -23,7 +23,7 @@ func (r *Router) initApiServer(cfg *APIConfig) error {
 	}
 	r.logger.Info().Stringer("addr", l.Addr()).Msg("api server started")
 
-	mux := chi.NewMux()
+	mux := r.apiMux
 
 	metricsHandler := promhttp.HandlerFor(r.metricsReg, promhttp.HandlerOpts{})
 	mux.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {

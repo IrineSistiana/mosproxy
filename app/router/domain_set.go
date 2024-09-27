@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/IrineSistiana/mosproxy/app/router/loader"
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
 )
 
@@ -38,12 +37,12 @@ func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
 		return m, nil
 	}
 
-	l := loader.NewLoader(cfg.Files, loadFn, nil)
-	err := l.LoadAndStage()
+	l := newDataLoader(cfg.Files, loadFn, nil)
+	err := l.loadAndStage()
 	if err != nil {
 		return err
 	}
-	l.Commit()
+	l.commit()
 	r.domainSets[cfg.Tag] = l
 	return nil
 }
