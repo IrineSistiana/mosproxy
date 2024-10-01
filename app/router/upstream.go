@@ -33,14 +33,19 @@ func (r *Router) initUpstream(cfg *UpstreamConfig) error {
 		return fmt.Errorf("failed to init tls config, %w", err)
 	}
 
-	controlOpts := cfg.Socket
-	controlOpts._TCP_USER_TIMEOUT = 5000 // 5s
 	logger := r.subLoggerForUpstream(cfg.Tag)
 	opt := upstream.Opt{
 		DialAddr:  cfg.DialAddr,
 		Logger:    logger,
 		TLSConfig: tlsConfig,
-		Control:   controlSocket(controlOpts),
+	}
+	if socketCtlOk {
+		controlOpts := cfg.Socket
+		controlOpts._TCP_USER_TIMEOUT = 5000 // 5s
+		// If we can set TCP_USER_TIMEOUT, dead connection should be closed by the system after 5s.
+		// It should be ok to set a long IdleTimeout.
+		opt.IdleTimeout = time.Minute
+		opt.Control = controlSocket(controlOpts)
 	}
 	u, err := upstream.NewUpstream(cfg.Addr, opt)
 	if err != nil {
