@@ -7,26 +7,30 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/ipmarker"
 )
 
-func (r *Router) loadEcsZone(f string) error {
-	loadFn := func(args string) (*ipmarker.IpMarker, error) {
-		f, err := os.Open(args)
+func (r *Router) loadEcsZone(fp string) error {
+	loadFile := func(fp string) (*ipmarker.IpMarker, error) {
+		f, err := os.Open(fp)
 		if err != nil {
 			return nil, err
 		}
 		defer f.Close()
-		m, err := ipmarker.LoadIpMarkerFromReader(f)
+		return ipmarker.LoadIpMarkerFromReader(f)
+	}
+	loadFn := func() (*ipmarker.IpMarker, error) {
+		m, err := loadFile(fp)
 		if err != nil {
+			r.logger.Error().Str("file", fp).Msg("failed to load ecs ip zone file")
 			return nil, err
 		}
-		r.logger.Info().Str("file", args).Int("len", m.IpLen()).Int("zone_num", m.MarkLen()).Msg("ecs ip zone file loaded")
+		r.logger.Info().Str("file", fp).Int("len", m.IpLen()).Int("zone_num", m.MarkLen()).Msg("ecs ip zone file loaded")
 		return m, nil
 	}
-	l := newDataLoader[string, ipmarker.IpMarker](f, loadFn, nil)
-	err := l.loadAndStage()
+	l := NewDataLoader[ipmarker.IpMarker](loadFn, nil)
+	_, err := l.LoadAndStageV()
 	if err != nil {
 		return err
 	}
-	l.commit()
+	l.Commit()
 	r.ecsZone = l
 	return nil
 }
@@ -39,27 +43,31 @@ func (ezo *ECSZoneOverWrite) Get(z string) netip.Prefix {
 	return ezo.m[z]
 }
 
-func (r *Router) loadEcsZoneOverwrite(f string) error {
-	loadFn := func(args string) (*ECSZoneOverWrite, error) {
-		f, err := os.Open(args)
+func (r *Router) loadEcsZoneOverwrite(fp string) error {
+	loadFile := func(fp string) (map[string]netip.Prefix, error) {
+		f, err := os.Open(fp)
 		if err != nil {
 			return nil, err
 		}
 		defer f.Close()
-		m, err := ipmarker.LoadMark2PrefixFromReader(f)
+		return ipmarker.LoadMark2PrefixFromReader(f)
+	}
+	loadFn := func() (*ECSZoneOverWrite, error) {
+		m, err := loadFile(fp)
 		if err != nil {
+			r.logger.Error().Str("file", fp).Err(err).Msg("failed to load zone ecs overwrite data")
 			return nil, err
 		}
-		r.logger.Info().Str("file", args).Int("len", len(m)).Msg("zone ecs data loaded")
+		r.logger.Info().Str("file", fp).Int("len", len(m)).Msg("zone ecs overwrite loaded")
 		return &ECSZoneOverWrite{m: m}, nil
 	}
 
-	l := newDataLoader[string, ECSZoneOverWrite](f, loadFn, nil)
-	err := l.loadAndStage()
+	l := NewDataLoader[ECSZoneOverWrite](loadFn, nil)
+	_, err := l.LoadAndStageV()
 	if err != nil {
 		return err
 	}
-	l.commit()
+	l.Commit()
 	r.ecsZoneOverwrite = l
 	return nil
 }

@@ -8,7 +8,7 @@ import (
 
 type rule struct {
 	reverse  bool
-	matcher  *dataloaderImpl[[]string, domainmatcher.Matcher]
+	matcher  *DataloaderImpl[domainmatcher.Matcher]
 	reject   uint16
 	upstream Upstream // maybe nil
 }

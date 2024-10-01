@@ -2,15 +2,15 @@ package router
 
 import "sync/atomic"
 
-type dataloader interface {
-	// Load T and stage the T. Return err if ocurred.
-	loadAndStage() error
+type Dataloader interface {
+	// Load T and stage the T. Return false if error ocurred.
+	LoadAndStage() (ok bool)
 
-	// commit the change. If no T staged, this call is noop.
-	commit()
+	// Commit the change. If no T staged, this call is noop.
+	Commit()
 
-	// discard the change. If no T staged, this call is noop.
-	discard()
+	// Discard the change. If no T staged, this call is noop.
+	Discard()
 }
 
 // Provider data.
@@ -19,36 +19,33 @@ type DataProvider[V any] interface {
 	V() *V
 }
 
-// Funcs of dataloaderImpl are not concurrent safe.
+// Funcs of DataloaderImpl are not concurrent safe.
 // Except load().
-type dataloaderImpl[A, T any] struct {
-	args      A
-	loadFn    func(args A) (*T, error)
-	releaseFn func(args A, v *T)
+type DataloaderImpl[T any] struct {
+	loadFn    func() (*T, error)
+	releaseFn func(v *T)
 
 	v      atomic.Pointer[T]
 	staged *T
 }
 
-func newDataLoader[A, V any](
-	args A, // args that to create the loader in loadFn.
-	loadFn func(args A) (*V, error), // load the T. CANNOT be nil.
-	releaseFn func(args A, v *V), // Called when old T was swapped. Can be nil.
-) *dataloaderImpl[A, V] {
-	return &dataloaderImpl[A, V]{
-		args:      args,
+func NewDataLoader[V any](
+	loadFn func() (*V, error), // load the T. CANNOT be nil.
+	releaseFn func(v *V), // Called when old T was swapped. Can be nil.
+) *DataloaderImpl[V] {
+	return &DataloaderImpl[V]{
 		loadFn:    loadFn,
 		releaseFn: releaseFn,
 	}
 }
 
-func (s *dataloaderImpl[A, V]) loadAndStage() error {
-	_, err := s.loadAndStageV()
-	return err
+func (s *DataloaderImpl[V]) LoadAndStage() (ok bool) {
+	_, err := s.LoadAndStageV()
+	return err == nil
 }
 
-func (s *dataloaderImpl[A, V]) loadAndStageV() (*V, error) {
-	v, err := s.loadFn(s.args)
+func (s *DataloaderImpl[V]) LoadAndStageV() (*V, error) {
+	v, err := s.loadFn()
 	if err != nil {
 		return nil, err
 	}
@@ -56,23 +53,23 @@ func (s *dataloaderImpl[A, V]) loadAndStageV() (*V, error) {
 	return v, nil
 }
 
-func (s *dataloaderImpl[A, V]) commit() {
+func (s *DataloaderImpl[V]) Commit() {
 	if s.staged != nil {
 		old := s.v.Swap(s.staged)
 		s.staged = nil
 		if old != nil && s.releaseFn != nil {
-			s.releaseFn(s.args, old)
+			s.releaseFn(old)
 		}
 	}
 }
 
-func (s *dataloaderImpl[A, V]) discard() {
+func (s *DataloaderImpl[V]) Discard() {
 	if old := s.staged; old != nil && s.releaseFn != nil {
-		s.releaseFn(s.args, old)
+		s.releaseFn(old)
 	}
 	s.staged = nil
 }
 
-func (s *dataloaderImpl[A, V]) V() *V {
+func (s *DataloaderImpl[V]) V() *V {
 	return s.v.Load()
 }

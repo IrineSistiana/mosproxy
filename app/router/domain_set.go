@@ -16,9 +16,9 @@ func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
 		return fmt.Errorf("dup tag [%s]", cfg.Tag)
 	}
 
-	loadFn := func(args []string) (*domainmatcher.Matcher, error) {
+	loadFiles := func(fps []string) (*domainmatcher.Matcher, error) {
 		loader := domainmatcher.NewLoader()
-		for _, fp := range args {
+		for _, fp := range fps {
 			f, err := os.Open(fp)
 			if err != nil {
 				return nil, fmt.Errorf("failed to open domain file %s, %w", fp, err)
@@ -33,16 +33,24 @@ func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
 		if err != nil {
 			return nil, fmt.Errorf("failed to compile data set, %w", err)
 		}
+		return m, err
+	}
+	loadFn := func() (*domainmatcher.Matcher, error) {
+		m, err := loadFiles(cfg.Files)
+		if err != nil {
+			r.logger.Error().Str("tag", cfg.Tag).Strs("files", cfg.Files).Msg("failed to load domain set")
+			return nil, err
+		}
 		r.logger.Info().Str("tag", cfg.Tag).Strs("files", cfg.Files).Int("len", m.Len()).Msg("domain set loaded")
 		return m, nil
 	}
 
-	l := newDataLoader(cfg.Files, loadFn, nil)
-	err := l.loadAndStage()
+	l := NewDataLoader(loadFn, nil)
+	_, err := l.LoadAndStageV()
 	if err != nil {
 		return err
 	}
-	l.commit()
+	l.Commit()
 	r.domainSets[cfg.Tag] = l
 	return nil
 }

@@ -117,25 +117,26 @@ type Router struct {
 	prefetchSf *prefetchCtl
 	apiMux     *chi.Mux
 
-	// metrics
-	queryTotal         prometheus.Counter
-	queryCacheHitTotal prometheus.Counter
-	prefetchTotal      prometheus.Counter
-
 	closeOnce sync.Once
 
 	// init later
-	ecsZone          *dataloaderImpl[string, ipmarker.IpMarker]                  // nil if not configured
-	ecsZoneOverwrite *dataloaderImpl[string, ECSZoneOverWrite]                   // nil if not configured
-	cache            *CacheCtl                                                   // not nil, noop if no backend is configured
-	upstreams        map[string]*UpstreamWrapper                                 // not nil
-	loadBalancers    map[string]*LoadBalancer                                    // not nil
-	domainSets       map[string]*dataloaderImpl[[]string, domainmatcher.Matcher] // not nil
+	ecsZone          *DataloaderImpl[ipmarker.IpMarker]                // nil if not configured
+	ecsZoneOverwrite *DataloaderImpl[ECSZoneOverWrite]                 // nil if not configured
+	cache            *CacheCtl                                         // not nil, noop if no backend is configured
+	upstreams        map[string]*UpstreamWrapper                       // not nil
+	loadBalancers    map[string]*LoadBalancer                          // not nil
+	domainSets       map[string]*DataloaderImpl[domainmatcher.Matcher] // not nil
 	rules            []*rule
 	middlewares      []Middleware // nil if no middleware
 	serverClosers    []func()
 
-	reloading atomic.Uint32 // 1 = true
+	reloading           atomic.Uint32           // 1 = true
+	middlewareReloaders map[Dataloader]struct{} // not nil
+
+	// metrics
+	queryTotal         prometheus.Counter
+	queryCacheHitTotal prometheus.Counter
+	prefetchTotal      prometheus.Counter
 }
 
 func Run(cfg *Config) (_ *Router, err error) {
@@ -150,9 +151,10 @@ func Run(cfg *Config) (_ *Router, err error) {
 		prefetchSf: newPrefetchCtl(),
 		apiMux:     chi.NewMux(),
 
-		upstreams:     make(map[string]*UpstreamWrapper),
-		loadBalancers: make(map[string]*LoadBalancer),
-		domainSets:    make(map[string]*dataloaderImpl[[]string, domainmatcher.Matcher]),
+		upstreams:           make(map[string]*UpstreamWrapper),
+		loadBalancers:       make(map[string]*LoadBalancer),
+		domainSets:          make(map[string]*DataloaderImpl[domainmatcher.Matcher]),
+		middlewareReloaders: make(map[Dataloader]struct{}),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "query_total",
@@ -391,4 +393,13 @@ func (r *Router) GetMetricsReg() *prometheus.Registry {
 
 func (r *Router) GetApiMux() *chi.Mux {
 	return r.apiMux
+}
+
+// Register a reloader so that it will be reloaded with
+// api /reload.
+// impl must be comparable.
+// This func is not concurrent safe. Should only be called when middleware is
+// initializing.
+func (r *Router) RegMiddlewareReloader(impl Dataloader) {
+	r.middlewareReloaders[impl] = struct{}{}
 }

@@ -9,54 +9,46 @@ var (
 	ErrConcurrentReload = errors.New("concurrent reloading call")
 )
 
-
 func (r *Router) Reload() (err error) {
 	if !r.reloading.CompareAndSwap(0, 1) {
 		return ErrConcurrentReload
 	}
 	defer r.reloading.Store(0)
 
-	var stagedReloaders []dataloader
-	ready := func(r dataloader) {
+	var reloaders []Dataloader
+	if r.ecsZone != nil {
+		reloaders = append(reloaders, r.ecsZone)
+	}
+	if r.ecsZoneOverwrite != nil {
+		reloaders = append(reloaders, r.ecsZoneOverwrite)
+	}
+	for _, l := range r.domainSets {
+		reloaders = append(reloaders, l)
+	}
+
+	var stagedReloaders []Dataloader
+	ready := func(r Dataloader) {
 		stagedReloaders = append(stagedReloaders, r)
 	}
-	failed := false
-
-	defer func() { // commit or discard changes
+	commitAll := func() {
 		for _, r := range stagedReloaders {
-			if failed {
-				r.discard()
-			} else {
-				r.commit()
-			}
+			r.Commit()
 		}
-	}()
-
-	if loader := r.ecsZone; loader != nil {
-		err := loader.loadAndStage()
-		if err != nil {
-			failed = true
-			return fmt.Errorf("failed to reload , %w", err)
+	}
+	discardAll := func() {
+		for _, r := range stagedReloaders {
+			r.Discard()
 		}
-		ready(loader)
 	}
 
-	if loader := r.ecsZoneOverwrite; loader != nil {
-		err := loader.loadAndStage()
-		if err != nil {
-			failed = true
-			return fmt.Errorf("failed to reload ecs overwrite rules, %w", err)
+	for _, l := range reloaders {
+		ok := l.LoadAndStage()
+		if !ok {
+			discardAll()
+			return fmt.Errorf("failed to reload %T", l)
 		}
-		ready(loader)
+		ready(l)
 	}
-
-	for tag, loader := range r.domainSets {
-		err := loader.loadAndStage()
-		if err != nil {
-			failed = true
-			return fmt.Errorf("failed to reload domain set [%s], %w", tag, err)
-		}
-		ready(loader)
-	}
+	commitAll()
 	return nil
 }
