@@ -163,7 +163,7 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		q.Path = append(q.Path, req.URL.Path...)
 
 		h.r.serverEntryHandler(q)
-		respBuf = serverFinalRespB(m, q.Resp, false, udpSize)
+		respBuf = serverFinalRespB(m, q.Resp(), false, udpSize)
 	}
 
 	w.Header().Set("Content-Type", "application/dns-message")

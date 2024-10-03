@@ -93,7 +93,7 @@ func (c *CacheCtl) Store(key []byte, q *QueryCtx) {
 		return
 	}
 
-	resp := q.Resp
+	resp := q.Resp()
 	if resp == nil {
 		return
 	}

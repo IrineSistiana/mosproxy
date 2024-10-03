@@ -55,7 +55,7 @@ func (r *Router) serverEntryHandler(q *QueryCtx) {
 		r.BuiltInHandler(ctx, q)
 	}
 
-	if q.Resp == nil {
+	if q.resp == nil {
 		SetEmptyRespMQ(q, dnsmsg.RCodeRefused)
 	}
 	if r.opt.Log.Queries {
@@ -67,7 +67,7 @@ func (r *Router) serverEntryHandler(q *QueryCtx) {
 func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 	// Match rules
 	var matchedRule *rule
-	for i, rule := range r.rules {
+	for _, rule := range r.rules {
 		if rule.matcher != nil {
 			matcher := rule.matcher.V()
 			matched := matcher.Match(q.Question.Name)
@@ -78,7 +78,6 @@ func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 				continue
 			}
 		}
-		q.Trace.RuleIdx = i
 		matchedRule = rule
 		break
 	}
@@ -107,8 +106,7 @@ func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 			r.AsyncSingleFlightPrefetch(cacheKey, q, upstream)
 		}
 		r.queryCacheHitTotal.Inc()
-		q.Resp = resp
-		q.Trace.Cached = true
+		q.SetRespFrom(resp, "cache")
 		return
 	}
 
@@ -160,12 +158,13 @@ func (r *Router) forward(ctx context.Context, q *QueryCtx, upstream Upstream) er
 	m := r.MakeQueryMsg(q)
 	defer dnsmsg.ReleaseMsg(m)
 
-	resp, err := upstream.Exchange(ctx, q, m)
+	err := upstream.Exchange(ctx, q, m)
 	if err != nil {
 		return fmt.Errorf("failed to exchange, %w", err)
 	}
-	dnsmsg.RemoveEDNS0(resp)
-	q.Resp = resp
+	if r := q.Resp(); r != nil {
+		dnsmsg.RemoveEDNS0(r)
+	}
 	return nil
 }
 

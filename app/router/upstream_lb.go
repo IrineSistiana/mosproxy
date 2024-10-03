@@ -123,20 +123,20 @@ func (lb *LoadBalancer) buildIdx() {
 
 func (lb *LoadBalancer) Tag() string { return lb.tag }
 
-func (lb *LoadBalancer) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
+func (lb *LoadBalancer) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) error {
 	s := lb.sampler.Load()
 	b, zero := s.fastPath()
 	if zero {
 		// Try to start a ping test in a random upstream.
 		// Hope some upstreams may have recovered already.
 		lb.e[rand.IntN(len(lb.e))].u.HcTryStartPing()
-		return nil, errors.New("all backends are offline")
+		return errors.New("all backends are offline")
 	}
 	if b == nil {
 		b = lb.simpleFn(s, q)
 	}
 	if b == nil {
-		return nil, errors.New("no backend available")
+		return errors.New("no backend available")
 	}
 	return b.u.Exchange(ctx, q, m)
 }

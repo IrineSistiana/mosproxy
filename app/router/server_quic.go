@@ -173,7 +173,7 @@ func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection) {
 	q.ServerName = append(q.ServerName, c.ConnectionState().TLS.ServerName...)
 
 	s.r.serverEntryHandler(q)
-	respBuf = serverFinalRespB(m, q.Resp, true, 0)
+	respBuf = serverFinalRespB(m, q.Resp(), true, 0)
 
 sendResp:
 	if _, err = stream.Write(respBuf); err != nil {

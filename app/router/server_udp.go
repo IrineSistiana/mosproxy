@@ -352,7 +352,7 @@ func (s *udpServer) handleMsg(b, oob []byte, remoteAddr netip.AddrPort) {
 		defer ReleaseQueryCtx(q)
 		defer dnsmsg.ReleaseMsg(m)
 		s.r.serverEntryHandler(q)
-		resp := serverFinalRespB(m, q.Resp, false, udpSize)
+		resp := serverFinalRespB(m, q.Resp(), false, udpSize)
 		op := udpSendOp{
 			b:      resp,
 			remote: remoteAddr,

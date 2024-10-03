@@ -45,14 +45,8 @@ type QueryCtx struct {
 	Prefetch     bool         // This is a prefetch query.
 
 	// Resp
-	Resp  *dnsmsg.Msg
-	Trace Trace
-}
-
-type Trace struct {
-	RuleIdx  int    // Matched rule id.
-	Cached   bool   // Resp is from cache.
-	Upstream string // Resp is from this upstream.
+	resp     *dnsmsg.Msg
+	respFrom string // only for log and info
 }
 
 var queryCtxPool = sync.Pool{}
@@ -65,6 +59,26 @@ func NewQueryCtx() *QueryCtx {
 	q.Qid = rand.Uint32()
 	q.Start = time.Now()
 	return q
+}
+
+func (q *QueryCtx) Resp() *dnsmsg.Msg {
+	return q.resp
+}
+
+func (q *QueryCtx) RespFrom() (resp *dnsmsg.Msg, from string) {
+	return q.resp, q.respFrom
+}
+
+func (q *QueryCtx) SetResp(resp *dnsmsg.Msg) {
+	q.SetRespFrom(resp, "")
+}
+
+func (q *QueryCtx) SetRespFrom(resp *dnsmsg.Msg, from string) {
+	if q.resp != nil {
+		dnsmsg.ReleaseMsg(q.resp)
+	}
+	q.resp = resp
+	q.respFrom = from
 }
 
 func (q *QueryCtx) Reset() {
@@ -82,11 +96,11 @@ func (q *QueryCtx) Reset() {
 	q.ECSZone = ""
 	q.Prefetch = false
 
-	if q.Resp != nil {
-		dnsmsg.ReleaseMsg(q.Resp)
-		q.Resp = nil
+	if q.resp != nil {
+		dnsmsg.ReleaseMsg(q.resp)
+		q.resp = nil
 	}
-	q.Trace.Reset()
+	q.respFrom = ""
 }
 
 func (q *QueryCtx) Copy() *QueryCtx {
@@ -104,19 +118,11 @@ func (q *QueryCtx) Copy() *QueryCtx {
 	n.ECSZone = q.ECSZone
 	n.Prefetch = q.Prefetch
 
-	if q.Resp != nil {
-		n.Resp = q.Resp.Copy()
+	if q.resp != nil {
+		n.resp = q.resp.Copy()
 	}
-	q.Trace.CopyTo(&n.Trace)
+	n.respFrom = q.respFrom
 	return n
-}
-
-func (t *Trace) Reset() {
-	*t = Trace{}
-}
-
-func (t *Trace) CopyTo(n *Trace) {
-	*n = *t
 }
 
 func zero[T any](s *[]T) {
@@ -169,20 +175,11 @@ func (q *QueryCtx) LogServerMeta() *zerolog.Event {
 
 func (q *QueryCtx) LogResp() *zerolog.Event {
 	e := zerolog.Dict()
-	if r := q.Resp; r != nil {
+	if r := q.resp; r != nil {
 		e.Uint16("rcode", uint16(r.RCode))
-	}
-
-	e.Int("rule", q.Trace.RuleIdx)
-	if q.Trace.Cached {
-		e.Bool("cached", true)
-	}
-	if len(q.Trace.Upstream) > 0 {
-		e.Str("upstream", q.Trace.Upstream)
-	}
-
-	if !q.Start.IsZero() {
-		e.Dur("elapsed", time.Since(q.Start))
+		if len(q.respFrom) > 0 {
+			e.Str("resp_by", q.respFrom)
+		}
 	}
 	return e
 }

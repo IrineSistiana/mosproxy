@@ -200,7 +200,7 @@ func (h *fasthttpHandler) HandleFastHTTP(ctx *fasthttp.RequestCtx) {
 		q.Path = append(q.Path, ctx.Path()...)
 
 		h.r.serverEntryHandler(q)
-		respBuf = serverFinalRespB(m, q.Resp, false, udpSize)
+		respBuf = serverFinalRespB(m, q.Resp(), false, udpSize)
 	}
 
 	ctx.Response.Header.Add("Content-Type", "application/dns-message")

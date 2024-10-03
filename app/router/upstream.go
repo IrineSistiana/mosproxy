@@ -61,7 +61,9 @@ func (r *Router) initUpstream(cfg *UpstreamConfig) error {
 }
 
 type Upstream interface {
-	Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) (*dnsmsg.Msg, error)
+	// Exchange send m to upstream. And set the resp in q.
+	// q is for info only, Exchange should not change the info in q, except the resp.
+	Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) error
 }
 
 // Wrapper for upstream.Upstream, with tag info and metrics.
@@ -169,10 +171,10 @@ func (uw *UpstreamWrapper) Ping(ctx context.Context) error {
 	return err
 }
 
-func (uw *UpstreamWrapper) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
+func (uw *UpstreamWrapper) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) error {
 	if uw.HcEnabled() && uw.HcOffline() {
 		uw.HcTryStartPing()
-		return nil, ErrUpstreamOffline
+		return ErrUpstreamOffline
 	}
 	r, err := uw.exchange(ctx, q, m)
 	if uw.HcEnabled() {
@@ -182,7 +184,11 @@ func (uw *UpstreamWrapper) Exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.
 			uw.hcSucceed()
 		}
 	}
-	return r, err
+	if err != nil {
+		return err
+	}
+	q.SetRespFrom(r, uw.tag)
+	return nil
 }
 
 func (uw *UpstreamWrapper) exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.Msg) (*dnsmsg.Msg, error) {
@@ -208,7 +214,6 @@ func (uw *UpstreamWrapper) exchange(ctx context.Context, q *QueryCtx, m *dnsmsg.
 		if r.opt.Log.TraceMsgs {
 			r.debugLogMsg(q, resp, uw.tag, "response received from upstream")
 		}
-		q.Trace.Upstream = uw.tag
 	}
 	return resp, err
 }
