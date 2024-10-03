@@ -20,7 +20,7 @@ func newTree() *tree {
 	return &tree{}
 }
 
-func (t *tree) Add(name *dnsmsg.Name, dataOff int64, inherit bool) error {
+func (t *tree) Add(name dnsmsg.Name, dataOff int64, inherit bool) error {
 	s := dnsmsg.NewNameScanner(name)
 	s.Reverse()
 	curNode := &t.root

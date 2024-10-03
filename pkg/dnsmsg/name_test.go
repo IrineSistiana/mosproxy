@@ -69,7 +69,7 @@ func TestName_AppendReadableTo(t *testing.T) {
 func Test_NameScanner(t *testing.T) {
 	r := require.New(t)
 	testFn := func(s string, want []string) {
-		n := NewName()
+		var n Name
 		err := n.Parse(s)
 		r.NoError(err)
 

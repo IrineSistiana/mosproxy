@@ -33,7 +33,7 @@ func TestMixMatcher_Match(t *testing.T) {
 	m, err := loader.Compile()
 	r.NoError(err)
 	match := func(n string, expect bool) {
-		name := dnsmsg.NewName()
+		var name dnsmsg.Name
 		err := name.Parse(n)
 		r.NoError(err)
 		res := m.Match(name)
@@ -62,10 +62,10 @@ func Benchmark_Matcher_100k(b *testing.B) {
 	)
 
 	rules := make([]string, 0, tldN*l2N)
-	names := make([]*dnsmsg.Name, 0, tldN*l2N)
+	names := make([]dnsmsg.Name, 0, tldN*l2N)
 	for i := 0; i < tldN; i++ {
 		for j := 0; j < l2N; j++ {
-			name := dnsmsg.NewName()
+			var name dnsmsg.Name
 			s := fmt.Sprintf("%d.%d.", j, i)
 			err := name.Parse(s)
 			if err != nil {
@@ -154,7 +154,7 @@ func Benchmark_1000k(b *testing.B) {
 	runtime.GC()
 
 	b.Run("match", func(b *testing.B) {
-		name := dnsmsg.NewName()
+		var name dnsmsg.Name
 		err := name.Parse("000000.10000000.1")
 		if err != nil {
 			b.Fatal(err)

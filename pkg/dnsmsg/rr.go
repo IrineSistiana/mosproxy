@@ -83,7 +83,7 @@ func (h *ResourceHdr) packLen(compression map[string]uint16) (int, error) {
 }
 
 func (h *ResourceHdr) copyFrom(h2 *ResourceHdr) {
-	h.Name.CopyFrom(&h2.Name)
+	h.Name.CopyFrom(h2.Name)
 	h.Type = h2.Type
 	h.Class = h2.Class
 	h.TTL = h2.TTL
@@ -198,7 +198,7 @@ func (r *NAMEResource) unpackBody(msg []byte, off int) (int, error) {
 func (r *NAMEResource) Copy() Resource {
 	n := NewNAME()
 	n.ResourceHdr.copyFrom(&r.ResourceHdr)
-	n.NameData.CopyFrom(&r.NameData)
+	n.NameData.CopyFrom(r.NameData)
 	return n
 }
 
@@ -288,8 +288,8 @@ func (r *SOA) Copy() Resource {
 	n := NewSOA()
 	n.ResourceHdr.copyFrom(&r.ResourceHdr)
 
-	n.NS.CopyFrom(&r.NS)
-	n.MBox.CopyFrom(&r.MBox)
+	n.NS.CopyFrom(r.NS)
+	n.MBox.CopyFrom(r.MBox)
 	n.Serial = r.Serial
 	n.Refresh = r.Refresh
 	n.Retry = r.Retry
@@ -360,7 +360,7 @@ func (r *MX) Copy() Resource {
 	n.ResourceHdr.copyFrom(&r.ResourceHdr)
 
 	n.Pref = r.Pref
-	n.MX.CopyFrom(&r.MX)
+	n.MX.CopyFrom(r.MX)
 	return n
 }
 
@@ -435,7 +435,7 @@ func (r *SRV) Copy() Resource {
 	n.Priority = r.Priority
 	n.Weight = r.Weight
 	n.Port = r.Port
-	n.Target.CopyFrom(&r.Target)
+	n.Target.CopyFrom(r.Target)
 	return n
 }
 

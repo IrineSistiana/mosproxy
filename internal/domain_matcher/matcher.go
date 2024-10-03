@@ -57,9 +57,9 @@ func (l *Loader) Add(rule []byte) error {
 		n.ToLower()
 
 		if string(typ) == "full" {
-			err = l.tree.Add(n, 0, false)
+			err = l.tree.Add(*n, 0, false)
 		} else {
-			err = l.tree.Add(n, 0, true)
+			err = l.tree.Add(*n, 0, true)
 		}
 		return err
 	case "regexp":
@@ -124,7 +124,7 @@ func (m *Matcher) Len() int {
 	return l
 }
 
-func (m *Matcher) Match(name *dnsmsg.Name) bool {
+func (m *Matcher) Match(name dnsmsg.Name) bool {
 	if m.ct != nil {
 		if _, lvl := m.ct.Match(name); lvl > -2 {
 			return true

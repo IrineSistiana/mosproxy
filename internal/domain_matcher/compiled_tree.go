@@ -115,7 +115,7 @@ func seg[T any](s []T, idx segAddr) []T {
 // the dataOff at node "c" and lvl==2.
 // If matched the root node, lvl==-1.
 // If no match, return -2.
-func (e *compiledTree) Match(n *dnsmsg.Name) (dataOff int64, lvl int) {
+func (e *compiledTree) Match(n dnsmsg.Name) (dataOff int64, lvl int) {
 	lvl = -2
 	if len(e.nodes) == 0 { // empty tree
 		return

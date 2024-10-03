@@ -58,7 +58,7 @@ func (n *Name) Reset() {
 	n.s = n.s[:0]
 }
 
-func (n *Name) CopyFrom(n2 *Name) {
+func (n *Name) CopyFrom(n2 Name) {
 	n.Reset()
 	n.ok = n2.ok
 	n.b = append(n.b, n2.b...)
@@ -378,13 +378,13 @@ func (n *Name) Parse(s string) error {
 }
 
 type NameScanner struct {
-	n     *Name
+	n     Name
 	r     bool
 	p     int
 	label []byte
 }
 
-func NewNameScanner(n *Name) NameScanner {
+func NewNameScanner(n Name) NameScanner {
 	return NameScanner{n: n}
 }
 

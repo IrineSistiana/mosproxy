@@ -12,7 +12,7 @@ func Test_Tree(t *testing.T) {
 
 	tree := newTree()
 	add := func(s string, off int64, inherit bool) {
-		n := dnsmsg.NewName()
+		var n dnsmsg.Name
 		err := n.Parse(s)
 		r.NoError(err)
 		tree.Add(n, off, inherit)
@@ -29,7 +29,7 @@ func Test_Tree(t *testing.T) {
 	ct, err := tree.Compile()
 	r.NoError(err)
 	want := func(s string, dataOff int64, lvl int) {
-		n := dnsmsg.NewName()
+		var n dnsmsg.Name
 		err := n.Parse(s)
 		r.NoError(err)
 		gotDataOff, gotLvl := ct.Match(n)

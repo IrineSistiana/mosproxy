@@ -28,7 +28,7 @@ func (q *Question) Copy() *Question {
 }
 
 func (q *Question) CopyFrom(q2 *Question) {
-	q.Name.CopyFrom(&q2.Name)
+	q.Name.CopyFrom(q2.Name)
 	q.Class = q2.Class
 	q.Type = q2.Type
 }

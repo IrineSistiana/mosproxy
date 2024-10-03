@@ -70,7 +70,7 @@ func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 	for i, rule := range r.rules {
 		if rule.matcher != nil {
 			matcher := rule.matcher.V()
-			matched := matcher.Match(&q.Question.Name)
+			matched := matcher.Match(q.Question.Name)
 			if rule.reverse {
 				matched = !matched
 			}
