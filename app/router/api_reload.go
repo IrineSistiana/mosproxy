@@ -25,6 +25,9 @@ func (r *Router) Reload() (err error) {
 	for _, l := range r.domainSets {
 		reloaders = append(reloaders, l)
 	}
+	for l := range r.middlewareReloaders {
+		reloaders = append(reloaders, l)
+	}
 
 	var stagedReloaders []Dataloader
 	ready := func(r Dataloader) {
