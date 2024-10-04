@@ -6,6 +6,7 @@ import (
 	"net/netip"
 
 	"github.com/IrineSistiana/mosproxy/internal/pool"
+	"github.com/IrineSistiana/mosproxy/internal/utils"
 	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
 )
 
@@ -55,13 +56,15 @@ func (r *Router) serverEntryHandler(q *QueryCtx) {
 		r.BuiltInHandler(ctx, q)
 	}
 
-	if q.resp == nil {
+	if q.Resp() == nil {
 		SetEmptyRespMQ(q, dnsmsg.RCodeRefused)
 	}
 	if r.opt.Log.Queries {
 		r.logAccess(q)
 	}
 }
+
+var cacheKeyPool = pool.NewBytesPool()
 
 // router main handle func.
 func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
@@ -96,14 +99,14 @@ func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 		return
 	}
 
-	cacheKey := r.cache.Key(q)
-	defer pool.ReleaseBuf(cacheKey)
-
 	// lookup cache
-	resp, t := r.cache.Get(ctx, cacheKey)
+	ckb := cacheKeyPool.Get()
+	defer cacheKeyPool.Release(ckb)
+	ckb.B = r.appendCacheKey(ckb.B, q)
+	resp, t := r.cache.Get(ctx, ckb.B)
 	if resp != nil {
 		if r.needPrefetch(t) {
-			r.AsyncSingleFlightPrefetch(cacheKey, q, upstream)
+			r.AsyncSingleFlightPrefetch(ckb.B, q, upstream)
 		}
 		r.queryCacheHitTotal.Inc()
 		q.SetRespFrom(resp, "cache")
@@ -120,27 +123,32 @@ func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 		SetEmptyRespMQ(q, dnsmsg.RCodeServerFailure)
 		return
 	}
-
-	r.cache.Store(cacheKey, q)
+	r.cache.Store(ckb.B, q.Resp())
 }
 
-// Prefetching q in other goroutine. If key is currently prefetching, do nothing.
+// Prefetching q in other goroutine.
+// If a query with same key is currently prefetching, do nothing.
 func (r *Router) AsyncSingleFlightPrefetch(key []byte, q *QueryCtx, u Upstream) {
-	if ok := r.prefetchSf.Reserve(key); !ok {
+	if len(key) == 0 {
 		return
 	}
-	keyCopy := pool.CopyBuf(key)
+	sk, ok := r.prefetchSf.Reserve(key)
+	if !ok {
+		return
+	}
 	qCopy := q.Copy()
 	go func() {
-		defer pool.ReleaseBuf(keyCopy)
 		defer ReleaseQueryCtx(qCopy)
-		defer r.prefetchSf.Done(keyCopy)
-		r.DoPrefetch(keyCopy, qCopy, u)
+		r.DoPrefetch(utils.Str2BytesUnsafe(sk), qCopy, u)
 	}()
 }
 
-// Send q to u, and save response using key.
+// Send q to u, and save response under key.
 func (r *Router) DoPrefetch(key []byte, q *QueryCtx, u Upstream) {
+	if len(key) == 0 {
+		return
+	}
+
 	q.Prefetch = true
 	ctx, cancel := context.WithTimeout(r.ctx, prefetchTimeout)
 	defer cancel()
@@ -149,7 +157,7 @@ func (r *Router) DoPrefetch(key []byte, q *QueryCtx, u Upstream) {
 		return
 	}
 	r.prefetchTotal.Inc()
-	r.cache.Store(key, q)
+	r.cache.Store(key, q.Resp())
 }
 
 // forward query to upstream and set the response.

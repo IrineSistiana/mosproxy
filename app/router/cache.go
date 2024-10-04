@@ -2,7 +2,6 @@ package router
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -88,19 +87,17 @@ func (c *CacheCtl) Nop() bool {
 
 // Store resp into cache.
 // Note: resp must not contain EDNS0 record.
-func (c *CacheCtl) Store(key []byte, q *QueryCtx) {
+func (c *CacheCtl) Store(key []byte, resp *dnsmsg.Msg) {
 	if c.memory == nil && c.redis == nil {
 		return
 	}
-
-	resp := q.Resp()
-	if resp == nil {
+	if len(key) == 0 || resp == nil {
 		return
 	}
 
 	// Check EDNS0, EDNS0 CANNOT be cached
 	if hasEDNS0(resp) {
-		c.logger.Error().Dict("query", q.LogQuery()).Msg("storing a msg with EDNS0 rr")
+		c.logger.Error().Bytes("key", key).Msg("storing a msg with EDNS0 rr")
 		return
 	}
 
@@ -173,8 +170,7 @@ func (c *CacheCtl) Store(key []byte, q *QueryCtx) {
 
 	e := c.logger.Debug()
 	if e != nil {
-		e.Dict("query", q.LogQuery())
-		e.Uint16("rcode", uint16(resp.RCode))
+		e.Bytes("key", key)
 		e.Int("ttl", msgTtl)
 		e.Int("cache_ttl", msgTtl+c.optimisticTtl)
 		e.Int("size", len(v))
@@ -192,18 +188,6 @@ func (c *CacheCtl) Store(key []byte, q *QueryCtx) {
 	if c.redis != nil {
 		c.redis.Store(key, v, t, negativeResp)
 	}
-}
-
-// Get cache key for this query.
-func (c *CacheCtl) Key(q *QueryCtx) pool.Buffer {
-	b := pool.GetBuf(len(q.Question.Name.Data()) + 4 + len(q.ECSZone))
-	off := copy(b, q.Question.Name.Data())
-	binary.BigEndian.PutUint16(b[off:], uint16(q.Question.Class))
-	off += 2
-	binary.BigEndian.PutUint16(b[off:], uint16(q.Question.Type))
-	off += 2
-	copy(b[off:], []byte(q.ECSZone))
-	return b
 }
 
 // If cache hit, Get will return a resp (not shared). It is the caller's
@@ -317,19 +301,20 @@ func newPrefetchCtl() *prefetchCtl {
 	}
 }
 
-func (c *prefetchCtl) Reserve(key []byte) bool {
+func (c *prefetchCtl) Reserve(key []byte) (sk string, ok bool) {
 	c.m.Lock()
 	defer c.m.Unlock()
 	_, dup := c.queue[string(key)]
 	if dup {
-		return false
+		return "", false
 	}
-	c.queue[string(key)] = struct{}{}
-	return true
+	s := string(key)
+	c.queue[s] = struct{}{}
+	return s, true
 }
 
-func (c *prefetchCtl) Done(key []byte) {
+func (c *prefetchCtl) Done(key string) {
 	c.m.Lock()
 	defer c.m.Unlock()
-	delete(c.queue, string(key))
+	delete(c.queue, key)
 }

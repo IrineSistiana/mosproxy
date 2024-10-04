@@ -70,3 +70,26 @@ func ReleaseBR1K(br *bufio.Reader) {
 	br.Reset(nil)
 	br1kPool.Put(br)
 }
+
+type BytesPool struct {
+	sp sync.Pool
+}
+
+func NewBytesPool() *BytesPool {
+	return &BytesPool{sp: sync.Pool{New: func() any { return new(Bytes) }}}
+}
+
+type Bytes struct {
+	B []byte
+}
+
+func (p *BytesPool) Get() *Bytes {
+	return p.sp.Get().(*Bytes)
+}
+
+func (p *BytesPool) Release(b *Bytes) {
+	if b.B != nil {
+		b.B = b.B[:0]
+	}
+	p.sp.Put(b)
+}

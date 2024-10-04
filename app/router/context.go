@@ -27,14 +27,16 @@ type QueryCtx struct {
 	Qid   uint32 // rand id for logging only. Not the dns msg id.
 	Start time.Time
 
+	Prefetch bool // This is a prefetch query.
+
 	// DNS query
 	Question  dnsmsg.Question // Always valid.
-	ClientECS netip.Prefix    // ECS from client query. Maybe invalid.
+	ClientECS netip.Prefix    // ECS from client query. Invalid if client query does not have ECS.
 
 	// Server side info
 	ServerTag  string         // Which server the query comes from. Maybe empty if not set.
-	Protocol   Proto          // Server protocol
-	RemoteAddr netip.AddrPort // Client addr, maybe invalid. e.g from unix socket
+	Protocol   Proto          // Server protocol.
+	RemoteAddr netip.AddrPort // Client addr, maybe invalid. e.g from unix socket.
 	ServerName []byte         // TLS servername, if protocol is based on TLS (DoT,DoH,DoQ)
 	Host       []byte         // HTTP host (if protocol is based on HTTP)
 	Path       []byte         // HTTP path (if protocol is based on HTTP)
@@ -42,7 +44,6 @@ type QueryCtx struct {
 	// Other info
 	ECS2Upstream netip.Prefix // ECS that is going to send to upstream.
 	ECSZone      string       // zone name for the ECS addr.
-	Prefetch     bool         // This is a prefetch query.
 
 	// Resp
 	resp     *dnsmsg.Msg
@@ -84,6 +85,7 @@ func (q *QueryCtx) SetRespFrom(resp *dnsmsg.Msg, from string) {
 func (q *QueryCtx) Reset() {
 	q.Qid = 0
 	q.Start = time.Time{}
+	q.Prefetch = false
 	q.Question.Reset()
 	q.ClientECS = netip.Prefix{}
 	q.Protocol = ProtoUnKnown
@@ -94,7 +96,6 @@ func (q *QueryCtx) Reset() {
 
 	q.ECS2Upstream = netip.Prefix{}
 	q.ECSZone = ""
-	q.Prefetch = false
 
 	if q.resp != nil {
 		dnsmsg.ReleaseMsg(q.resp)
@@ -107,6 +108,8 @@ func (q *QueryCtx) Copy() *QueryCtx {
 	n := NewQueryCtx()
 	n.Qid = q.Qid
 	n.Start = q.Start
+	n.Prefetch = q.Prefetch
+
 	n.Question.CopyFrom(&q.Question)
 	n.ClientECS = q.ClientECS
 	n.Protocol = q.Protocol
@@ -116,7 +119,6 @@ func (q *QueryCtx) Copy() *QueryCtx {
 
 	n.ECS2Upstream = q.ECS2Upstream
 	n.ECSZone = q.ECSZone
-	n.Prefetch = q.Prefetch
 
 	if q.resp != nil {
 		n.resp = q.resp.Copy()
