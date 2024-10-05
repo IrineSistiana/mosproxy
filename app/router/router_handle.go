@@ -32,6 +32,10 @@ func (r *Router) serverEntryHandler(q *QueryCtx) {
 			m := r.ecsZone.V()
 			if m != nil {
 				q.ECSZone = m.Mark(q.ECS2Upstream.Addr())
+				// No zone, assume it is local, don not send ecs to upstream
+				if len(q.ECSZone) == 0 {
+					q.ECS2Upstream = netip.Prefix{}
+				}
 			}
 		}
 
