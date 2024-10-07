@@ -35,15 +35,16 @@ func newProxyCmd() *cobra.Command {
 		cacheRedis         string
 		cacheOptimisticTTL int
 		accessLog          bool
+		api                string
 	)
 	c := &cobra.Command{
-		Use:   "proxy -u upstream_addr [-u upstream_addr] [flags]",
+		Use:   "proxy -l listen_addr -u upstream_addr [-u upstream_addr]... [flags]",
 		Short: "Start a dns proxy service via command line",
 		Long: "Start a dns proxy service via command line. e.g:" +
 			"\nProxy from 0.0.0.0:5353 to Google DoH." +
-			"\n\t`proxy -l 0.0.0.0:5353 -u https://dns.google/dns-query`" +
-			"\nProxy to Cloudflare DNS, send client subnet to upstream, and use Google DNS as fallback." +
-			"\n\t`proxy -l 0.0.0.0:5353 -u 1.1.1.1 -u 8.8.8.8 --upstream-lb fall_through --ecs`",
+			"\n\tproxy -l 0.0.0.0:5353 -u https://dns.google/dns-query" +
+			"\nProxy to Cloudflare DNS, send client subnet to upstreams, and use Google DNS as fallback." +
+			"\n\tproxy -l 0.0.0.0:5353 -u 1.1.1.1 -u 8.8.8.8 --upstream-lb fall_through --ecs",
 		Args: cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			logger := mlog.L()
@@ -54,26 +55,43 @@ func newProxyCmd() *cobra.Command {
 					{Listen: listen, Protocol: "tcp"},
 				}
 			} else {
-				cfg.Servers = []router.ServerConfig{
-					{
-						Listen:   listen,
-						Protocol: protocol,
-						Tls: router.TlsConfig{
-							Certs: []string{tlsCert},
-							Keys:  []string{tlsKey},
-						},
-					},
+				sCfg := router.ServerConfig{
+					Listen:   listen,
+					Protocol: protocol,
 				}
+				if len(tlsCert) > 0 {
+					sCfg.Tls.Certs = append(sCfg.Tls.Certs, tlsCert)
+				}
+				if len(tlsKey) > 0 {
+					sCfg.Tls.Keys = append(sCfg.Tls.Keys, tlsKey)
+				}
+				cfg.Servers = []router.ServerConfig{sCfg}
 			}
 
 			if len(upstreams) == 0 {
 				logger.Fatal().Msg("no upstream is configured")
 			}
+
+			mustParseInt := func(q url.Values, k string, df int) int {
+				s := q.Get(k)
+				if len(s) > 0 {
+					i, err := strconv.Atoi(s)
+					if err != nil {
+						logger.Fatal().Err(err).Str("key0", k).Msg("invalid arg in upstream url")
+					}
+					return i
+				} else {
+					return df
+				}
+			}
+			lbBackends := make([]router.LoadBalancerBackendConfig, 0)
 			for _, u := range upstreams {
 				var (
 					tag      string
 					dialAddr string
 					maxFails int
+					weight   int
+					qps      int
 					insecure bool
 				)
 				if !strings.Contains(u, "://") {
@@ -89,19 +107,11 @@ func newProxyCmd() *cobra.Command {
 					tag = u
 				}
 				dialAddr = q.Get("dial_addr")
+				maxFails = mustParseInt(q, "max_fails", 5)
+				weight = mustParseInt(q, "weight", 1)
+				qps = mustParseInt(q, "qps", 0)
 
-				s := q.Get("max_fails")
-				if len(s) > 0 {
-					var err error
-					maxFails, err = strconv.Atoi(s)
-					if err != nil {
-						logger.Fatal().Err(err).Msg("invalid max_fails arg in upstream url")
-					}
-				} else {
-					maxFails = 5
-				}
-
-				s = q.Get("insecure")
+				s := q.Get("insecure")
 				if len(s) > 0 {
 					var err error
 					insecure, err = strconv.ParseBool(s)
@@ -120,13 +130,12 @@ func newProxyCmd() *cobra.Command {
 						MaxFails: maxFails,
 					},
 				})
+				lbBackends = append(lbBackends, router.LoadBalancerBackendConfig{Tag: tag, Weight: weight, QPS: qps})
 			}
 			lbCfg := router.LoadBalancerConfig{
-				Tag:    "lb",
-				Method: upstreamLb,
-			}
-			for _, u := range cfg.Upstreams {
-				lbCfg.Backends = append(lbCfg.Backends, router.LoadBalancerBackendConfig{Tag: u.Tag})
+				Tag:      "lb",
+				Method:   upstreamLb,
+				Backends: lbBackends,
 			}
 			cfg.LoadBalancers = []router.LoadBalancerConfig{lbCfg}
 			cfg.Rules = []router.RuleConfig{{Forward: "lb"}}
@@ -139,6 +148,7 @@ func newProxyCmd() *cobra.Command {
 				MaximumTTL:    3600 * 24,
 			}
 			cfg.Log = router.LogConfig{Queries: accessLog}
+			cfg.API = router.APIConfig{Addr: api}
 
 			r, err := router.Run(&cfg)
 			if err != nil {
@@ -168,7 +178,9 @@ func newProxyCmd() *cobra.Command {
 		},
 	}
 	fs := c.Flags()
-	fs.StringVarP(&listen, "listen", "l", "127.0.0.1:53", "Listening address.")
+	fs.SortFlags = false
+	fs.StringVarP(&listen, "listen", "l", "", "Listening address.")
+	c.MarkFlagRequired("listen")
 	fs.StringVarP(&protocol, "protocol", "p", "", "Listening protocol.\nOne of [udp|tcp|tls|http|fasthttp|https|quic].\nDefault is listening both udp and tcp.")
 	fs.StringVar(&tlsCert, "tls-cert", "", "Path to a file of PEM certificate.")
 	fs.StringVar(&tlsKey, "tls-key", "", "Path to a file of PEM private key.")
@@ -176,16 +188,22 @@ func newProxyCmd() *cobra.Command {
 	usage := "Upstream addr (can be specified multiple times)." +
 		"\nFormat: [protocol://]host[:port][/path][?arg_key=arg_value][&arg_key=arg_value]..." +
 		"\nprotocol can be one of: [udp|tcp[+pipeline]|tls[+pipeline]|https|h3|quic]" +
+		"\ne.g.: tcp://8.8.8.8:53, https://dns.google/dns-query?dial_addr=8.8.8.8&tag=google_doh" +
 		"\nSupported arg_key:" +
 		"\n\ttag: Tag name for this upstream, useful for logging." +
-		"\n\tdial_addr: IP addr of the host." +
+		"\n\tdial_addr: Specifying the IP address of the host." +
+		"\n\t\t(Eliminate the need for host name resolution and establish connections faster)" +
+		"\n\tweight: Weight of this upstream. (See --upstream-lb flag)" +
+		"\n\tqps: QPS limit of this upstream. (See --upstream-lb flag, fall_through mode)" +
 		"\n\tmax_fails: If the upstream failed max_fails times continuously, mark it as offline. (default 5)" +
-		"\n\tinsecure: [true] Disable TLS server verification." +
-		"\ne.g.: tcp://8.8.8.8:53, https://dns.google/dns-query?dial_addr=8.8.8.8&tag=google_doh"
+		"\n\t\t(See --upstream-lb flag)" +
+		"\n\tinsecure: [true] Disable TLS server verification."
 	fs.StringSliceVarP(&upstreams, "upstream", "u", nil, usage)
+	c.MarkFlagRequired("upstream")
 	usage = "Upstream load balance mode:" +
 		"\n\trandom: Use random online upstream." +
-		"\n\tfall_through: Fallback to next online upstream if previous one was offline." +
+		"\n\tfall_through: Fallback to next online upstream if previous one was offline or reached QPS limit." +
+		"\n\t\tNote: Upstream weights are ignored in this mode." +
 		"\n\tqname_hash: Queries with same domain name will use the same online upstream." +
 		"\n\tclient_ip_hash: Queries from same ip will use the same online upstream."
 	fs.StringVar(&upstreamLb, "upstream-lb", "random", usage)
@@ -199,5 +217,6 @@ func newProxyCmd() *cobra.Command {
 	fs.StringVar(&cacheRedis, "cache-redis", "", usage)
 	fs.IntVar(&cacheOptimisticTTL, "cache-optimistic-ttl", 0, "If > 0, enable optimistic cache.")
 	fs.BoolVar(&accessLog, "access-log", false, "Print all queries to log.")
+	fs.StringVar(&api, "api", "", "API server listening address.")
 	return c
 }
