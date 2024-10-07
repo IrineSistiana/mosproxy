@@ -96,13 +96,14 @@ type noCopy struct{}
 func (*noCopy) Lock()   {}
 func (*noCopy) Unlock() {}
 
-func parseDDD(b string) (byte, bool) {
+func parseDDD[T []byte | string](b T) (byte, bool) {
 	const base = 10
 	if len(b) != 3 {
 		return 0, false
 	}
 	s := 0
-	for _, c := range b {
+	for i := 0; i < len(b); i++ {
+		c := b[i]
 		if c < 30 || c > 39 {
 			return 0, false
 		}

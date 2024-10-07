@@ -21,11 +21,10 @@ func newTree() *tree {
 }
 
 func (t *tree) Add(name dnsmsg.Name, dataOff int64, inherit bool) error {
-	s := dnsmsg.NewNameScanner(name)
-	s.Reverse()
+	labels := name.Labels()
 	curNode := &t.root
-	for s.Scan() {
-		label := s.Label()
+	for i := len(labels) - 1; i >= 0; i-- {
+		label := labels[i]
 		child, ok := curNode.children[string(label)]
 		if !ok {
 			var err error

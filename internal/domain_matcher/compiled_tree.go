@@ -137,16 +137,16 @@ func (e *compiledTree) Match(n dnsmsg.Name) (dataOff int64, lvl int) {
 		}
 	}
 
-	s := dnsmsg.NewNameScanner(n)
-	s.Reverse()
-	for i := 0; s.Scan(); i++ {
+	labels := n.Labels()
+	for i := range labels {
+		label := labels[len(labels)-1-i]
 		// reset fm status
 		fm = false
 		fmOff = 0
 		fmLvl = 0
 
 		idxSeg := seg(e.idxNodes, curNode.childIdxSeg)
-		elemIdx := e.binarySearchIdx(idxSeg, s.Label())
+		elemIdx := e.binarySearchIdx(idxSeg, label)
 		if elemIdx < 0 {
 			return
 		}

@@ -20,7 +20,7 @@ func newEDNS0(udpSize uint16) *dnsmsg.RawResource {
 		udpSize = 512
 	}
 	opt := dnsmsg.NewRaw()
-	opt.Name.Finish() // Just "."
+	opt.Name.Parse(".") // Just "."
 	opt.Class = dnsmsg.Class(udpSize)
 	opt.Type = dnsmsg.TypeOPT
 	return opt

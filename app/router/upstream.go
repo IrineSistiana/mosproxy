@@ -162,7 +162,7 @@ func (uw *UpstreamWrapper) Ping(ctx context.Context) error {
 	defer dnsmsg.ReleaseMsg(m)
 
 	q := dnsmsg.NewQuestion()
-	q.Name.Finish()
+	q.Name.Parse(".")
 	q.Class = dnsmsg.ClassINET
 	q.Type = dnsmsg.TypeNS
 	m.Questions = append(m.Questions, q)
