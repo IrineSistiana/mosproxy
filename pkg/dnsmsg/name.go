@@ -189,7 +189,10 @@ Loop:
 	if ptr == 0 {
 		newOff = currOff
 	}
-	n.parseLabels()
+	err := n.parseLabels()
+	if err != nil {
+		return off, fmt.Errorf("internal error: %w", err)
+	}
 	return newOff, nil
 }
 
@@ -231,6 +234,13 @@ func appendEscapedLabel(dst []byte, label []byte) []byte {
 			case '\\':
 				dst = append(dst, "\\\\"...)
 			default:
+				dst = append(dst, '\\')
+				switch {
+				case b < 10:
+					dst = append(dst, "00"...)
+				case b < 100:
+					dst = append(dst, '0')
+				}
 				dst = strconv.AppendUint(dst, uint64(b), 10)
 			}
 		}
@@ -257,17 +267,21 @@ func appendLabelTo[T []byte | string](n *Name, s T) error {
 	return nil
 }
 
-func (n *Name) parseLabels() {
+func (n *Name) parseLabels() error {
 	for i := 0; i < len(n.b); {
 		l := int(n.b[i])
 		if l == 0 {
-			return
+			if i != len(n.b)-1 {
+				return errNameBufTooLong
+			}
+			return nil
 		}
 		start := i + 1
 		end := start + l
 		n.s = append(n.s, n.b[start:end])
 		i += 1 + l
 	}
+	return errNameBufTooShort
 }
 
 func (n *Name) Parse(s string) error {
@@ -302,9 +316,9 @@ func ParseName[T []byte | string](n *Name, s T) error {
 					c = nextChar
 					ok = true
 				} else { // "\DDD"
-					if i+4 <= len(s) {
+					if n+3 <= len(s) {
 						i += 3
-						c, ok = parseDDD(s[i+1 : i+4])
+						c, ok = parseDDD(s[n : n+3])
 					}
 				}
 			}
@@ -339,7 +353,10 @@ func ParseName[T []byte | string](n *Name, s T) error {
 	}
 
 	n.b = append(n.b, 0)
-	n.parseLabels()
+	err := n.parseLabels()
+	if err != nil {
+		return fmt.Errorf("internal error: %w", err)
+	}
 	return nil
 }
 
@@ -354,6 +371,17 @@ func ParseNameLabels[T []byte | string](n *Name, ls []T) error {
 		}
 	}
 	n.b = append(n.b, 0)
-	n.parseLabels()
+	err := n.parseLabels()
+	if err != nil {
+		return fmt.Errorf("internal error: %w", err)
+	}
 	return nil
+}
+
+func ParseNameRaw[T []byte | string](n *Name, s T) error {
+	if n.dirty() {
+		return errDirtyName
+	}
+	n.b = append(n.b, s...)
+	return n.parseLabels()
 }

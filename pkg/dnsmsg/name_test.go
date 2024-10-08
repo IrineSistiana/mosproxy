@@ -35,6 +35,7 @@ func TestParse(t *testing.T) {
 		testFn(s, nil)
 	}
 
+	testFn("aaa.aa\\255.\\000.\\\\.\\..aaa.aaa", nil)
 	testFn(".a", errZeroSegLen)
 	testFn("a.b.c..d", errZeroSegLen)
 	testFn("a.b."+strings.Repeat("c", 63)+".d", nil)
@@ -53,9 +54,9 @@ func TestName_AppendReadableTo(t *testing.T) {
 		got := n.AppendReadableTo(nil)
 		r.Equal(w, string(got))
 	}
-
 	testFn("1.2.3", "1.2.3")
 	testFn("1.2.3.", "1.2.3")
+	testFn("aaa.aa\\123.\\000.\\\\.\\..aaa.aaa", "aaa.aa\\123.\\000.\\\\.\\..aaa.aaa")
 	testFn("a.bb.ccc.dddd", "a.bb.ccc.dddd")
 	testFn("", ".")
 }

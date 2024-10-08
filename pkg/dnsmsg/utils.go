@@ -104,10 +104,10 @@ func parseDDD[T []byte | string](b T) (byte, bool) {
 	s := 0
 	for i := 0; i < len(b); i++ {
 		c := b[i]
-		if c < 30 || c > 39 {
+		if c < 48 || c > 57 {
 			return 0, false
 		}
-		n := c - 30
+		n := c - 48
 		s *= base
 		s += int(n)
 	}
