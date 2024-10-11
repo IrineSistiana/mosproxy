@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	defaultMaxCacheTtl = 60 * 10 // 10 min
+	defaultMaxCacheTtl = 24 * 3600 // 1d
 	prefetchTimeout    = time.Second * 6
 )
 
@@ -106,8 +106,8 @@ func (c *CacheCtl) Store(key []byte, resp *dnsmsg.Msg) {
 	var msgTtl int
 	var applyOptimistic bool
 	switch resp.Header.RCode {
-	case dnsmsg.RCodeNameError: // NXDOMAIN, cache for 30s
-		const defaultTtl = 30
+	case dnsmsg.RCodeNameError: // NXDOMAIN, cache for 300s
+		const defaultTtl = 300
 		if hasRr {
 			msgTtl = min(defaultTtl, msgRrMinTtl)
 		} else {
@@ -121,12 +121,12 @@ func (c *CacheCtl) Store(key []byte, resp *dnsmsg.Msg) {
 			msgTtl = defaultTtl
 		}
 	case dnsmsg.RCodeSuccess:
-		const defaultTtl = 30
+		const defaultTtl = 300
 		if hasRr {
 			msgTtl = msgRrMinTtl
 			applyOptimistic = true
 		} else {
-			// SUCCESS, but no record, cache for 30s
+			// SUCCESS, but no record, cache for 300s
 			// TODO: Use minttl from SOA record.
 			msgTtl = defaultTtl
 		}
