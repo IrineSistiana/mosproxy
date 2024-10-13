@@ -33,7 +33,7 @@ func (r *Router) initApiServer(cfg *APIConfig) error {
 	mux.Route("/ctl", func(route chi.Router) {
 		route.Get("/reload", func(w http.ResponseWriter, req *http.Request) {
 			start := time.Now()
-			r.logger.Info().Object("request", (*httpReqLoggerObj)(req)).Msg("reloading data sets")
+			r.logger.Info().Object("request", (*httpReqLoggerObj)(req)).Msg("reloading files")
 			err := r.Reload()
 			if err != nil {
 				r.logger.Error().Object("request", (*httpReqLoggerObj)(req)).Err(err).Msg("reload cmd failed")
@@ -45,7 +45,7 @@ func (r *Router) initApiServer(cfg *APIConfig) error {
 			r.logger.Info().
 				Object("request", (*httpReqLoggerObj)(req)).
 				Dur("elapse", time.Since(start)).
-				Msg("data sets reloaded")
+				Msg("files reloaded")
 		})
 	})
 

@@ -137,8 +137,8 @@ type CacheConfig struct {
 type ECSConfig struct {
 	Enabled       bool   `yaml:"enabled"`
 	Forward       bool   `yaml:"forward"`
-	IpZone        string `yaml:"ip_zone"`
-	ZoneOverwrite string `yaml:"zone_overwrite"`
+	IpZone        []string `yaml:"ip_zone"`
+	ZoneOverwrite []string `yaml:"zone_overwrite"`
 }
 
 type APIConfig struct {

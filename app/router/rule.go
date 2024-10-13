@@ -2,13 +2,11 @@ package router
 
 import (
 	"fmt"
-
-	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
 )
 
 type rule struct {
 	reverse  bool
-	matcher  *DataloaderImpl[domainmatcher.Matcher]
+	matcher  *DomainSet
 	reject   uint16
 	upstream Upstream // maybe nil
 }

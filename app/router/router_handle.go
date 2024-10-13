@@ -29,24 +29,19 @@ func (r *Router) serverEntryHandler(q *QueryCtx) {
 
 		// Get zone
 		if r.ecsZone != nil {
-			m := r.ecsZone.V()
-			if m != nil {
-				q.ECSZone = m.Mark(q.ECS2Upstream.Addr())
-				// No zone, assume it is local, don not send ecs to upstream
-				if len(q.ECSZone) == 0 {
-					q.ECS2Upstream = netip.Prefix{}
-				}
+			q.ECSZone, _ = r.ecsZone.Mark(q.ECS2Upstream.Addr())
+
+			// No zone, assume it is local, don not send ecs to upstream
+			if len(q.ECSZone) == 0 {
+				q.ECS2Upstream = netip.Prefix{}
 			}
 		}
 
 		// Overwrite ecs
 		if r.ecsZoneOverwrite != nil {
-			m := r.ecsZoneOverwrite.V()
-			if m != nil {
-				addr := m.Get(q.ECSZone)
-				if addr.IsValid() {
-					q.ECS2Upstream = addr
-				}
+			p, ok := r.ecsZoneOverwrite.Get(q.ECSZone)
+			if ok {
+				q.ECS2Upstream = p
 			}
 		}
 	}
@@ -76,8 +71,7 @@ func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 	var matchedRule *rule
 	for _, rule := range r.rules {
 		if rule.matcher != nil {
-			matcher := rule.matcher.V()
-			matched := matcher.Match(q.Question.Name)
+			matched := rule.matcher.Match(q.Question.Name)
 			if rule.reverse {
 				matched = !matched
 			}

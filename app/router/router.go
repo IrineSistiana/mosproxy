@@ -15,8 +15,6 @@ import (
 	"github.com/IrineSistiana/mosproxy/app"
 	"github.com/go-chi/chi/v5"
 
-	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
-	"github.com/IrineSistiana/mosproxy/internal/ipmarker"
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/mitchellh/mapstructure"
 	"github.com/prometheus/client_golang/prometheus"
@@ -53,9 +51,10 @@ func newRouterCmd() *cobra.Command {
 				logger.Fatal().Err(err).Msg("failed to decode yaml config")
 			}
 			decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
-				ErrorUnused: true,
-				TagName:     "yaml",
-				Result:      cfg,
+				ErrorUnused:      true,
+				TagName:          "yaml",
+				Result:           cfg,
+				WeaklyTypedInput: true,
 			})
 			if err != nil {
 				logger.Fatal().Err(err).Msg("failed to init yaml decoder")
@@ -120,12 +119,12 @@ type Router struct {
 	closeOnce sync.Once
 
 	// init later
-	ecsZone          *DataloaderImpl[ipmarker.IpMarker]                // nil if not configured
-	ecsZoneOverwrite *DataloaderImpl[ECSZoneOverWrite]                 // nil if not configured
-	cache            *CacheCtl                                         // not nil, noop if no backend is configured
-	upstreams        map[string]*UpstreamWrapper                       // not nil
-	loadBalancers    map[string]*LoadBalancer                          // not nil
-	domainSets       map[string]*DataloaderImpl[domainmatcher.Matcher] // not nil
+	ecsZone          *ECSZone                    // nil if not configured
+	ecsZoneOverwrite *ECSZoneOverWrite           // nil if not configured
+	cache            *CacheCtl                   // not nil, noop if no backend is configured
+	upstreams        map[string]*UpstreamWrapper // not nil
+	loadBalancers    map[string]*LoadBalancer    // not nil
+	domainSets       map[string]*DomainSet       // not nil
 	rules            []*rule
 	middlewares      []Middleware // nil if no middleware
 	serverClosers    []func()
@@ -153,7 +152,7 @@ func Run(cfg *Config) (_ *Router, err error) {
 
 		upstreams:           make(map[string]*UpstreamWrapper),
 		loadBalancers:       make(map[string]*LoadBalancer),
-		domainSets:          make(map[string]*DataloaderImpl[domainmatcher.Matcher]),
+		domainSets:          make(map[string]*DomainSet),
 		middlewareReloaders: make(map[Dataloader]struct{}),
 
 		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
@@ -348,20 +347,13 @@ func (r *Router) subLoggerForMiddleware(typ string) *zerolog.Logger {
 }
 
 // Nil if not configured.
-func (r *Router) GetECSZone() DataProvider[ipmarker.IpMarker] {
-	if r.ecsZone != nil {
-		return r.ecsZone
-	}
-	return nil
+func (r *Router) GetECSZone() *ECSZone {
+	return r.ecsZone
 }
 
-// Nil if not configured. DO NOT retain the result. It will be replaced
-// when router reloaded.
+// Nil if not configured.
 func (r *Router) GetECSZoneOverwrite() *ECSZoneOverWrite {
-	if r.ecsZoneOverwrite != nil {
-		return r.ecsZoneOverwrite.V()
-	}
-	return nil
+	return r.ecsZoneOverwrite
 }
 
 // Nil if not configured.
@@ -375,12 +367,8 @@ func (r *Router) GetLoadBalancer(tag string) *LoadBalancer {
 }
 
 // Nil if not configured.
-func (r *Router) GetDomainSet(tag string) DataProvider[domainmatcher.Matcher] {
-	loader, ok := r.domainSets[tag]
-	if !ok {
-		return nil
-	}
-	return loader
+func (r *Router) GetDomainSet(tag string) *DomainSet {
+	return r.domainSets[tag]
 }
 
 func (r *Router) GetCache() *CacheCtl {

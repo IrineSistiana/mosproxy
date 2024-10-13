@@ -13,19 +13,19 @@ import (
 )
 
 type IpMarker struct {
-	l          *netlist.List[int]
-	marks      []string
+	l     *netlist.List[int]
+	marks []string
 }
 
-func (m *IpMarker) Mark(addr netip.Addr) string {
+func (m *IpMarker) Mark(addr netip.Addr) (string, bool) {
 	if !addr.IsValid() {
-		return ""
+		return "", false
 	}
 	idx, ok := m.l.LookupAddr(addr)
 	if !ok {
-		return ""
+		return "", false
 	}
-	return m.marks[idx]
+	return m.marks[idx], true
 }
 
 func (m *IpMarker) IpLen() int {

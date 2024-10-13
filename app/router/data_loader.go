@@ -1,6 +1,12 @@
 package router
 
-import "sync/atomic"
+import (
+	"crypto/sha256"
+	"os"
+	"sync/atomic"
+
+	"github.com/rs/zerolog"
+)
 
 type Dataloader interface {
 	// Load T and stage the T. Return false if error ocurred.
@@ -19,57 +25,100 @@ type DataProvider[V any] interface {
 	V() *V
 }
 
-// Funcs of DataloaderImpl are not concurrent safe.
-// Except load().
-type DataloaderImpl[T any] struct {
-	loadFn    func() (*T, error)
-	releaseFn func(v *T)
+// Funcs of fileLoader are not concurrent safe.
+// Except V().
+type fileLoader[V any] struct {
+	fp      string
+	parseFn func(b []byte) (*V, error)
+	logger  *zerolog.Logger
+	vInfo   func(e *zerolog.Event, v *V) // print log fields when v is loaded, DO NOT call e.Msg().
 
-	v      atomic.Pointer[T]
-	staged *T
+	hash       [sha256.Size]byte
+	v          atomic.Pointer[V]
+	stagedHash [sha256.Size]byte
+	staged     *V
 }
 
-func NewDataLoader[V any](
-	loadFn func() (*V, error), // load the T. CANNOT be nil.
-	releaseFn func(v *V), // Called when old T was swapped. Can be nil.
-) *DataloaderImpl[V] {
-	return &DataloaderImpl[V]{
-		loadFn:    loadFn,
-		releaseFn: releaseFn,
+func (s *fileLoader[V]) LoadAndStage() (ok bool) {
+	b, err := os.ReadFile(s.fp)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to read file")
+		return
 	}
-}
-
-func (s *DataloaderImpl[V]) LoadAndStage() (ok bool) {
-	_, err := s.LoadAndStageV()
+	newHash := sha256.Sum256(b)
+	if newHash == s.hash {
+		s.logger.Info().Msg("skip loading file, same checksum")
+		return true
+	}
+	v, err := s.parseFn(b)
+	if v != nil {
+		e := s.logger.Info()
+		if s.vInfo != nil {
+			s.vInfo(e, v)
+		}
+		e.Msg("file loaded")
+		s.staged = v
+		s.stagedHash = newHash
+	}
+	if err != nil {
+		s.logger.Error().Err(err).Msg("failed to parse data")
+	}
 	return err == nil
 }
 
-func (s *DataloaderImpl[V]) LoadAndStageV() (*V, error) {
-	v, err := s.loadFn()
+func (s *fileLoader[V]) init() (*V, error) {
+	b, err := os.ReadFile(s.fp)
 	if err != nil {
 		return nil, err
 	}
-	s.staged = v
+	h := sha256.Sum256(b)
+	v, err := s.parseFn(b)
+	if err != nil {
+		return v, err
+	}
+	s.v.Store(v)
+	s.hash = h
 	return v, nil
 }
 
-func (s *DataloaderImpl[V]) Commit() {
+func (s *fileLoader[V]) Commit() {
 	if s.staged != nil {
-		old := s.v.Swap(s.staged)
+		s.v.Store(s.staged)
+		s.hash = s.stagedHash
 		s.staged = nil
-		if old != nil && s.releaseFn != nil {
-			s.releaseFn(old)
+		clear(s.hash[:])
+	}
+}
+
+func (s *fileLoader[V]) Discard() {
+	s.staged = nil
+	clear(s.hash[:])
+}
+
+func (s *fileLoader[V]) V() *V {
+	return s.v.Load()
+}
+
+type fileLoaderGroup[V any] []*fileLoader[V]
+
+func (g fileLoaderGroup[V]) LoadAndStage() bool {
+	for _, loader := range g {
+		ok := loader.LoadAndStage()
+		if !ok {
+			return false
 		}
 	}
+	return true
 }
 
-func (s *DataloaderImpl[V]) Discard() {
-	if old := s.staged; old != nil && s.releaseFn != nil {
-		s.releaseFn(old)
+func (g fileLoaderGroup[V]) Commit() {
+	for _, loader := range g {
+		loader.Commit()
 	}
-	s.staged = nil
 }
 
-func (s *DataloaderImpl[V]) V() *V {
-	return s.v.Load()
+func (g fileLoaderGroup[V]) Discard() {
+	for _, loader := range g {
+		loader.Discard()
+	}
 }

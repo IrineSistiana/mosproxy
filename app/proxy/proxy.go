@@ -140,7 +140,11 @@ func newProxyCmd() *cobra.Command {
 			cfg.LoadBalancers = []router.LoadBalancerConfig{lbCfg}
 			cfg.Rules = []router.RuleConfig{{Forward: "lb"}}
 
-			cfg.ECS = router.ECSConfig{Enabled: ecs, Forward: ecs, IpZone: ecsIpZone}
+			cfg.ECS = router.ECSConfig{Enabled: ecs, Forward: ecs}
+			if len(ecsIpZone) > 0 {
+				cfg.ECS.IpZone = append(cfg.ECS.IpZone, ecsIpZone)
+			}
+
 			cfg.Cache = router.CacheConfig{
 				MemSize:       cache,
 				Redis:         cacheRedis,

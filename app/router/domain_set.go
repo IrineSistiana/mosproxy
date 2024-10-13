@@ -1,11 +1,13 @@
 package router
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
-	"os"
 
 	domainmatcher "github.com/IrineSistiana/mosproxy/internal/domain_matcher"
+	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
+	"github.com/rs/zerolog"
 )
 
 func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
@@ -16,41 +18,50 @@ func (r *Router) loadDomainSet(cfg *DomainSetConfig) error {
 		return fmt.Errorf("dup tag [%s]", cfg.Tag)
 	}
 
-	loadFiles := func(fps []string) (*domainmatcher.Matcher, error) {
+	parseFn := func(b []byte) (*domainmatcher.Matcher, error) {
 		loader := domainmatcher.NewLoader()
-		for _, fp := range fps {
-			f, err := os.Open(fp)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open domain file %s, %w", fp, err)
-			}
-			err = loader.LoadRulesFromReader(f)
-			f.Close()
-			if err != nil {
-				return nil, fmt.Errorf("failed to load data from file %s, %w", fp, err)
-			}
+		err := loader.LoadRulesFromReader(bytes.NewReader(b))
+		if err != nil {
+			return nil, fmt.Errorf("failed to read rules, %w", err)
 		}
 		m, err := loader.Compile()
 		if err != nil {
-			return nil, fmt.Errorf("failed to compile data set, %w", err)
+			return nil, fmt.Errorf("failed to compile dataset, %w", err)
 		}
-		return m, err
-	}
-	loadFn := func() (*domainmatcher.Matcher, error) {
-		m, err := loadFiles(cfg.Files)
-		if err != nil {
-			r.logger.Error().Str("tag", cfg.Tag).Strs("files", cfg.Files).Msg("failed to load domain set")
-			return nil, err
-		}
-		r.logger.Info().Str("tag", cfg.Tag).Strs("files", cfg.Files).Int("len", m.Len()).Msg("domain set loaded")
 		return m, nil
 	}
-
-	l := NewDataLoader(loadFn, nil)
-	_, err := l.LoadAndStageV()
-	if err != nil {
-		return err
+	vInfo := func(e *zerolog.Event, v *domainmatcher.Matcher) {
+		e.Int("rule_num", v.Len())
 	}
-	l.Commit()
-	r.domainSets[cfg.Tag] = l
+	s := make([]*fileLoader[domainmatcher.Matcher], 0)
+	for _, fp := range cfg.Files {
+		logger := r.logger.With().Str("domain_set", cfg.Tag).Str("file", fp).Logger()
+		loader := &fileLoader[domainmatcher.Matcher]{
+			fp:      fp,
+			parseFn: parseFn,
+			logger:  &logger,
+			vInfo:   vInfo,
+		}
+		_, err := loader.init()
+		if err != nil {
+			return fmt.Errorf("failed to load domain set from file %s, %w", fp, err)
+		}
+		s = append(s, loader)
+	}
+	r.domainSets[cfg.Tag] = &DomainSet{fileLoaderGroup: s}
 	return nil
+}
+
+type DomainSet struct {
+	fileLoaderGroup[domainmatcher.Matcher]
+}
+
+func (g *DomainSet) Match(name dnsmsg.Name) bool {
+	for _, loader := range g.fileLoaderGroup {
+		ok := loader.V().Match(name)
+		if ok {
+			return true
+		}
+	}
+	return false
 }

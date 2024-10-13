@@ -1,73 +1,97 @@
 package router
 
 import (
+	"bytes"
+	"fmt"
 	"net/netip"
-	"os"
 
 	"github.com/IrineSistiana/mosproxy/internal/ipmarker"
+	"github.com/rs/zerolog"
 )
 
-func (r *Router) loadEcsZone(fp string) error {
-	loadFile := func(fp string) (*ipmarker.IpMarker, error) {
-		f, err := os.Open(fp)
-		if err != nil {
-			return nil, err
+func (r *Router) loadEcsZone(fps []string) error {
+	parseFn := func(b []byte) (*ipmarker.IpMarker, error) {
+		return ipmarker.LoadIpMarkerFromReader(bytes.NewReader(b))
+	}
+	vInfo := func(e *zerolog.Event, v *ipmarker.IpMarker) {
+		e.Int("ip_len", v.IpLen()).Int("zone_len", v.MarkLen())
+	}
+	s := make([]*fileLoader[ipmarker.IpMarker], 0)
+	for _, fp := range fps {
+		logger := r.logger.With().Str("ecs_zone", fp).Logger()
+		loader := &fileLoader[ipmarker.IpMarker]{
+			fp:      fp,
+			parseFn: parseFn,
+			logger:  &logger,
+			vInfo:   vInfo,
 		}
-		defer f.Close()
-		return ipmarker.LoadIpMarkerFromReader(f)
-	}
-	loadFn := func() (*ipmarker.IpMarker, error) {
-		m, err := loadFile(fp)
+		_, err := loader.init()
 		if err != nil {
-			r.logger.Error().Str("file", fp).Msg("failed to load ecs ip zone file")
-			return nil, err
+			return fmt.Errorf("failed to load ecs zone from file %s, %w", fp, err)
 		}
-		r.logger.Info().Str("file", fp).Int("len", m.IpLen()).Int("zone_num", m.MarkLen()).Msg("ecs ip zone file loaded")
-		return m, nil
+		s = append(s, loader)
 	}
-	l := NewDataLoader[ipmarker.IpMarker](loadFn, nil)
-	_, err := l.LoadAndStageV()
-	if err != nil {
-		return err
-	}
-	l.Commit()
-	r.ecsZone = l
+	r.ecsZone = &ECSZone{fileLoaderGroup: s}
 	return nil
 }
 
+type ECSZone struct {
+	fileLoaderGroup[ipmarker.IpMarker]
+}
+
+func (z *ECSZone) Mark(addr netip.Addr) (string, bool) {
+	for _, loader := range z.fileLoaderGroup {
+		s, ok := loader.V().Mark(addr)
+		if ok {
+			return s, true
+		}
+	}
+	return "", false
+}
+
 type ECSZoneOverWrite struct {
-	m map[string]netip.Prefix
+	fileLoaderGroup[map[string]netip.Prefix]
 }
 
-func (ezo *ECSZoneOverWrite) Get(z string) netip.Prefix {
-	return ezo.m[z]
+func (g *ECSZoneOverWrite) Get(z string) (netip.Prefix, bool) {
+	for _, loader := range g.fileLoaderGroup {
+		m := loader.V()
+		if m != nil {
+			p, ok := (*m)[z]
+			if ok {
+				return p, true
+			}
+		}
+	}
+	return netip.Prefix{}, false
 }
 
-func (r *Router) loadEcsZoneOverwrite(fp string) error {
-	loadFile := func(fp string) (map[string]netip.Prefix, error) {
-		f, err := os.Open(fp)
+func (r *Router) loadEcsZoneOverwrite(fps []string) error {
+	parseFn := func(b []byte) (*map[string]netip.Prefix, error) {
+		m, err := ipmarker.LoadMark2PrefixFromReader(bytes.NewReader(b))
 		if err != nil {
 			return nil, err
 		}
-		defer f.Close()
-		return ipmarker.LoadMark2PrefixFromReader(f)
+		return &m, nil
 	}
-	loadFn := func() (*ECSZoneOverWrite, error) {
-		m, err := loadFile(fp)
-		if err != nil {
-			r.logger.Error().Str("file", fp).Err(err).Msg("failed to load zone ecs overwrite data")
-			return nil, err
+	vInfo := func(e *zerolog.Event, v *map[string]netip.Prefix) {
+		e.Int("len", len(*v))
+	}
+	s := make([]*fileLoader[map[string]netip.Prefix], 0)
+	for _, fp := range fps {
+		logger := r.logger.With().Str("ecs_zone_overwrite", fp).Logger()
+		loader := &fileLoader[map[string]netip.Prefix]{
+			fp:      fp,
+			parseFn: parseFn,
+			logger:  &logger,
+			vInfo:   vInfo,
 		}
-		r.logger.Info().Str("file", fp).Int("len", len(m)).Msg("zone ecs overwrite loaded")
-		return &ECSZoneOverWrite{m: m}, nil
+		_, err := loader.init()
+		if err != nil {
+			return fmt.Errorf("failed to load ecs zone overwrite from file %s, %w", fp, err)
+		}
+		s = append(s, loader)
 	}
-
-	l := NewDataLoader[ECSZoneOverWrite](loadFn, nil)
-	_, err := l.LoadAndStageV()
-	if err != nil {
-		return err
-	}
-	l.Commit()
-	r.ecsZoneOverwrite = l
+	r.ecsZoneOverwrite = &ECSZoneOverWrite{fileLoaderGroup: s}
 	return nil
 }
