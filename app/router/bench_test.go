@@ -28,6 +28,7 @@ const (
 	httpsAddr    = "127.0.0.1:5004"
 	quicAddr     = "127.0.0.1:5005"
 	tlsAddr      = "127.0.0.1:5006"
+	http3Addr    = "127.0.0.1:5007"
 
 	tcpUnixAddr      = "@mosproxy_test_tcp"
 	httpUnixAddr     = "@mosproxy_test_http"
@@ -163,6 +164,17 @@ func Benchmark_https(b *testing.B) {
 	loopBench(b, opts)
 }
 
+func Benchmark_http3(b *testing.B) {
+	os.Setenv("QUIC_GO_DISABLE_GSO", "0")
+	initBenchServerOnce()
+	opts := benchmarkOpts{
+		addr:         fmt.Sprintf("h3://%s", http3Addr),
+		upstreamOpts: upstream.Opt{TLSConfig: &tls.Config{InsecureSkipVerify: true}},
+		concurrent:   512, // TODO: Avoid concurrent tls handshakes that may boom the benchmark.
+	}
+	loopBench(b, opts)
+}
+
 func Benchmark_quic(b *testing.B) {
 	// os.Setenv("QUIC_GO_DISABLE_GSO", "true")
 	initBenchServerOnce()
@@ -192,8 +204,9 @@ var initBenchServerOnce = sync.OnceFunc(func() {
 
 			{Protocol: "http", Listen: fasthttpAddr},
 			{Protocol: "http", Listen: fasthttpUnixAddr},
+			{Protocol: "http3", Listen: http3Addr, Tls: tlsOpts, Quic: QuicConfig{MaxStreams: 9999999}},
 
-			{Protocol: "quic", Listen: quicAddr, Tls: tlsOpts, Quic: QuicConfig{MaxStreams: math.MaxInt}},
+			{Protocol: "quic", Listen: quicAddr, Tls: tlsOpts, Quic: QuicConfig{MaxStreams: 9999999}},
 		},
 	}
 

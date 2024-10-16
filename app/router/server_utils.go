@@ -13,6 +13,7 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/mlog"
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -147,6 +148,7 @@ func (r *Router) listen(cfg *ServerConfig) (net.Listener, error) {
 	return l, err
 }
 
+
 type connTracker[T comparable] struct {
 	closeConn     func(T)
 	closeListener func()
@@ -247,4 +249,20 @@ func makeEmptyRespM(m *dnsmsg.Msg, rcode dnsmsg.RCode) *dnsmsg.Msg {
 		break // only return one question. Avoid malicious queries.
 	}
 	return resp
+}
+
+func serverQuicCfg(cfg *ServerConfig) *quic.Config {
+	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
+	if idleTimeout <= 0 {
+		idleTimeout = defaultQuicIdleTimeout
+	}
+	return &quic.Config{
+		MaxIdleTimeout:                 idleTimeout,
+		InitialStreamReceiveWindow:     4 * 1024,
+		MaxStreamReceiveWindow:         4 * 1024,
+		InitialConnectionReceiveWindow: 8 * 1024,
+		MaxConnectionReceiveWindow:     16 * 1024,
+		Allow0RTT:                      false,
+		MaxIncomingStreams:             cfg.Quic.MaxStreams,
+	}
 }

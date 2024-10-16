@@ -59,7 +59,7 @@ func NewDoHTransport(opts DoHTransportOpts) (*DoHTransport, error) {
 
 func (u *DoHTransport) Close() error {
 	if u.closer != nil {
-		return u.Close()
+		return u.closer.Close()
 	}
 	return nil
 }

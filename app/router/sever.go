@@ -49,6 +49,12 @@ func (r *Router) startServer(cfg *ServerConfig) (closeFn func(), err error) {
 			return nil, err
 		}
 		return func() { s.Close() }, nil
+	case "http3":
+		s, err := r.startHttp3Server(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return func() { s.Close() }, nil
 	case "quic":
 		s, err := r.startQuicServer(cfg)
 		if err != nil {

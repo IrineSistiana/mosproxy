@@ -1,10 +1,12 @@
 package router
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"strings"
@@ -14,11 +16,13 @@ import (
 	"github.com/IrineSistiana/mosproxy/internal/pool"
 	"github.com/IrineSistiana/mosproxy/internal/utils"
 	"github.com/IrineSistiana/mosproxy/pkg/dnsmsg"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/rs/zerolog"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
-func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, error) {
+func (r *Router) startHttpServer(cfg *ServerConfig, useTLS bool) (*http.Server, error) {
 	const defaultIdleTimeout = time.Second * 30
 	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
 	if idleTimeout <= 0 {
@@ -28,7 +32,9 @@ func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 	h := &httpHandler{
 		cfg:              cfg,
 		r:                r,
+		path:             cfg.Http.Path,
 		clientAddrHeader: cfg.Http.ClientAddrHeader,
+		logger:           r.subLoggerForServer("server_http", cfg.Tag),
 	}
 
 	hs := &http.Server{
@@ -36,34 +42,33 @@ func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 		ReadTimeout:    time.Second * 5,
 		IdleTimeout:    idleTimeout,
 		MaxHeaderBytes: 4096,
+		ErrorLog:       log.New(mlog.WriteToLogger(h.logger, "redirected http log", "msg"), "", 0),
 	}
 
-	if err := http2.ConfigureServer(hs, &http2.Server{
+	h2s := &http2.Server{
 		MaxReadFrameSize:             16 * 1024, // http2 minimum
 		MaxConcurrentStreams:         cfg.Http.DebugMaxStreams,
 		IdleTimeout:                  idleTimeout,
 		MaxUploadBufferPerConnection: 65535, // http2 minimum
 		MaxUploadBufferPerStream:     65535, // http2 minimum
-	}); err != nil {
-		return nil, fmt.Errorf("failed to setup http2 server, %w", err)
 	}
-
-	if useTls {
+	if useTLS {
 		tlsConfig, err := makeTlsConfig(&cfg.Tls, true)
 		if err != nil {
 			return nil, err
 		}
-		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h2")
 		hs.TLSConfig = tlsConfig
+		if err := http2.ConfigureServer(hs, h2s); err != nil {
+			return nil, fmt.Errorf("failed to setup http2 server, %w", err)
+		}
+	} else {
+		hs.Handler = h2c.NewHandler(hs.Handler, h2s)
 	}
 
 	l, err := r.listen(cfg)
 	if err != nil {
 		return nil, err
 	}
-	h.localAddr = netAddr2NetipAddr(l.Addr()) // maybe nil
-	h.logger = r.subLoggerForServer("server_http", cfg.Tag)
-	hs.ErrorLog = log.New(mlog.WriteToLogger(h.logger, "redirected http log", "msg"), "", 0)
 
 	h.logger.Info().
 		Str("network", l.Addr().Network()).
@@ -72,7 +77,7 @@ func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 	go func() {
 		defer l.Close()
 		var err error
-		if useTls {
+		if useTLS {
 			err = hs.ServeTLS(l, "", "")
 		} else {
 			err = hs.Serve(l)
@@ -84,10 +89,58 @@ func (r *Router) startHttpServer(cfg *ServerConfig, useTls bool) (*http.Server, 
 	return hs, nil
 }
 
+func (r *Router) startHttp3Server(cfg *ServerConfig) (*http3.Server, error) {
+	const defaultIdleTimeout = time.Second * 30
+	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
+	if idleTimeout <= 0 {
+		idleTimeout = defaultIdleTimeout
+	}
+
+	h := &httpHandler{
+		cfg:              cfg,
+		r:                r,
+		path:             cfg.Http.Path,
+		clientAddrHeader: cfg.Http.ClientAddrHeader,
+		logger:           r.subLoggerForServer("server_http3", cfg.Tag),
+	}
+
+	tlsConfig, err := makeTlsConfig(&cfg.Tls, true)
+	if err != nil {
+		return nil, err
+	}
+
+	h3s := &http3.Server{
+		Handler:        h,
+		IdleTimeout:    idleTimeout,
+		MaxHeaderBytes: 4096,
+		TLSConfig:      tlsConfig,
+		QUICConfig:     serverQuicCfg(cfg),
+	}
+
+	lc := net.ListenConfig{Control: controlSocket(cfg.Socket)}
+	c, err := lc.ListenPacket(context.Background(), "udp", cfg.Listen)
+	if err != nil {
+		return nil, err
+	}
+
+	cAddr := c.LocalAddr()
+	h.logger.Info().
+		Str("network", cAddr.Network()).
+		Stringer("addr", cAddr).
+		Msg("http3 server started")
+	go func() {
+		defer c.Close()
+		err := h3s.Serve(c)
+		if !errors.Is(err, http.ErrServerClosed) {
+			r.Close(fmt.Errorf("http server exited, %w", err))
+		}
+	}()
+	return h3s, nil
+}
+
 type httpHandler struct {
 	cfg              *ServerConfig
 	r                *Router
-	localAddr        netip.AddrPort // maybe invalid, e.g. server is on unix socket
 	path             string
 	clientAddrHeader string
 

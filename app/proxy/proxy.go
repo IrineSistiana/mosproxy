@@ -185,7 +185,7 @@ func newProxyCmd() *cobra.Command {
 	fs.SortFlags = false
 	fs.StringVarP(&listen, "listen", "l", "", "Listening address.")
 	c.MarkFlagRequired("listen")
-	fs.StringVarP(&protocol, "protocol", "p", "", "Listening protocol.\nOne of [udp|tcp|tls|http|fasthttp|https|quic].\nDefault is listening both udp and tcp.")
+	fs.StringVarP(&protocol, "protocol", "p", "", "Listening protocol.\nOne of [udp|tcp|tls|http|fasthttp|https|http3|quic].\nDefault is listening both udp and tcp.")
 	fs.StringVar(&tlsCert, "tls-cert", "", "Path to a file of PEM certificate.")
 	fs.StringVar(&tlsKey, "tls-key", "", "Path to a file of PEM private key.")
 	fs.StringVar(&httpPath, "http-path", "", "Http path of DoH server.")

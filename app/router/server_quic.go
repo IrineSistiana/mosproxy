@@ -21,28 +21,11 @@ const (
 )
 
 func (r *Router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
-	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
-	if idleTimeout <= 0 {
-		idleTimeout = defaultQuicIdleTimeout
-	}
-
 	tlsConfig, err := makeTlsConfig(&cfg.Tls, true)
 	if err != nil {
 		return nil, err
 	}
 	tlsConfig.NextProtos = []string{"doq"}
-
-	quicConfig := &quic.Config{
-		MaxIdleTimeout:                 idleTimeout,
-		InitialStreamReceiveWindow:     4 * 1024,
-		MaxStreamReceiveWindow:         4 * 1024,
-		InitialConnectionReceiveWindow: 8 * 1024,
-		MaxConnectionReceiveWindow:     16 * 1024,
-		Allow0RTT:                      false,
-		MaxIncomingStreams:             cfg.Quic.MaxStreams,
-		// UniStream is not allowed.
-		MaxIncomingUniStreams: -1,
-	}
 
 	uc, err := net.ListenPacket("udp", cfg.Listen)
 	if err != nil {
@@ -58,12 +41,18 @@ func (r *Router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 		qt.StatelessResetKey = (*quic.StatelessResetKey)(&srk)
 	}
 
-	l, err := qt.Listen(tlsConfig, quicConfig)
+	quicCfg := serverQuicCfg(cfg)
+	quicCfg.MaxIncomingUniStreams = -1 // UniStream is not allowed in dns over quic.
+	l, err := qt.Listen(tlsConfig, quicCfg)
 	if err != nil {
 		qt.Close()
 		return nil, fmt.Errorf("failed to listen quic, %w", err)
 	}
 
+	idleTimeout := time.Duration(cfg.IdleTimeout) * time.Second
+	if idleTimeout <= 0 {
+		idleTimeout = defaultQuicIdleTimeout
+	}
 	s := &quicServer{
 		cfg:         cfg,
 		r:           r,
