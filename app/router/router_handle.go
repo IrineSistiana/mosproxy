@@ -70,24 +70,17 @@ func (r *Router) BuiltInHandler(ctx context.Context, q *QueryCtx) {
 	// Match rules
 	var matchedRule *rule
 	for _, rule := range r.rules {
-		if rule.matcher != nil {
-			matched := rule.matcher.Match(q.Question.Name)
-			if rule.reverse {
-				matched = !matched
-			}
-			if !matched {
-				continue
-			}
+		if rule.match(q) {
+			matchedRule = rule
+			break
 		}
-		matchedRule = rule
-		break
 	}
 
 	if matchedRule == nil {
 		SetEmptyRespMQ(q, dnsmsg.RCodeRefused)
 		return
 	}
-	if rejectRCode := matchedRule.reject; rejectRCode > 0 {
+	if rejectRCode := matchedRule.cfg.Reject; rejectRCode > 0 {
 		SetEmptyRespMQ(q, dnsmsg.RCode(rejectRCode))
 		return
 	}

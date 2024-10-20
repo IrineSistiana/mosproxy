@@ -113,10 +113,14 @@ type DomainSetConfig struct {
 }
 
 type RuleConfig struct {
-	Reverse bool   `yaml:"reverse"`
-	Domain  string `yaml:"domain"`
-	Reject  uint16 `yaml:"reject"`
-	Forward string `yaml:"forward"`
+	Reverse    bool     `yaml:"reverse"`
+	Domain     string   `yaml:"domain"`
+	Server     string   `yaml:"server"`
+	ServerName string   `yaml:"server_name"`
+	Path       string   `yaml:"path"`
+	ClientIP   []string `yaml:"client_ip"`
+	Reject     uint16   `yaml:"reject"`
+	Forward    string   `yaml:"forward"`
 }
 
 type AddonsConfig struct{}
@@ -135,8 +139,8 @@ type CacheConfig struct {
 }
 
 type ECSConfig struct {
-	Enabled       bool   `yaml:"enabled"`
-	Forward       bool   `yaml:"forward"`
+	Enabled       bool     `yaml:"enabled"`
+	Forward       bool     `yaml:"forward"`
 	IpZone        []string `yaml:"ip_zone"`
 	ZoneOverwrite []string `yaml:"zone_overwrite"`
 }

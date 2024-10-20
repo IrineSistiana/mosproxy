@@ -38,6 +38,7 @@ func Test_Netlist(t *testing.T) {
 	add("0.0.0.0", "0.0.0.4", 1, b)
 	add("0.0.0.5", "0.0.0.6", 2, b)
 	add("0.0.0.7", "0.0.0.8", 3, b)
+	add("0.0.0.255", "0.0.0.255", 4, b)
 	l, err = b.Build()
 	r.NoError(err)
 	r.NotNil(l)
@@ -52,6 +53,9 @@ func Test_Netlist(t *testing.T) {
 	v, ok = l.Lookup(ipf("0.0.0.8")) // matched
 	r.True(ok)
 	r.Equal(3, v)
+	v, ok = l.Lookup(ipf("0.0.0.255")) // matched
+	r.True(ok)
+	r.Equal(4, v)
 	v, ok = l.Lookup(ipf("0.0.0.10")) // not matched
 	r.Equal(0, v)
 	r.False(ok)
