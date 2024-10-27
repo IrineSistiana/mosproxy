@@ -27,7 +27,10 @@ func (r *Router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 	}
 	tlsConfig.NextProtos = []string{"doq"}
 
-	uc, err := net.ListenPacket("udp", cfg.Listen)
+	nl := net.ListenConfig{
+		Control: controlSocket(cfg.Socket),
+	}
+	uc, err := nl.ListenPacket(context.Background(), "udp", cfg.Listen)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen socket, %w", err)
 	}
