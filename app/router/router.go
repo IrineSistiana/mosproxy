@@ -261,10 +261,10 @@ func Run(cfg *Config) (_ *Router, err error) {
 	// start servers
 	for i, serverCfg := range cfg.Servers {
 		closer, err := r.startServer(&serverCfg)
-		r.serverClosers = append(r.serverClosers, closer)
 		if err != nil {
 			return nil, fmt.Errorf("failed to start server #%d, %w", i, err)
 		}
+		r.serverClosers = append(r.serverClosers, closer)
 	}
 
 	runtime.GC()
