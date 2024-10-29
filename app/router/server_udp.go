@@ -223,13 +223,15 @@ func (s *udpServer) startWriteLoopLinux() error {
 		m.NN = 0
 	}
 
-	var waitTimeout *time.Timer
+	var batchWaitTimeout *time.Timer
 	defer func() {
-		if waitTimeout != nil {
-			waitTimeout.Stop()
+		if batchWaitTimeout != nil {
+			batchWaitTimeout.Stop()
 		}
 	}()
+
 	for {
+		waitStart := time.Now()
 		select {
 		case <-s.ctx.Done():
 			return context.Cause(s.ctx)
@@ -237,28 +239,30 @@ func (s *udpServer) startWriteLoopLinux() error {
 			i := 0
 			op2Msg(op, &wms[0])
 
-			// read more
-			if waitTimeout == nil {
-				waitTimeout = time.NewTimer(sendInterval)
-			} else {
-				waitTimeout.Reset(sendInterval)
-			}
-		readMore:
-			for {
-				select {
-				case op := <-s.send:
-					i++
-					op2Msg(op, &wms[i])
-					if i < len(wms)-1 {
-						continue
-					}
-					break readMore
-				case <-waitTimeout.C:
-					break readMore
+			// try write responses in batch
+			if time.Since(waitStart) < time.Millisecond {
+				if batchWaitTimeout == nil {
+					batchWaitTimeout = time.NewTimer(sendInterval)
+				} else {
+					batchWaitTimeout.Reset(sendInterval)
 				}
-			}
-			if waitTimeout != nil {
-				waitTimeout.Stop()
+			waitMore:
+				for {
+					select {
+					case op := <-s.send:
+						i++
+						op2Msg(op, &wms[i])
+						if i < len(wms)-1 {
+							continue
+						}
+						break waitMore
+					case <-batchWaitTimeout.C:
+						break waitMore
+					}
+				}
+				if batchWaitTimeout != nil {
+					batchWaitTimeout.Stop()
+				}
 			}
 
 			// batch write
