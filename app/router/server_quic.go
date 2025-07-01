@@ -77,7 +77,7 @@ func (r *Router) startQuicServer(cfg *ServerConfig) (*quicServer, error) {
 	return s, nil
 }
 
-func closeQuicConnServerClosing(c quic.Connection) {
+func closeQuicConnServerClosing(c *quic.Conn) {
 	c.CloseWithError(0, "server is closing")
 }
 
@@ -88,7 +88,7 @@ type quicServer struct {
 	idleTimeout time.Duration
 	logger      *zerolog.Logger
 
-	ct *connTracker[quic.Connection]
+	ct *connTracker[*quic.Conn]
 }
 
 func (s *quicServer) run() error {
@@ -115,7 +115,7 @@ func (s *quicServer) run() error {
 	}
 }
 
-func (s *quicServer) handleConn(c quic.Connection) error {
+func (s *quicServer) handleConn(c *quic.Conn) error {
 	for {
 		streamAcceptCtx, cancelAccept := context.WithTimeout(context.Background(), s.idleTimeout)
 		stream, err := c.AcceptStream(streamAcceptCtx)
@@ -136,7 +136,7 @@ func (s *quicServer) handleConn(c quic.Connection) error {
 	}
 }
 
-func (s *quicServer) handleStream(stream quic.Stream, c quic.Connection) {
+func (s *quicServer) handleStream(stream *quic.Stream, c *quic.Conn) {
 	stream.SetReadDeadline(time.Now().Add(quicStreamReadTimeout))
 	m, _, err := dnsutils.ReadMsgFromTCP(stream)
 	if err != nil {

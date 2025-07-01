@@ -253,7 +253,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 			t = &http3.Transport{
 				TLSClientConfig: opt.TLSConfig,
 				QUICConfig:      quicConfig,
-				Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+				Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 					ua, err := net.ResolveUDPAddr("udp", dialAddr)
 					if err != nil {
 						return nil, err
@@ -331,7 +331,7 @@ func NewUpstream(addr string, opt Opt) (_ Upstream, err error) {
 		}
 		defer closeIfFuncErr(t)
 
-		dialQuicConn := func(ctx context.Context) (quic.Connection, error) {
+		dialQuicConn := func(ctx context.Context) (*quic.Conn, error) {
 			ua, err := net.ResolveUDPAddr("udp", dialAddr)
 			if err != nil {
 				return nil, err

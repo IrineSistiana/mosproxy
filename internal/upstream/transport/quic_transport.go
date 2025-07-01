@@ -31,13 +31,13 @@ type QuicTransport struct {
 	m           sync.Mutex
 	closed      bool
 	dialingCall *dialingQuicCall
-	c           quic.Connection
+	c           *quic.Conn
 }
 
 type QuicTransportOpts struct {
 	// DialContext specifies the method to dial a connection to the server.
 	// DialContext MUST NOT be nil.
-	DialContext func(ctx context.Context) (quic.Connection, error)
+	DialContext func(ctx context.Context) (*quic.Conn, error)
 
 	// DialTimeout specifies the timeout for DialFunc.
 	// Default is defaultDialTimeout.
@@ -114,7 +114,7 @@ func (t *QuicTransport) exchangePayload(ctx context.Context, payload []byte) (*d
 	}
 }
 
-func (t *QuicTransport) exchangeConn(ctx context.Context, payload []byte, c quic.Connection) (*dnsmsg.Msg, error) {
+func (t *QuicTransport) exchangeConn(ctx context.Context, payload []byte, c *quic.Conn) (*dnsmsg.Msg, error) {
 	s, err := c.OpenStream()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open stream, %w", err)
@@ -122,7 +122,7 @@ func (t *QuicTransport) exchangeConn(ctx context.Context, payload []byte, c quic
 	return t.exchangeStream(ctx, payload, s)
 }
 
-func (t *QuicTransport) exchangeStream(ctx context.Context, payload []byte, stream quic.Stream) (resp *dnsmsg.Msg, err error) {
+func (t *QuicTransport) exchangeStream(ctx context.Context, payload []byte, stream *quic.Stream) (resp *dnsmsg.Msg, err error) {
 	type res struct {
 		resp *dnsmsg.Msg
 		err  error
@@ -164,7 +164,7 @@ func (t *QuicTransport) exchangeStream(ctx context.Context, payload []byte, stre
 	}
 }
 
-func (t *QuicTransport) getConn(ctx context.Context) (_ quic.Connection, newConn bool, _ error) {
+func (t *QuicTransport) getConn(ctx context.Context) (_ *quic.Conn, newConn bool, _ error) {
 	t.m.Lock()
 	if t.closed {
 		t.m.Unlock()
@@ -228,11 +228,11 @@ func (t *QuicTransport) runDialingCall(call *dialingQuicCall) {
 
 type dialingQuicCall struct {
 	done chan struct{}
-	c    quic.Connection
+	c    *quic.Conn
 	err  error
 }
 
-func (call *dialingQuicCall) wait(ctx context.Context) (quic.Connection, error) {
+func (call *dialingQuicCall) wait(ctx context.Context) (*quic.Conn, error) {
 	select {
 	case <-ctx.Done():
 		return nil, context.Cause(ctx)
