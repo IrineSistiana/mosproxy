@@ -70,7 +70,7 @@ func makeEdns0ClientSubnetReqOpt(p netip.Prefix) pool.Buffer {
 	p = p.Masked()
 	addr := p.Addr()
 	mask := uint8(p.Bits())
-	addrL := (mask / 8) + 1
+	addrL := (mask + 7) / 8
 
 	family := uint16(0)
 	optLen := 4 + uint16(addrL)
